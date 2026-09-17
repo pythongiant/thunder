@@ -10,3 +10,5 @@ benchmarks/results/*.json
 benchmarks/results/*.csv
 !benchmarks/results/*.md
 .modal/
+
+experiments/
