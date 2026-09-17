@@ -1,0 +1,9 @@
+k=4 v=4 d=128 nk=128 tile=64 causal=True max_abs=1.4639e-03 violations=0 ref_abs_mean=1.8665e-01
+k=4 v=4 d=128 nk=256 tile=64 causal=True max_abs=1.4639e-03 violations=0 ref_abs_mean=1.3954e-01
+k=4 v=4 d=128 nk=512 tile=64 causal=True max_abs=1.4639e-03 violations=0 ref_abs_mean=1.0298e-01
+k=4 v=4 d=128 nk=128 tile=64 causal=False max_abs=4.3017e-04 violations=0 ref_abs_mean=1.0790e-01
+k=4 v=4 d=128 nk=192 tile=64 causal=True max_abs=1.4639e-03 violations=0 ref_abs_mean=1.5723e-01
+k=2 v=2 d=128 nk=128 tile=64 causal=True max_abs=1.0209e-03 violations=0 ref_abs_mean=1.7173e-01
+k=3 v=4 d=128 nk=128 tile=64 causal=True max_abs=1.4639e-03 violations=0 ref_abs_mean=1.8571e-01
+k=4 v=4 d=64 nk=128 tile=64 causal=True max_abs=1.3803e-03 violations=0 ref_abs_mean=1.8721e-01
+FAILURES: []

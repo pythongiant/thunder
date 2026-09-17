@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "numpy"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turboquant-vllm"
+version = "0.1.0"
+description = "CuTeDSL fused TurboQuant KV-cache dequantization attention backend for vLLM (SM100/SM110)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "TurboQuant CuTe authors" }]
+keywords = ["vllm", "attention", "turboquant", "blackwell", "cutedsl", "quantization"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Runtime deps. `torch` is deliberately unpinned here: the plugin is imported
+# inside an already-provisioned vLLM environment and must not fight its pins.
+# See `ci/modal_image.py` for the exact CUDA/torch/vLLM/CUTLASS combination the
+# CI target is validated against.
+dependencies = [
+    "torch",
+    "numpy",
+    "triton",
+    "nvidia-cutlass-dsl>=4.7.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-xdist"]
+bench = ["pynvml", "transformers", "safetensors", "einops", "pandas"]
+dev = ["ruff", "mypy"]
+
+[project.entry-points."vllm.general_plugins"]
+turboquant_cute = "turboquant_vllm.model.registry:register"
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["turboquant_vllm*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "cuda: requires a CUDA device",
+    "sm100: requires an SM100/SM110 device",
+    "slow: long-running",
+]
