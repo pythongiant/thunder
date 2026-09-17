@@ -1,4 +1,4 @@
-# Thunder
+# thunder-vllm
 
 A vLLM plugin that fuses TurboQuant KV-cache dequantization into a
 FlashAttention-4-style SM100/SM110 attention kernel, written in CuTeDSL. The
