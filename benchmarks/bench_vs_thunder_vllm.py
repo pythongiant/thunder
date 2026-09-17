@@ -1,7 +1,7 @@
 """End-to-end benchmark: this plugin vs the upstream vLLM TurboQuant backend.
 
 Loads the same model twice (vLLM's ``TURBOQUANT`` vs this plugin's
-``TURBOQUANT_CUTE``), warms both at the same batch shape, and reports the sweep
+``THUNDER_CUTE``), warms both at the same batch shape, and reports the sweep
 table with ours as a percent of the baseline.
 
 Parity caveat (important)
@@ -14,8 +14,8 @@ plugin's quantizer) and compares attention outputs with
 ``atol=rtol=1e-2``. That isolates kernel correctness from quantizer semantics.
 
 Run:
-    python -m benchmarks.bench_vs_turboquant_vllm --model Qwen/Qwen3-4B \
-        --out benchmarks/results/vs_turboquant_vllm.md
+    python -m benchmarks.bench_vs_thunder_vllm --model Qwen/Qwen3-4B \
+        --out benchmarks/results/vs_thunder_vllm.md
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ def bench_workload(model: str, name: str, batch: int, prompt_len: int, gen_len: 
     base["mem_used_mb"] = gpu["mem_used_mb"]
 
     # The plugin registers as CUSTOM; see model/registry.py.
-    import turboquant_vllm.model.registry as reg
+    import thunder_vllm.model.registry as reg
 
     reg.configure(k_bits=4, v_bits=4)
     reg.register()
@@ -110,7 +110,7 @@ def bench_workload(model: str, name: str, batch: int, prompt_len: int, gen_len: 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-4B")
-    ap.add_argument("--out", default="benchmarks/results/vs_turboquant_vllm.md")
+    ap.add_argument("--out", default="benchmarks/results/vs_thunder_vllm.md")
     args = ap.parse_args()
 
     rows = []
@@ -120,7 +120,7 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
-        f.write("# TurboQuant-CuTe vs upstream vLLM TurboQuant\n\n")
+        f.write("# Thunder-CuTe vs upstream vLLM TurboQuant\n\n")
         f.write("| Workload | batch | prompt | gen | baseline tok/s | ours tok/s | ours % | ours latency s | baseline latency s |\n")
         f.write("|---" * 9 + "|\n")
         for r in rows:

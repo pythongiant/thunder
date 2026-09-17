@@ -15,7 +15,7 @@
    /opt/flash-attention for the vs-FA4 benchmark but is not installed.
 5. vLLM installed with `VLLM_USE_PRECOMPILED=1` (no 20-min kernel build).
 
-Result: `vllm 0.29.1rc1.dev159+gdffbb714e` (the pin) + `turboquant_vllm` install
+Result: `vllm 0.29.1rc1.dev159+gdffbb714e` (the pin) + `thunder_vllm` install
 cleanly. Image is cached; rebuild is ~6 s.
 
 ## Registry / API facts (measured in-container)
@@ -23,12 +23,12 @@ cleanly. Image is cached; rebuild is ~6 s.
 * `AttentionBackendEnum` **already contains `TURBOQUANT`** at this pin, and also
   `CUSTOM`. So upstream ships a TurboQuant backend and the vs-upstream comparison
   is directly available.
-* `register_backend(CUSTOM, "turboquant_vllm.attention.backend.TurboQuantAttentionBackend")`
+* `register_backend(CUSTOM, "thunder_vllm.attention.backend.ThunderAttentionBackend")`
   **succeeds**.
-* BUT the registry keys on the *enum* member: resolving `"TURBOQUANT_CUTE"` fails
+* BUT the registry keys on the *enum* member: resolving `"THUNDER_CUTE"` fails
   ("Unknown attention backend"), because there is no such enum member. The
   selectable name after registering on CUSTOM is **`CUSTOM`**. `get_name()`
-  returning "TURBOQUANT_CUTE" is therefore not the selection key.
+  returning "THUNDER_CUTE" is therefore not the selection key.
   (The local probe also tried `_ATTN_BACKEND_REGISTRY`, which does not exist in
   this version -- that was my error, not vLLM's.)
 * `VLLM_ATTENTION_BACKEND` is **no longer recognised** ("Unknown vLLM environment
@@ -36,9 +36,9 @@ cleanly. Image is cached; rebuild is ~6 s.
   `--attention-backend`. Any integration doc/env in the repo referencing
   VLLM_ATTENTION_BACKEND is stale.
 * Backend surface is healthy:
-  name TURBOQUANT_CUTE, head sizes [64, 128, 256], impl + builder resolve,
-  kv_cache_dtypes ['turboquant_cute', 'turboquant_k8v4', 'turboquant_k3v4_nc',
-  'turboquant_4bit_nc', 'turboquant_3bit_nc'].
+  name THUNDER_CUTE, head sizes [64, 128, 256], impl + builder resolve,
+  kv_cache_dtypes ['thunder_cute', 'thunder_k8v4', 'thunder_k3v4_nc',
+  'thunder_4bit_nc', 'thunder_3bit_nc'].
 
 ## Engine run: fails on a torch/flash-attn ABI mismatch
 
@@ -58,7 +58,7 @@ dependency choice, not our code.
 1. Pin torch to whatever this vLLM commit requires and install the matching FA
    wheel (or select a non-FA backend), so the engine core starts.
 2. Select our backend as `CUSTOM` via `attention_config`/`--attention-backend`
-   (not VLLM_ATTENTION_BACKEND, not "TURBOQUANT_CUTE").
+   (not VLLM_ATTENTION_BACKEND, not "THUNDER_CUTE").
 3. Then the correctness matrix (single / short decode / long decode / prefill),
    decode concurrency scaling, memory / max supported context.
 4. Compare against upstream `TURBOQUANT` (now known to exist at this pin).
@@ -74,18 +74,18 @@ engine walks into our backend. The sequence of rejections, in order:
    not valid ... Reason: ['block_size not supported']`
    -> `supports_block_size(None)` returned False because vLLM asks with None to
    mean "backend decides". FIXED (accept None) + instrumented via
-   TURBOQUANT_DEBUG_BLOCK.
-2. `registry.py: ValueError: Unknown attention backend: 'TURBOQUANT_CUTE'`
+   THUNDER_DEBUG_BLOCK.
+2. `registry.py: ValueError: Unknown attention backend: 'THUNDER_CUTE'`
    -> vLLM resolves the backend name through AttentionBackendEnum, whose key is
    the ENUM MEMBER, so `get_name()` must return the registry key. FIXED:
-   `get_name()` returns REGISTRY_NAME = "CUSTOM"; "TURBOQUANT_CUTE" stays the
+   `get_name()` returns REGISTRY_NAME = "CUSTOM"; "THUNDER_CUTE" stays the
    display name only.
 3. `attention.py:728 assert hasattr(impl, "do_kv_cache_update")` ->
-   `AssertionError: TurboQuantAttentionImpl does not support kv cache update`
+   `AssertionError: ThunderAttentionImpl does not support kv cache update`
    FIXED: implemented `do_kv_cache_update` on the Impl (same reshape_and_cache the
    forward path used to do inline), with argument discovery by role
    (cache = largest tensor, slot mapping = 1-D int, then key/value) and
-   TURBOQUANT_DEBUG_KV logging. The call DID arrive and the discovery worked.
+   THUNDER_DEBUG_KV logging. The call DID arrive and the discovery worked.
 4. `backend.py:650 RuntimeError: TurboQuant norms buffer not bound; call
    bind_scales()` -> nothing calls bind_scales because vLLM allocates the cache
    itself. FIXED: `_scales_for` now lazily allocates the norms buffer from
@@ -120,7 +120,7 @@ KV-cache WARM-UP, not during a normal step:
   core.py:356   _initialize_kv_caches(vllm_config)
                   -> model_executor.compile_or_warm_up_model()
   executor/abstract.py:126  collective_rpc(...)          # warm-up forward
-  backend.py:544            TurboQuantAttentionImpl.forward
+  backend.py:544            ThunderAttentionImpl.forward
   paged_kv.py:162/205       gather_packed_tiles -> gather_packed_tiles_ref
   cache_layout.py:173       k_codes: nb, bs, _ = kv_cache.shape
   -> ValueError: too many values to unpack (expected 3)
@@ -142,12 +142,12 @@ exactly as upstream TurboQuant transposes `(B,H,N,C) -> (B,N,H,C)` before its
 kernels.
 
 ### Bounded refactor this implies
-  * `TurboQuantCacheLayout.get_kv_cache_shape` -> 4-D, and
+  * `ThunderCacheLayout.get_kv_cache_shape` -> 4-D, and
     `get_scales_shape` re-derived to match (norms ride in the same slot region).
   * `k_codes` / `v_codes` -> consume the 4-D cache, return the kernels' layout
     (transpose at this single boundary).
   * `paged_kv.gather_packed_tiles_ref` and `reshape_and_cache` -> same boundary.
-  * `TurboQuantAttentionBackend.get_kv_cache_shape` -> return the 4-D shape.
+  * `ThunderAttentionBackend.get_kv_cache_shape` -> return the 4-D shape.
   * CPU tests in tests/test_cache_layout.py and test_paged_kv.py must be updated to
     the new convention (they currently encode the 3-D one).
 
@@ -155,19 +155,19 @@ kernels.
 My layout DEBUG logging did not appear because the spawned EngineCore process does
 not inherit the driver process's `logging.basicConfig`; to see those lines the
 logging config has to be applied inside the engine process (e.g. via an env-driven
-setup at plugin import time in `turboquant_vllm.model.registry`).
+setup at plugin import time in `thunder_vllm.model.registry`).
 
 
 ## Link 5 FIXED — 4-D canonical cache layout
 
-`TurboQuantCacheLayout` now uses vLLM's canonical combined-K+V layout:
+`ThunderCacheLayout` now uses vLLM's canonical combined-K+V layout:
 
     (num_blocks, num_kv_heads, block_size, head_slot_bytes)
     head_slot_bytes = k_packed_bytes + v_packed_bytes      # per head, K then V
     kv_scales: (num_blocks, num_kv_heads, block_size, 2)
 
 Changes:
-  * `get_kv_cache_shape` / `get_scales_shape` -> 4-D; `TurboQuantAttentionBackend
+  * `get_kv_cache_shape` / `get_scales_shape` -> 4-D; `ThunderAttentionBackend
     .get_kv_cache_shape` delegates, so it follows.
   * `k_codes` / `v_codes` -> slice the head slot and `permute(0, 2, 1, 3)` to the
     kernels' `(nb, bs, Hk, packed)` order. This is THE single transpose boundary.
@@ -240,8 +240,8 @@ The framework ABI is now fully cleared and the engine REACHES KERNEL EXECUTION:
 during vLLM's warm-up forward. Next: validate the launch path under vLLM's
 metadata -- the launcher dereferences seq_lens / query_start_loc / block table, and
 the warm-up metadata does not necessarily carry the same fields or dtypes our
-TurboQuantMetadata provides (e.g. absent q_start -> garbage pointer). Add shape and
-dtype assertions in TurboQuantAttentionImpl.forward before the launch so the next
+ThunderMetadata provides (e.g. absent q_start -> garbage pointer). Add shape and
+dtype assertions in ThunderAttentionImpl.forward before the launch so the next
 failure is a clear message rather than an illegal address.
 
 CPU suite after all of the above: 38 passed, 8 skipped.
@@ -319,9 +319,9 @@ R=16/B=16/seq=128).
 
   * `_load_kv_packed` takes `req` and `kv_row_stride` and applies `base` to the K
     read, the V read, and BOTH norm reads.
-  * `TurboQuantAttentionForward.kernel` takes a runtime `kv_row_stride: Int32`
+  * `ThunderAttentionForward.kernel` takes a runtime `kv_row_stride: Int32`
     (runtime, not constexpr, so it does not add a compile per stride).
-  * `launch_turboquant_attention` derives it from `metadata.max_blocks_per_req`,
+  * `launch_thunder_attention` derives it from `metadata.max_blocks_per_req`,
     falling back to `page_rows // num_reqs` (the fallback is only right when the
     gather did not pad up to max_num_reqs).
 
@@ -547,7 +547,7 @@ row base must be in TOKENS:
 
     kv_row_stride = max_blocks_per_req * block_size      # tokens per request
 
-`launch_turboquant_attention` now multiplies by `block_size`
+`launch_thunder_attention` now multiplies by `block_size`
 (`cute_kernel.py:~745`). With that, `R=2,B=2` gives `base=[0,32]`, and the
 multi-request probe is fully correct:
 
@@ -585,7 +585,7 @@ Fix (`cute_kernel.py`):
     do_kv_cache_update -> reshape_and_cache -> _reshape_and_cache_kernel
     Triton Error [CUDA]: an illegal memory access
 
-Instrumented host probe (TURBOQUANT_DEBUG_KV=1) at the warm-up:
+Instrumented host probe (THUNDER_DEBUG_KV=1) at the warm-up:
 
     [TQ-CACHE] n=16384 ... slots_min=-1 slots_max=-1
 
@@ -705,7 +705,7 @@ declares `UNIFORM_SINGLE_TOKEN_DECODE`), otherwise it measures the launcher.
 
 ### Model / shapes used
 
-  * engine smoke: `Qwen/Qwen3-0.6B` (TURBOQUANT_SCHEDULE=mma), max_model_len=512,
+  * engine smoke: `Qwen/Qwen3-0.6B` (THUNDER_SCHEDULE=mma), max_model_len=512,
     block_size=16, fp16, gpu_memory_utilization=0.6, enforce_eager=True.
   * kernel smoke: synthetic, nheads=32/nkv=8/hd=128, decode-short 4096,
     decode-long 32768, prefill 4096.

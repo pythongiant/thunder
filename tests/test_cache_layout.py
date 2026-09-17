@@ -5,15 +5,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-from turboquant_vllm.attention.cache_layout import (
-    TurboQuantCacheLayout,
+from thunder_vllm.attention.cache_layout import (
+    ThunderCacheLayout,
     allocate_kv_cache,
     reshape_and_cache_ref,
 )
-from turboquant_vllm.quant.hadamard import build_hadamard
-from turboquant_vllm.quant.lloyd_max import build_lloyd_max_codebook, build_lut
-from turboquant_vllm.quant.packing import pack_indices, unpack_indices
-from turboquant_vllm.quant.quantizer import TurboQuantQuantizer
+from thunder_vllm.quant.hadamard import build_hadamard
+from thunder_vllm.quant.lloyd_max import build_lloyd_max_codebook, build_lut
+from thunder_vllm.quant.packing import pack_indices, unpack_indices
+from thunder_vllm.quant.quantizer import ThunderQuantizer
 
 BITS_SWEEP = [(2, 2), (3, 3), (4, 4), (3, 4), (4, 4)]
 HEAD_DIMS = [64, 128, 256]
@@ -71,7 +71,7 @@ def test_lut_shape_and_broadcast():
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_quantizer_roundtrip_error(k_bits, v_bits, head_dim):
     torch.manual_seed(1)
-    q = TurboQuantQuantizer(head_dim, k_bits, v_bits)
+    q = ThunderQuantizer(head_dim, k_bits, v_bits)
     k = torch.randn(8, 4, head_dim, dtype=torch.float16)
     v = torch.randn(8, 4, head_dim, dtype=torch.float16)
     kv = q.quantize(k, v)
@@ -86,7 +86,7 @@ def test_quantizer_roundtrip_error(k_bits, v_bits, head_dim):
 
 @pytest.mark.parametrize("k_bits,v_bits", BITS_SWEEP)
 def test_cache_layout_shapes_and_views(k_bits, v_bits):
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=8, head_dim=128, k_bits=k_bits, v_bits=v_bits, block_size=16
     )
     nb = 4
@@ -105,10 +105,10 @@ def test_cache_layout_shapes_and_views(k_bits, v_bits):
 
 
 def test_cache_write_scatter_matches_reference():
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=4, head_dim=128, k_bits=4, v_bits=4, block_size=16
     )
-    q = TurboQuantQuantizer(128, 4, 4)
+    q = ThunderQuantizer(128, 4, 4)
     kv, scales = allocate_kv_cache(6, 16, 4, 128, 4, 4, device="cpu")
 
     torch.manual_seed(3)

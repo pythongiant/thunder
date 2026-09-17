@@ -2,10 +2,10 @@
 https://modal.com/apps/srihari-unnikrishnan/main/ap-Kkt3KbAxAqSoTKhRDdOkjn
 ✓ Created objects.
 ├── 🔨 Created mount 
-│   /Users/srihariunnikrishnan/thunderthunder/turboquant_vllm/ci_probe/modal_pro
+│   /Users/srihariunnikrishnan/thunderthunder/thunder_vllm/ci_probe/modal_pro
 │   be_exec.py
 ├── 🔨 Created mount 
-│   /Users/srihariunnikrishnan/thunderthunder/turboquant_vllm/turboquant_vllm
+│   /Users/srihariunnikrishnan/thunderthunder/thunder_vllm/thunder_vllm
 └── 🔨 Created function probe.
 
 ==========
@@ -35,29 +35,29 @@ k=4 v=4 d=64 nk=128 tile=64 causal=True max_abs=9.5679e+03 violations=16227 ref_
 FAILURES: [(4, 4, 128, 128, True, inf, 32317.0), (4, 4, 128, 256, True, inf, 64600.0), (4, 4, 128, 512, True, inf, 128960.0), (4, 4, 128, 128, False, inf, 32210.0), (4, 4, 128, 192, True, inf, 48595.0), (2, 2, 128, 128, True, 2212.434814453125, 32327.0), (3, 4, 128, 128, True, 392.3085632324219, 32412.0), (4, 4, 64, 128, True, 9567.9130859375, 16227.0)]
 
 ---- stderr ----
-[2026-09-16 05:27:09,251 INFO turboquant_vllm.quant.lloyd_max] Lloyd-Max codebook bits=4 head_dim=128 std=0.0883883 distortion=7.433e-05
-[2026-09-16 05:27:10,304 INFO turboquant_vllm.quant.lloyd_max] Lloyd-Max codebook bits=4 head_dim=128 std=0.0883883 distortion=7.396e-05
-[2026-09-16 05:27:10,330 INFO turboquant_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.0 MiB norms=0.0 MiB
-[2026-09-16 05:27:10,713 INFO turboquant_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 64 B, V 64 B per row)
-[2026-09-16 05:27:16,511 INFO turboquant_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=16 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.1 MiB norms=0.0 MiB
-[2026-09-16 05:27:16,524 INFO turboquant_vllm.attention.paged_kv] reserved gather buffers: page_rows=16 block_size=16 Hk=2 (K 64 B, V 64 B per row)
-[2026-09-16 05:27:22,145 INFO turboquant_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=32 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.1 MiB norms=0.0 MiB
-[2026-09-16 05:27:22,157 INFO turboquant_vllm.attention.paged_kv] reserved gather buffers: page_rows=32 block_size=16 Hk=2 (K 64 B, V 64 B per row)
-[2026-09-16 05:27:27,683 INFO turboquant_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.0 MiB norms=0.0 MiB
-[2026-09-16 05:27:27,695 INFO turboquant_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 64 B, V 64 B per row)
-[2026-09-16 05:27:33,103 INFO turboquant_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=12 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.0 MiB norms=0.0 MiB
-[2026-09-16 05:27:33,115 INFO turboquant_vllm.attention.paged_kv] reserved gather buffers: page_rows=12 block_size=16 Hk=2 (K 64 B, V 64 B per row)
-[2026-09-16 05:27:39,053 INFO turboquant_vllm.quant.lloyd_max] Lloyd-Max codebook bits=2 head_dim=128 std=0.0883883 distortion=9.174e-04
-[2026-09-16 05:27:39,584 INFO turboquant_vllm.quant.lloyd_max] Lloyd-Max codebook bits=2 head_dim=128 std=0.0883883 distortion=9.137e-04
-[2026-09-16 05:27:39,585 INFO turboquant_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=128 K_BITS=2 V_BITS=2 slot_bytes=128 codes=0.0 MiB norms=0.0 MiB
-[2026-09-16 05:27:39,595 INFO turboquant_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 32 B, V 32 B per row)
-[2026-09-16 05:27:45,494 INFO turboquant_vllm.quant.lloyd_max] Lloyd-Max codebook bits=3 head_dim=128 std=0.0883883 distortion=2.704e-04
-[2026-09-16 05:27:45,494 INFO turboquant_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=128 K_BITS=3 V_BITS=4 slot_bytes=224 codes=0.0 MiB norms=0.0 MiB
-[2026-09-16 05:27:45,507 INFO turboquant_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 48 B, V 64 B per row)
-[2026-09-16 05:27:52,814 INFO turboquant_vllm.quant.lloyd_max] Lloyd-Max codebook bits=4 head_dim=64 std=0.125 distortion=1.487e-04
-[2026-09-16 05:27:53,996 INFO turboquant_vllm.quant.lloyd_max] Lloyd-Max codebook bits=4 head_dim=64 std=0.125 distortion=1.479e-04
-[2026-09-16 05:27:53,997 INFO turboquant_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=64 K_BITS=4 V_BITS=4 slot_bytes=128 codes=0.0 MiB norms=0.0 MiB
-[2026-09-16 05:27:54,003 INFO turboquant_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 32 B, V 32 B per row)
+[2026-09-16 05:27:09,251 INFO thunder_vllm.quant.lloyd_max] Lloyd-Max codebook bits=4 head_dim=128 std=0.0883883 distortion=7.433e-05
+[2026-09-16 05:27:10,304 INFO thunder_vllm.quant.lloyd_max] Lloyd-Max codebook bits=4 head_dim=128 std=0.0883883 distortion=7.396e-05
+[2026-09-16 05:27:10,330 INFO thunder_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.0 MiB norms=0.0 MiB
+[2026-09-16 05:27:10,713 INFO thunder_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 64 B, V 64 B per row)
+[2026-09-16 05:27:16,511 INFO thunder_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=16 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.1 MiB norms=0.0 MiB
+[2026-09-16 05:27:16,524 INFO thunder_vllm.attention.paged_kv] reserved gather buffers: page_rows=16 block_size=16 Hk=2 (K 64 B, V 64 B per row)
+[2026-09-16 05:27:22,145 INFO thunder_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=32 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.1 MiB norms=0.0 MiB
+[2026-09-16 05:27:22,157 INFO thunder_vllm.attention.paged_kv] reserved gather buffers: page_rows=32 block_size=16 Hk=2 (K 64 B, V 64 B per row)
+[2026-09-16 05:27:27,683 INFO thunder_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.0 MiB norms=0.0 MiB
+[2026-09-16 05:27:27,695 INFO thunder_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 64 B, V 64 B per row)
+[2026-09-16 05:27:33,103 INFO thunder_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=12 block_size=16 Hk=2 D=128 K_BITS=4 V_BITS=4 slot_bytes=256 codes=0.0 MiB norms=0.0 MiB
+[2026-09-16 05:27:33,115 INFO thunder_vllm.attention.paged_kv] reserved gather buffers: page_rows=12 block_size=16 Hk=2 (K 64 B, V 64 B per row)
+[2026-09-16 05:27:39,053 INFO thunder_vllm.quant.lloyd_max] Lloyd-Max codebook bits=2 head_dim=128 std=0.0883883 distortion=9.174e-04
+[2026-09-16 05:27:39,584 INFO thunder_vllm.quant.lloyd_max] Lloyd-Max codebook bits=2 head_dim=128 std=0.0883883 distortion=9.137e-04
+[2026-09-16 05:27:39,585 INFO thunder_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=128 K_BITS=2 V_BITS=2 slot_bytes=128 codes=0.0 MiB norms=0.0 MiB
+[2026-09-16 05:27:39,595 INFO thunder_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 32 B, V 32 B per row)
+[2026-09-16 05:27:45,494 INFO thunder_vllm.quant.lloyd_max] Lloyd-Max codebook bits=3 head_dim=128 std=0.0883883 distortion=2.704e-04
+[2026-09-16 05:27:45,494 INFO thunder_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=128 K_BITS=3 V_BITS=4 slot_bytes=224 codes=0.0 MiB norms=0.0 MiB
+[2026-09-16 05:27:45,507 INFO thunder_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 48 B, V 64 B per row)
+[2026-09-16 05:27:52,814 INFO thunder_vllm.quant.lloyd_max] Lloyd-Max codebook bits=4 head_dim=64 std=0.125 distortion=1.487e-04
+[2026-09-16 05:27:53,996 INFO thunder_vllm.quant.lloyd_max] Lloyd-Max codebook bits=4 head_dim=64 std=0.125 distortion=1.479e-04
+[2026-09-16 05:27:53,997 INFO thunder_vllm.attention.cache_layout] allocated TurboQuant cache: blocks=8 block_size=16 Hk=2 D=64 K_BITS=4 V_BITS=4 slot_bytes=128 codes=0.0 MiB norms=0.0 MiB
+[2026-09-16 05:27:54,003 INFO thunder_vllm.attention.paged_kv] reserved gather buffers: page_rows=8 block_size=16 Hk=2 (K 32 B, V 32 B per row)
 
 returncode: 1
 Stopping app - local entrypoint completed.

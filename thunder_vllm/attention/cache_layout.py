@@ -40,9 +40,9 @@ from typing import NamedTuple
 
 import torch
 
-_log = _logging.getLogger("turboquant_vllm.cache_layout")
+_log = _logging.getLogger("thunder_vllm.cache_layout")
 
-from turboquant_vllm.utils.logging import get_logger
+from thunder_vllm.utils.logging import get_logger
 
 logger = get_logger("attention.cache_layout")
 
@@ -75,7 +75,7 @@ class KVSlotView(NamedTuple):
 
 
 @dataclass(frozen=True)
-class TurboQuantCacheLayout:
+class ThunderCacheLayout:
     """Static description of the combined packed-KV slot.
 
     ``head_dim_padded`` rounds up to a multiple of 16: the packed bytes are
@@ -199,7 +199,7 @@ class TurboQuantCacheLayout:
         The cache is ``(nb, Hk, bs, head_slot)``; this is the single transpose
         boundary between vLLM's convention and the kernels'.
         """
-        if _os.environ.get("TURBOQUANT_DEBUG_LAYOUT"):
+        if _os.environ.get("THUNDER_DEBUG_LAYOUT"):
             _log.info(
                 "k_codes received shape=%s dtype=%s stride=%s contiguous=%s",
                 tuple(kv_cache.shape), kv_cache.dtype, tuple(kv_cache.stride()),
@@ -226,7 +226,7 @@ def allocate_kv_cache(
 
     ``kv_cache`` is always ``uint8``; ``dtype`` controls the fp16 norm storage.
     """
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         k_bits=K_BITS,
@@ -268,7 +268,7 @@ def reshape_and_cache_ref(
     kv_cache: torch.Tensor,
     kv_scales: torch.Tensor,
     quantizer,
-    layout: TurboQuantCacheLayout,
+    layout: ThunderCacheLayout,
 ) -> None:
     """Reference (pure-torch) cache write. Also the CPU test path.
 
@@ -439,7 +439,7 @@ if _HAS_TRITON:
         kv_cache: torch.Tensor,
         kv_scales: torch.Tensor,
         quantizer,
-        layout: TurboQuantCacheLayout,
+        layout: ThunderCacheLayout,
         block_rows: int = 16,
     ) -> None:
         """GPU cache write. Falls back to :func:`reshape_and_cache_ref` for
@@ -452,7 +452,7 @@ if _HAS_TRITON:
         n = key.shape[0]
         if n == 0:
             return
-        if _os.environ.get("TURBOQUANT_DEBUG_KV") and not (
+        if _os.environ.get("THUNDER_DEBUG_KV") and not (
             slot_mapping.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
             # NOTE: this block reads slot min/max back to the host. That is a D2H
@@ -526,7 +526,7 @@ def reshape_and_cache(
     kv_cache: torch.Tensor,
     kv_scales: torch.Tensor,
     quantizer,
-    layout: TurboQuantCacheLayout,
+    layout: ThunderCacheLayout,
 ) -> None:
     """Dispatch to the Triton path on CUDA, the reference path otherwise."""
     if key.is_cuda and _HAS_TRITON:

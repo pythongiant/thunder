@@ -30,8 +30,8 @@ import os as _os
 
 import torch
 
-from turboquant_vllm.attention.cache_layout import TurboQuantCacheLayout
-from turboquant_vllm.utils.logging import get_logger
+from thunder_vllm.attention.cache_layout import ThunderCacheLayout
+from thunder_vllm.utils.logging import get_logger
 
 logger = get_logger("attention.paged_kv")
 
@@ -60,7 +60,7 @@ class PagedKVManager:
 
     def __init__(
         self,
-        layout: TurboQuantCacheLayout,
+        layout: ThunderCacheLayout,
         *,
         max_num_reqs: int,
         max_blocks_per_req: int,
@@ -236,7 +236,7 @@ class PagedKVManager:
         vv_view[:r, :b_live].copy_(v)
         kn_view[:r, :b_live].copy_(kn[bt_live])
         vn_view[:r, :b_live].copy_(vn[bt_live])
-        if _os.environ.get("TURBOQUANT_DEBUG_LAYOUT"):
+        if _os.environ.get("THUNDER_DEBUG_LAYOUT"):
             print(
                 f"[TQ-GATHER-TRIM] r={r} b={b} b_live={b_live} "
                 f"live_page_rows={r * b_live} reserved_page_rows={self.max_page_rows}",
@@ -286,7 +286,7 @@ class PagedKVManager:
         # with, and a fixed-target reshape then fails with
         #   shape '[32768, 16, 8, 64]' is invalid for input of size 1879048192
         page_rows = int(bt.shape[0]) * int(bt.shape[1])
-        if _os.environ.get("TURBOQUANT_DEBUG_LAYOUT"):
+        if _os.environ.get("THUNDER_DEBUG_LAYOUT"):
             print(
                 f"[TQ-GATHER] bt={tuple(bt.shape)} reserved=({self.max_num_reqs},"
             f"{self.max_blocks_per_req}) max_page_rows={self.max_page_rows} "
@@ -303,7 +303,7 @@ class PagedKVManager:
         # (R, B, bs, Hk, pb) -> (R*B*bs, Hk, pb)
         k = k_codes[bt].reshape(-1, self.layout.num_kv_heads, self.layout.k_packed_bytes)
         v = v_codes[bt].reshape(-1, self.layout.num_kv_heads, self.layout.v_packed_bytes)
-        if _os.environ.get("TURBOQUANT_DEBUG_LAYOUT"):
+        if _os.environ.get("THUNDER_DEBUG_LAYOUT"):
             print(
                 f"[TQ-GATHER] k_codes={tuple(k_codes.shape)} v_codes={tuple(v_codes.shape)} "
                 f"k={tuple(k.shape)} v={tuple(v.shape)}",
@@ -330,7 +330,7 @@ class PagedKVManager:
 
 
 def make_paged_kv_manager(
-    layout: TurboQuantCacheLayout,
+    layout: ThunderCacheLayout,
     *,
     max_num_reqs: int,
     max_model_len: int,

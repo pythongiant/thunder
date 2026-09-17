@@ -3,14 +3,14 @@ requires = ["setuptools>=68", "wheel", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "turboquant-vllm"
+name = "thunder-vllm"
 version = "0.1.0"
 description = "CuTeDSL fused TurboQuant KV-cache dequantization attention backend for vLLM (SM100/SM110)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-authors = [{ name = "TurboQuant CuTe authors" }]
-keywords = ["vllm", "attention", "turboquant", "blackwell", "cutedsl", "quantization"]
+authors = [{ name = "Thunder authors" }]
+keywords = ["vllm", "attention", "thunder", "blackwell", "cutedsl", "quantization"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -33,14 +33,14 @@ bench = ["pynvml", "transformers", "safetensors", "einops", "pandas"]
 dev = ["ruff", "mypy"]
 
 [project.entry-points."vllm.general_plugins"]
-turboquant_cute = "turboquant_vllm.model.registry:register"
+thunder_cute = "thunder_vllm.model.registry:register"
 
 [tool.setuptools]
 package-dir = { "" = "." }
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["turboquant_vllm*"]
+include = ["thunder_vllm*"]
 
 [tool.ruff]
 line-length = 100

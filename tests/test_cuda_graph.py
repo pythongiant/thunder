@@ -21,20 +21,20 @@ import os
 import pytest
 import torch
 
-from turboquant_vllm.attention.cache_layout import (
-    TurboQuantCacheLayout,
+from thunder_vllm.attention.cache_layout import (
+    ThunderCacheLayout,
     allocate_kv_cache,
 )
-from turboquant_vllm.attention.paged_kv import make_paged_kv_manager
-from turboquant_vllm.attention.scratch import new_scratch, reserve_scratch
-from turboquant_vllm.quant.quantizer import TurboQuantQuantizer
+from thunder_vllm.attention.paged_kv import make_paged_kv_manager
+from thunder_vllm.attention.scratch import new_scratch, reserve_scratch
+from thunder_vllm.quant.quantizer import ThunderQuantizer
 
 pytestmark = [pytest.mark.cuda, pytest.mark.sm100]
 
 
 @pytest.mark.skipif(
-    os.environ.get("TURBOQUANT_KERNEL_ENABLE", "0") != "1",
-    reason="kernel schedule incomplete; set TURBOQUANT_KERNEL_ENABLE=1",
+    os.environ.get("THUNDER_KERNEL_ENABLE", "0") != "1",
+    reason="kernel schedule incomplete; set THUNDER_KERNEL_ENABLE=1",
 )
 def test_cuda_graph_replay_parity():
     device = "cuda"
@@ -43,10 +43,10 @@ def test_cuda_graph_replay_parity():
     batch, nk = 4, 4096
     bs = 16
 
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=hk, head_dim=d, k_bits=4, v_bits=4, block_size=bs
     )
-    quant = TurboQuantQuantizer(d, 4, 4, device=device)
+    quant = ThunderQuantizer(d, 4, 4, device=device)
     nb = batch * ((nk + bs - 1) // bs)
     kv, scales = allocate_kv_cache(nb, bs, hk, d, 4, 4, device=device)
 
@@ -61,9 +61,9 @@ def test_cuda_graph_replay_parity():
     scratch = new_scratch()
     reserve_scratch(batch, hq, d, device, scratch, num_splits=1)
 
-    from turboquant_vllm.attention.cute_kernel import TurboQuantAttentionForward
+    from thunder_vllm.attention.cute_kernel import ThunderAttentionForward
 
-    kernel = TurboQuantAttentionForward(
+    kernel = ThunderAttentionForward(
         head_dim=d, K_BITS=4, V_BITS=4, qhead_per_kvhead=hq // hk, is_causal=True
     )
 

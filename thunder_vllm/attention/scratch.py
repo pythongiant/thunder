@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from turboquant_vllm.utils.logging import get_logger
+from thunder_vllm.utils.logging import get_logger
 
 logger = get_logger("attention.scratch")
 

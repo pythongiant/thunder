@@ -10,13 +10,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from turboquant_vllm.attention.cache_layout import (
-    TurboQuantCacheLayout,
+from thunder_vllm.attention.cache_layout import (
+    ThunderCacheLayout,
     allocate_kv_cache,
     reshape_and_cache_ref,
 )
-from turboquant_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
-from turboquant_vllm.quant.quantizer import TurboQuantQuantizer
+from thunder_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
+from thunder_vllm.quant.quantizer import ThunderQuantizer
 
 
 def _fill_cache(layout, q, kv, scales, n_tokens, seed=0):
@@ -29,10 +29,10 @@ def _fill_cache(layout, q, kv, scales, n_tokens, seed=0):
 
 
 def test_gather_matches_block_table_walk():
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=4, head_dim=128, k_bits=4, v_bits=4, block_size=16
     )
-    q = TurboQuantQuantizer(128, 4, 4)
+    q = ThunderQuantizer(128, 4, 4)
     nb = 8
     kv, scales = allocate_kv_cache(nb, 16, 4, 128, 4, 4, device="cpu")
     key, _, _ = _fill_cache(layout, q, kv, scales, nb * 16)
@@ -63,7 +63,7 @@ def test_gather_matches_block_table_walk():
 
 
 def test_gather_row_map_and_reserve_identity():
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=2, head_dim=64, k_bits=4, v_bits=4, block_size=16
     )
     mgr = PagedKVManager(layout, max_num_reqs=2, max_blocks_per_req=4, device="cpu")
@@ -76,10 +76,10 @@ def test_gather_row_map_and_reserve_identity():
 
 
 def test_gather_in_place_reuses_buffer():
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=2, head_dim=64, k_bits=4, v_bits=4, block_size=16
     )
-    q = TurboQuantQuantizer(64, 4, 4)
+    q = ThunderQuantizer(64, 4, 4)
     nb = 4
     kv, scales = allocate_kv_cache(nb, 16, 2, 64, 4, 4, device="cpu")
     _fill_cache(layout, q, kv, scales, nb * 16, seed=7)
@@ -92,7 +92,7 @@ def test_gather_in_place_reuses_buffer():
 
 
 def test_make_manager_block_count():
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=1, head_dim=64, k_bits=4, v_bits=4, block_size=32
     )
     mgr = make_paged_kv_manager(layout, max_num_reqs=4, max_model_len=100, device="cpu")
@@ -101,7 +101,7 @@ def test_make_manager_block_count():
 
 
 def test_seq_row_counts():
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=1, head_dim=64, k_bits=2, v_bits=2, block_size=16
     )
     mgr = PagedKVManager(layout, max_num_reqs=4, max_blocks_per_req=4, device="cpu")
@@ -118,7 +118,7 @@ def test_gather_at_smaller_table_than_reservation():
     The page-row count must come from the (padded) table actually handed in, and
     the in-place variant must copy only the valid rows.
     """
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=8, head_dim=128, k_bits=4, v_bits=4, block_size=16
     )
     nb = 8

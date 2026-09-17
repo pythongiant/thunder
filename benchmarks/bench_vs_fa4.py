@@ -1,4 +1,4 @@
-"""Kernel-level benchmark: TurboQuant-CuTe vs FA4 (``FlashAttentionForwardSm100``).
+"""Kernel-level benchmark: Thunder-CuTe vs FA4 (``FlashAttentionForwardSm100``).
 
 FA4 exposes no public ``AttentionBackend`` in vLLM, so this benchmark is at the
 kernel level. A *dense fp16* KV cache is built alongside the packed TurboQuant
@@ -81,9 +81,9 @@ def bench_one(batch: int, seqlen: int) -> dict:
 
     # Our kernel: launcher is wired once the schedule lands.
     try:
-        from turboquant_vllm.attention.cute_kernel import launch_turboquant_attention
+        from thunder_vllm.attention.cute_kernel import launch_thunder_attention
 
-        result["ours"] = _time_ours(sb, launch_turboquant_attention)
+        result["ours"] = _time_ours(sb, launch_thunder_attention)
     except Exception as exc:  # noqa: BLE001
         result["ours_error"] = repr(exc)
 
@@ -99,10 +99,10 @@ def bench_one(batch: int, seqlen: int) -> dict:
 
 
 def _time_ours(sb, launcher):
-    from turboquant_vllm.attention.cute_kernel import TurboQuantAttentionForward
-    from turboquant_vllm.attention.paged_kv import make_paged_kv_manager
+    from thunder_vllm.attention.cute_kernel import ThunderAttentionForward
+    from thunder_vllm.attention.paged_kv import make_paged_kv_manager
 
-    kernel = TurboQuantAttentionForward(
+    kernel = ThunderAttentionForward(
         head_dim=HEAD_DIM,
         K_BITS=sb.layout.k_bits,
         V_BITS=sb.layout.v_bits,
@@ -162,7 +162,7 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
-        f.write("# TurboQuant-CuTe vs FA4 (kernel level)\n\n")
+        f.write("# Thunder-CuTe vs FA4 (kernel level)\n\n")
         f.write(
             "| batch | seqlen | FA4 latency ms (med/p20/p80) | ours latency | "
             "TFLOPs ours | TFLOPs FA4 | eff BW ours GB/s | BW FA4 GB/s | "

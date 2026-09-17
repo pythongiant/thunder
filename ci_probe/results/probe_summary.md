@@ -64,7 +64,7 @@ an fp32 SDPA over the *dequantized* K/V, and the kernel matches it to ~1e-3.
 2. **Probe, not kernel: wrong basis.** The kernel scores in the rotated basis
    and accumulates `P @ (R V)`, so the reference had to be built in the rotated
    basis. This also pinned down a contract requirement: the caller must apply
-   `R^T` to the output, which `TurboQuantAttentionImpl.forward` does as its
+   `R^T` to the output, which `ThunderAttentionImpl.forward` does as its
    output-projection GEMM.
 3. `ldmatrix` requires 128-bit-aligned SMEM sources and a swizzle-compatible
    layout. v0 uses plain 16-bit universal copies; 32-bit copies cannot vectorize
@@ -72,7 +72,7 @@ an fp32 SDPA over the *dequantized* K/V, and the kernel matches it to ~1e-3.
 
 ## P3b path A: tcgen05 / TMEM (sync fixed; operand K-order mismatch remains)
 
-`turboquant_vllm/attention/cute_kernel_tcgen05.py` is the attempted tcgen05
+`thunder_vllm/attention/cute_kernel_tcgen05.py` is the attempted tcgen05
 conversion. It does **not** compile, and the blocker is in CUTLASS-DSL 4.7.1,
 not in the schedule:
 
@@ -186,7 +186,7 @@ One compiler caveat found on the way: replacing the epilogue sub-tiled readback
 `cute.make_fragment_like(tDtS, Float32)` **segfaults the CuTeDSL compiler**
 (SIGSEGV, returncode -11) on this build, so the sub-tiled readback is retained.
 
-The backend refuses `TURBOQUANT_SCHEDULE=tcgen05` with a message pointing at
+The backend refuses `THUNDER_SCHEDULE=tcgen05` with a message pointing at
 this module rather than silently falling back.
 
 ## P3b follow-up
@@ -1106,10 +1106,10 @@ Note v0 requires m_block_size == num_threads//32*16 == 64 with 128 threads; tile
 ## 2026-09-17 — PHASE 1 NUMBERS ON B200 (v0 mma_sync, default schedule)
 
 Harness fix required first: ci/modal_bench_smoke.py called
-launch_turboquant_attention(None, q, gathered, out, None, scale, quantizer=...)
+launch_thunder_attention(None, q, gathered, out, None, scale, quantizer=...)
 but the launcher now reads kernel.k_packed_bytes and needs metadata
 (seq_lens/query_start_loc), so the old call could not type-check. Updated the smoke
-to construct TurboQuantAttentionForward + a SimpleNamespace metadata, matching the
+to construct ThunderAttentionForward + a SimpleNamespace metadata, matching the
 exec probe. bench_common itself was already current.
 
 RESULTS (B200, schedule = mma_sync, reference = dequant-to-fp16 + fp16 SDPA on the

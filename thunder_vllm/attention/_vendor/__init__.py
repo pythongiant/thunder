@@ -4,7 +4,7 @@
 ``blackwell_helpers`` issues ``tcgen05.mma`` with explicit TMEM offsets. Both are
 copied from Dao-AILab/flash-attention because CUTLASS-DSL 4.7.1's high-level
 ``cute.gemm`` cannot drive a tcgen05 SMEMxSMEM MMA (see
-``turboquant_vllm/attention/cute_kernel_tcgen05.py``).
+``thunder_vllm/attention/cute_kernel_tcgen05.py``).
 
 Nothing is imported eagerly here: both modules depend on ``cutlass``, and this
 package must stay importable on CPU-only hosts.

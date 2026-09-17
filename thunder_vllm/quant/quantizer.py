@@ -21,9 +21,9 @@ from dataclasses import dataclass
 
 import torch
 
-from turboquant_vllm.quant.hadamard import HadamardRotation
-from turboquant_vllm.quant.lloyd_max import Codebook, build_lut
-from turboquant_vllm.quant.packing import pack_indices, unpack_indices
+from thunder_vllm.quant.hadamard import HadamardRotation
+from thunder_vllm.quant.lloyd_max import Codebook, build_lut
+from thunder_vllm.quant.packing import pack_indices, unpack_indices
 
 
 @dataclass
@@ -36,7 +36,7 @@ class QuantizedKV:
     v_norm: torch.Tensor  # (N, Hk) fp16
 
 
-class TurboQuantQuantizer:
+class ThunderQuantizer:
     """Owns the rotation and both codebooks for one layer.
 
     Args:
@@ -86,7 +86,7 @@ class TurboQuantQuantizer:
         ).contiguous()
 
     def _make_codebook(self, bits: int, seed: int) -> Codebook:
-        from turboquant_vllm.quant.lloyd_max import build_lloyd_max_codebook
+        from thunder_vllm.quant.lloyd_max import build_lloyd_max_codebook
 
         return build_lloyd_max_codebook(bits, head_dim=self.head_dim, seed=seed,
                                         device=self.device)

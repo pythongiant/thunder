@@ -1,7 +1,7 @@
 """tcgen05 / TMEM schedule for the TurboQuant forward (opt-in).
 
-Select with ``TURBOQUANT_SCHEDULE=tcgen05``. The default remains the verified
-cooperative ``mma.sync`` schedule in :mod:`turboquant_vllm.attention.cute_kernel`.
+Select with ``THUNDER_SCHEDULE=tcgen05``. The default remains the verified
+cooperative ``mma.sync`` schedule in :mod:`thunder_vllm.attention.cute_kernel`.
 
 Status
 ------
@@ -72,7 +72,7 @@ operands, ``declare_ptx_smem_desc`` computed once from
 gmem staging buffer (`make_tiled_tma_atom_A/B`), which is what every canonical
 example does and which guarantees the descriptor matches. Then re-run
 ``ci_probe/modal_probe_exec.py --kernel-module
-turboquant_vllm.attention.cute_kernel_tcgen05 --tile-m 128 --tile-n 64`` and
+thunder_vllm.attention.cute_kernel_tcgen05 --tile-m 128 --tile-n 64`` and
 expect 0 violations.
 
 Pattern
@@ -108,8 +108,8 @@ from cutlass.cute.nvgpu import tcgen05
 import cutlass.utils as utils_basic
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import pipeline as _pipeline
-from turboquant_vllm.attention._vendor import blackwell_helpers as _bh
-from turboquant_vllm.attention._vendor import mma_sm100_desc as _sd
+from thunder_vllm.attention._vendor import blackwell_helpers as _bh
+from thunder_vllm.attention._vendor import mma_sm100_desc as _sd
 from cutlass._mlir.dialects import llvm
 
 
@@ -132,7 +132,7 @@ def _fence_proxy_async_shared():
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
-from turboquant_vllm.attention.cute_kernel import (
+from thunder_vllm.attention.cute_kernel import (
     _LOG2E,
     _copy_lut_to_smem,
     _dequantize_strided,
@@ -140,7 +140,7 @@ from turboquant_vllm.attention.cute_kernel import (
     _unpack,
     _load_kv_packed,
 )
-from turboquant_vllm.utils.logging import get_logger
+from thunder_vllm.utils.logging import get_logger
 
 logger = get_logger("attention.cute_kernel_tcgen05")
 
@@ -331,11 +331,11 @@ def _flat(x: cute.Tensor):
     return cute.group_modes(x, 0, cute.rank(x))
 
 
-class TurboQuantAttentionForward:
+class ThunderAttentionForward:
     """tcgen05/TMEM TurboQuant forward (cooperative, two-pass).
 
     Same ``__call__`` contract as the default schedule, so the launcher in
-    :mod:`turboquant_vllm.attention.cute_kernel` and the backend are
+    :mod:`thunder_vllm.attention.cute_kernel` and the backend are
     schedule-agnostic.
     """
 

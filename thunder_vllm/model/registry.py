@@ -3,7 +3,7 @@
 The entry point is declared in ``pyproject.toml``::
 
     [project.entry-points."vllm.general_plugins"]
-    turboquant_cute = "turboquant_vllm.model.registry:register"
+    thunder_cute = "thunder_vllm.model.registry:register"
 
 vLLM calls ``register()`` once at engine startup.
 
@@ -16,7 +16,7 @@ this project exists to beat, so the CuTe backend registers into the third-party
 
 If a future vLLM exposes a dynamic backend-registration hook (or the plugin is
 deployed alongside a patched enum), :func:`register` also installs a
-``TURBOQUANT_CUTE`` enum alias when that is possible without touching the
+``THUNDER_CUTE`` enum alias when that is possible without touching the
 upstream ``TURBOQUANT`` member.
 """
 
@@ -25,17 +25,17 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from turboquant_vllm.attention.backend import (
+from thunder_vllm.attention.backend import (
     BACKEND_NAME,
-    TurboQuantAttentionBackend,
-    TurboQuantCuteConfig,
+    ThunderAttentionBackend,
+    ThunderCuteConfig,
 )
-from turboquant_vllm.utils.logging import get_logger
+from thunder_vllm.utils.logging import get_logger
 
 logger = get_logger("model.registry")
 
 _BACKEND_PATH = (
-    "turboquant_vllm.attention.backend.TurboQuantAttentionBackend"
+    "thunder_vllm.attention.backend.ThunderAttentionBackend"
 )
 
 
@@ -52,10 +52,10 @@ def configure(
     environment once at impl construction.
     """
     mapping = {
-        "TURBOQUANT_K_BITS": k_bits,
-        "TURBOQUANT_V_BITS": v_bits,
-        "TURBOQUANT_NUM_STAGES": num_stages,
-        "TURBOQUANT_NUM_THREADS": num_threads,
+        "THUNDER_K_BITS": k_bits,
+        "THUNDER_V_BITS": v_bits,
+        "THUNDER_NUM_STAGES": num_stages,
+        "THUNDER_NUM_THREADS": num_threads,
     }
     for key, val in mapping.items():
         if val is not None:
@@ -63,7 +63,7 @@ def configure(
 
 
 def _install_enum_alias() -> None:
-    """Best-effort install of a ``TURBOQUANT_CUTE`` enum member.
+    """Best-effort install of a ``THUNDER_CUTE`` enum member.
 
     Python ``Enum`` forbids adding members after class creation; we only inject
     into the lookup tables, and only when the member is absent. Failure is
@@ -101,7 +101,7 @@ def register() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "vLLM attention backend registry not found (%s); "
-            "TurboQuant-CuTe backend will not be selectable",
+            "Thunder-CuTe backend will not be selectable",
             exc,
         )
         return
@@ -109,7 +109,7 @@ def register() -> None:
     register_backend(AttentionBackendEnum.CUSTOM, _BACKEND_PATH)
     _install_enum_alias()
 
-    cfg = TurboQuantCuteConfig.from_env()
+    cfg = ThunderCuteConfig.from_env()
     logger.info(
         "registered attention backend %s (K_BITS=%d V_BITS=%d, select with "
         "--attention-backend %s)",
@@ -120,8 +120,8 @@ def register() -> None:
     )
 
 
-def backend_cls() -> type[TurboQuantAttentionBackend]:
-    return TurboQuantAttentionBackend
+def backend_cls() -> type[ThunderAttentionBackend]:
+    return ThunderAttentionBackend
 
 
 __all__ = ["backend_cls", "configure", "register"]

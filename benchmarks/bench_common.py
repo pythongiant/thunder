@@ -23,11 +23,11 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # noqa: BLE001
     triton_do_bench = None
 
-from turboquant_vllm.attention.cache_layout import (
-    TurboQuantCacheLayout,
+from thunder_vllm.attention.cache_layout import (
+    ThunderCacheLayout,
     allocate_kv_cache,
 )
-from turboquant_vllm.quant.quantizer import TurboQuantQuantizer
+from thunder_vllm.quant.quantizer import ThunderQuantizer
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +91,7 @@ def bandwidth_fwd_bytes(
     return float((q + k + v + o) * dtype_bytes)
 
 
-def effective_kv_bytes(layout: TurboQuantCacheLayout, seqlen_k: int, batch: int = 1) -> float:
+def effective_kv_bytes(layout: ThunderCacheLayout, seqlen_k: int, batch: int = 1) -> float:
     """Bytes the TurboQuant kernel reads for the KV cache.
 
     Per (token, kv-head) position: packed K + packed V codes plus two fp16
@@ -104,7 +104,7 @@ def effective_kv_bytes(layout: TurboQuantCacheLayout, seqlen_k: int, batch: int 
 
 
 def memory_tokens_per_gb(
-    layout: TurboQuantCacheLayout, budget_gb: float = 40.0
+    layout: ThunderCacheLayout, budget_gb: float = 40.0
 ) -> float:
     """How many KV positions fit in ``budget_gb`` for this layout.
 
@@ -209,8 +209,8 @@ class SyntheticBatch:
     kv_scales: torch.Tensor
     block_table: torch.Tensor
     seq_lens: torch.Tensor
-    layout: TurboQuantCacheLayout
-    quantizer: TurboQuantQuantizer
+    layout: ThunderCacheLayout
+    quantizer: ThunderQuantizer
 
 
 def make_synthetic_batch(
@@ -228,18 +228,18 @@ def make_synthetic_batch(
     seed: int = 0,
 ) -> SyntheticBatch:
     """Build a batch with a realistic paged KV cache and block table."""
-    from turboquant_vllm.attention.cache_layout import reshape_and_cache_ref
+    from thunder_vllm.attention.cache_layout import reshape_and_cache_ref
 
     dev = torch.device(device)
     torch.manual_seed(seed)
-    layout = TurboQuantCacheLayout(
+    layout = ThunderCacheLayout(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         k_bits=k_bits,
         v_bits=v_bits,
         block_size=block_size,
     )
-    quant = TurboQuantQuantizer(head_dim, k_bits, v_bits, device=dev)
+    quant = ThunderQuantizer(head_dim, k_bits, v_bits, device=dev)
 
     blocks_per_req = math.ceil(seqlen / block_size)
     num_blocks = batch * blocks_per_req

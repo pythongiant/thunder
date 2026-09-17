@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 
-_PREFIX = "turboquant_vllm"
+_PREFIX = "thunder_vllm"
 _configured: dict[str, logging.Logger] = {}
 
 try:  # pragma: no cover - exercised only inside a real vLLM install
@@ -35,7 +35,7 @@ def get_logger(name: str | None = None) -> logging.Logger:
                 logging.Formatter("[%(asctime)s %(levelname)s %(name)s] %(message)s")
             )
             logger.addHandler(handler)
-        logger.setLevel(os.environ.get("TURBOQUANT_LOG_LEVEL", "INFO").upper())
+        logger.setLevel(os.environ.get("THUNDER_LOG_LEVEL", "INFO").upper())
         logger.propagate = False
 
     _configured[full] = logger

@@ -1,4 +1,4 @@
-"""Attention metadata for the TurboQuant-CuTe backend.
+"""Attention metadata for the Thunder-CuTe backend.
 
 vLLM ``main`` replaced the old ``get_metadata_cls()`` + classmethod ``build()``
 contract with a *builder* class: ``AttentionBackend.get_builder_cls()`` returns
@@ -17,7 +17,7 @@ from typing import Any, ClassVar
 
 import torch
 
-from turboquant_vllm.utils.logging import get_logger
+from thunder_vllm.utils.logging import get_logger
 
 logger = get_logger("attention.metadata")
 
@@ -54,7 +54,7 @@ except Exception:  # noqa: BLE001
 
 
 @dataclass
-class TurboQuantMetadata(AttentionMetadata):
+class ThunderMetadata(AttentionMetadata):
     """Everything the CuTe kernel needs to resolve its KV tiles.
 
     Mirrors ``FlashAttentionMetadata`` in vLLM: a flat token axis
@@ -119,8 +119,8 @@ class TurboQuantMetadata(AttentionMetadata):
         return slice(lo, hi)
 
 
-class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
-    """Builds :class:`TurboQuantMetadata` from ``CommonAttentionMetadata``.
+class ThunderMetadataBuilder(AttentionMetadataBuilder[ThunderMetadata]):
+    """Builds :class:`ThunderMetadata` from ``CommonAttentionMetadata``.
 
     ``_cudagraph_support`` is declared as ``UNIFORM_SINGLE_TOKEN_DECODE``: the
     CuTe kernel is only captured for pure single-token decode batches, which is
@@ -142,7 +142,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         self.layer_names = list(layer_names)
         self.vllm_config = vllm_config
         self.device = device
-        # Engine capacities for the gather reservation (see TurboQuantMetadata).
+        # Engine capacities for the gather reservation (see ThunderMetadata).
         self._cap_num_reqs = 0
         self._cap_model_len = 0
         try:
@@ -164,7 +164,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         common_prefix_len: int,
         common_attn_metadata: Any,
         fast_build: bool = False,
-    ) -> TurboQuantMetadata:
+    ) -> ThunderMetadata:
         cam = common_attn_metadata
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             _split_decodes_and_prefills(cam)
@@ -172,7 +172,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         max_query_len = int(getattr(cam, "max_query_len", 0) or 0)
         max_seq_len = int(getattr(cam, "max_seq_len", 0) or 0)
         seq_lens = getattr(cam, "seq_lens", None)
-        return TurboQuantMetadata(
+        return ThunderMetadata(
             seq_lens=seq_lens,
             slot_mapping=cam.slot_mapping,
             block_table=cam.block_table_tensor,
@@ -194,7 +194,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             seq_lens_cpu=getattr(cam, "seq_lens_cpu_upper_bound", None),
         )
 
-    def build_for_cudagraph_capture(self, common_attn_metadata: Any) -> TurboQuantMetadata:
+    def build_for_cudagraph_capture(self, common_attn_metadata: Any) -> ThunderMetadata:
         """Capture-time metadata with placeholder seq_lens.
 
         The graph is replayed with real ``seq_lens`` written into the same
@@ -228,12 +228,12 @@ def _split_decodes_and_prefills(cam: Any) -> tuple[int, int, int, int]:
     return 0, num_actual, 0, num_actual
 
 
-def get_builder_cls() -> type[TurboQuantMetadataBuilder]:
-    return TurboQuantMetadataBuilder
+def get_builder_cls() -> type[ThunderMetadataBuilder]:
+    return ThunderMetadataBuilder
 
 
 __all__ = [
-    "TurboQuantMetadata",
-    "TurboQuantMetadataBuilder",
+    "ThunderMetadata",
+    "ThunderMetadataBuilder",
     "get_builder_cls",
 ]

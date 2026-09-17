@@ -44,7 +44,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 
-from turboquant_vllm.utils.logging import get_logger
+from thunder_vllm.utils.logging import get_logger
 
 logger = get_logger("attention.cute_kernel")
 
@@ -61,7 +61,7 @@ VARIANT_PACKING = 6
 _LOG2E = 1.4426950408889634
 
 
-class TurboQuantConfig(NamedTuple):
+class ThunderConfig(NamedTuple):
     """Compile-time configuration (the prototype's public shape)."""
 
     head_dim: int
@@ -163,7 +163,7 @@ def _copy_lut_to_smem(
             sLut[idx // head_dim, idx % head_dim] = mLut[idx // head_dim, idx % head_dim]
 
 
-class TurboQuantAttentionForward:
+class ThunderAttentionForward:
     """Cooperative TurboQuant forward.
 
     ``num_threads`` is a multiple of 32 and ``m_block_size == tile_m`` must be
@@ -704,8 +704,8 @@ class KernelNotReadyError(RuntimeError):
 _DBG_BUFFER = None
 
 
-def launch_turboquant_attention(
-    kernel: TurboQuantAttentionForward,
+def launch_thunder_attention(
+    kernel: ThunderAttentionForward,
     q,
     gathered,
     out,

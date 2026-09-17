@@ -37,10 +37,10 @@ def run(dbg_mode):
     from cutlass.cute.runtime import from_dlpack
 
     mod = _il.import_module(
-        os.environ.get("TQ_KERNEL_MODULE", "turboquant_vllm.attention.cute_kernel_tcgen05")
+        os.environ.get("TQ_KERNEL_MODULE", "thunder_vllm.attention.cute_kernel_tcgen05")
     )
-    Fwd = mod.TurboQuantAttentionForward
-    from turboquant_vllm.quant.packing import pack_indices
+    Fwd = mod.ThunderAttentionForward
+    from thunder_vllm.quant.packing import pack_indices
 
     k_lut, v_lut, code_k, code_v = build()
 

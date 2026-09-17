@@ -21,8 +21,8 @@ from cutlass import Float16, Float32, Int32, Int64, Uint8
 from cutlass import pipeline as _pipeline
 from cutlass.cute.nvgpu import tcgen05
 
-from turboquant_vllm.attention._vendor import blackwell_helpers as _bh
-from turboquant_vllm.attention._vendor import mma_sm100_desc as _sd
+from thunder_vllm.attention._vendor import blackwell_helpers as _bh
+from thunder_vllm.attention._vendor import mma_sm100_desc as _sd
 
 @cute.jit
 def sentinel(k):

@@ -1,8 +1,8 @@
 """vLLM attention backend + impl for the fused TurboQuant CuTeDSL kernel.
 
-Registered as ``TURBOQUANT_CUTE`` through ``AttentionBackendEnum.CUSTOM`` (see
+Registered as ``THUNDER_CUTE`` through ``AttentionBackendEnum.CUSTOM`` (see
 ``model/registry.py``), deliberately *not* as ``TURBOQUANT``: upstream vLLM
-already ships a ``TurboQuantAttentionBackend`` under that name, and we need it
+already ships a ``ThunderAttentionBackend`` under that name, and we need it
 intact to benchmark against.
 
 Only the plumbing lives here; the kernel itself is in ``cute_kernel.py`` and is
@@ -17,18 +17,18 @@ from typing import Any, ClassVar
 
 import torch
 
-from turboquant_vllm.attention.cache_layout import (
-    TurboQuantCacheLayout,
+from thunder_vllm.attention.cache_layout import (
+    ThunderCacheLayout,
     allocate_kv_cache,
     reshape_and_cache,
 )
-from turboquant_vllm.attention.metadata import (
-    TurboQuantMetadata,
-    TurboQuantMetadataBuilder,
+from thunder_vllm.attention.metadata import (
+    ThunderMetadata,
+    ThunderMetadataBuilder,
 )
-from turboquant_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
-from turboquant_vllm.attention.scratch import ScratchState, new_scratch, reserve_scratch
-from turboquant_vllm.utils.logging import get_logger, log_once
+from thunder_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
+from thunder_vllm.attention.scratch import ScratchState, new_scratch, reserve_scratch
+from thunder_vllm.utils.logging import get_logger, log_once
 
 logger = get_logger("attention.backend")
 
@@ -59,20 +59,20 @@ except Exception:  # noqa: BLE001
         DECODER = "decoder"
 
 
-BACKEND_NAME = "TURBOQUANT_CUTE"
+BACKEND_NAME = "THUNDER_CUTE"
 
 # Name that must be returned by ``get_name()``. vLLM resolves the backend name
 # through ``AttentionBackendEnum[name]``, and ``register_backend`` keys the
 # override by the ENUM MEMBER, so the resolvable name is "CUSTOM" -- our display
-# name "TURBOQUANT_CUTE" is not an enum member and makes the engine fail with
-#   ValueError: Unknown attention backend: 'TURBOQUANT_CUTE'.
+# name "THUNDER_CUTE" is not an enum member and makes the engine fail with
+#   ValueError: Unknown attention backend: 'THUNDER_CUTE'.
 REGISTRY_NAME = "CUSTOM"
 SUPPORTED_HEAD_SIZES = (64, 128, 256)
 SUPPORTED_BLOCK_SIZES = (16, 32, 64, 128)
 
 
 @dataclass(frozen=True)
-class TurboQuantCuteConfig:
+class ThunderCuteConfig:
     """Plugin-level knobs that vLLM has no slot for.
 
     Upstream vLLM encodes the TurboQuant preset in ``kv_cache_dtype`` (a
@@ -95,19 +95,19 @@ class TurboQuantCuteConfig:
     cache_block_size: int = 16
 
     @classmethod
-    def from_env(cls, kv_cache_dtype: str | None = None) -> TurboQuantCuteConfig:
+    def from_env(cls, kv_cache_dtype: str | None = None) -> ThunderCuteConfig:
         k_bits, v_bits = _bits_from_kv_cache_dtype(kv_cache_dtype)
         env = os.environ
         return cls(
-            k_bits=int(env.get("TURBOQUANT_K_BITS", k_bits)),
-            v_bits=int(env.get("TURBOQUANT_V_BITS", v_bits)),
-            num_stages=int(env.get("TURBOQUANT_NUM_STAGES", 2)),
-            num_dequant_stages=int(env.get("TURBOQUANT_NUM_DEQUANT_STAGES", 2)),
-            num_threads=int(env.get("TURBOQUANT_NUM_THREADS", 128)),
-            m_block_size=int(env.get("TURBOQUANT_M_BLOCK", 64)),
-            n_block_size=int(env.get("TURBOQUANT_N_BLOCK", 64)),
-            q_stage=int(env.get("TURBOQUANT_Q_STAGE", 2)),
-            use_2cta_instrs=env.get("TURBOQUANT_USE_2CTA", "0") == "1",
+            k_bits=int(env.get("THUNDER_K_BITS", k_bits)),
+            v_bits=int(env.get("THUNDER_V_BITS", v_bits)),
+            num_stages=int(env.get("THUNDER_NUM_STAGES", 2)),
+            num_dequant_stages=int(env.get("THUNDER_NUM_DEQUANT_STAGES", 2)),
+            num_threads=int(env.get("THUNDER_NUM_THREADS", 128)),
+            m_block_size=int(env.get("THUNDER_M_BLOCK", 64)),
+            n_block_size=int(env.get("THUNDER_N_BLOCK", 64)),
+            q_stage=int(env.get("THUNDER_Q_STAGE", 2)),
+            use_2cta_instrs=env.get("THUNDER_USE_2CTA", "0") == "1",
         )
 
     def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool) -> tuple:
@@ -131,10 +131,10 @@ class TurboQuantCuteConfig:
 def _kernel_module():
     """Pick the kernel schedule: ``mma`` (default) or ``tcgen05``.
 
-    Selected with ``TURBOQUANT_SCHEDULE``. The tcgen05 module is a drop-in for
+    Selected with ``THUNDER_SCHEDULE``. The tcgen05 module is a drop-in for
     the same call contract, so only the import site changes.
     """
-    which = os.environ.get("TURBOQUANT_SCHEDULE", "mma").lower()
+    which = os.environ.get("THUNDER_SCHEDULE", "mma").lower()
     if which in ("tcgen05", "tmem"):
         raise NotImplementedError(
             "the tcgen05 schedule is not finished (path A in progress). It needs "
@@ -142,15 +142,15 @@ def _kernel_module():
             "gemm_ptx_precomputed_varname) to drive the SMEMxSMEM MMA; the "
             "vendored helpers are in place and the TMEM/mbarrier/readback parts "
             "are API-correct. See the module docstring of "
-            "turboquant_vllm/attention/cute_kernel_tcgen05.py and "
-            "ci_probe/results/probe_summary.md. Use TURBOQUANT_SCHEDULE=mma."
+            "thunder_vllm/attention/cute_kernel_tcgen05.py and "
+            "ci_probe/results/probe_summary.md. Use THUNDER_SCHEDULE=mma."
         )
-    from turboquant_vllm.attention import cute_kernel as mod
+    from thunder_vllm.attention import cute_kernel as mod
     return mod
 
 
 def _bits_from_kv_cache_dtype(kv_cache_dtype: str | None) -> tuple[int, int]:
-    """Best-effort parse of a ``turboquant_*`` cache-dtype string."""
+    """Best-effort parse of a ``thunder_*`` cache-dtype string."""
     if not kv_cache_dtype:
         return 4, 4
     s = kv_cache_dtype.lower()
@@ -165,19 +165,19 @@ def _bits_from_kv_cache_dtype(kv_cache_dtype: str | None) -> tuple[int, int]:
     return 4, 4
 
 
-class TurboQuantAttentionBackend(AttentionBackend):
-    """Backend registration surface for ``TURBOQUANT_CUTE``."""
+class ThunderAttentionBackend(AttentionBackend):
+    """Backend registration surface for ``THUNDER_CUTE``."""
 
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = False
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[str]] = [
-        "turboquant_cute",
-        "turboquant_k8v4",
-        "turboquant_k3v4_nc",
-        "turboquant_4bit_nc",
-        "turboquant_3bit_nc",
+        "thunder_cute",
+        "thunder_k8v4",
+        "thunder_k3v4_nc",
+        "thunder_4bit_nc",
+        "thunder_3bit_nc",
     ]
 
     @staticmethod
@@ -186,11 +186,11 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls():
-        return TurboQuantAttentionImpl
+        return ThunderAttentionImpl
 
     @staticmethod
     def get_builder_cls():
-        return TurboQuantMetadataBuilder
+        return ThunderMetadataBuilder
 
     # -- capability queries ------------------------------------------------
     @staticmethod
@@ -210,7 +210,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
         #   ['block_size not supported']
         # Accept None and let the kernel's own cache_block_size govern.
         result = True if block_size is None else block_size in SUPPORTED_BLOCK_SIZES
-        if os.environ.get("TURBOQUANT_DEBUG_BLOCK"):
+        if os.environ.get("THUNDER_DEBUG_BLOCK"):
             logger.info(
                 "supports_block_size(%r) -> %s (supported=%s)",
                 block_size, result, SUPPORTED_BLOCK_SIZES,
@@ -239,7 +239,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
         if kv_cache_dtype is None:
             return True
         s = str(kv_cache_dtype)
-        return s == "auto" or s.startswith("turboquant")
+        return s == "auto" or s.startswith("thunder")
 
     @classmethod
     def supports_attn_type(cls, attn_type: Any) -> bool:
@@ -262,8 +262,8 @@ class TurboQuantAttentionBackend(AttentionBackend):
         head_size: int,
     ) -> tuple[int, ...]:
         """Combined packed-KV slot shape: ``(blocks, block_size, slot_bytes)``."""
-        cfg = TurboQuantCuteConfig.from_env()
-        layout = TurboQuantCacheLayout(
+        cfg = ThunderCuteConfig.from_env()
+        layout = ThunderCacheLayout(
             num_kv_heads=num_kv_heads,
             head_dim=head_size,
             k_bits=cfg.k_bits,
@@ -271,7 +271,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
             block_size=block_size,
         )
         shape = layout.get_kv_cache_shape(num_blocks)
-        if os.environ.get("TURBOQUANT_DEBUG_LAYOUT"):
+        if os.environ.get("THUNDER_DEBUG_LAYOUT"):
             logger.info(
                 "get_kv_cache_shape(num_blocks=%d, block_size=%d, num_kv_heads=%d, "
                 "head_size=%d) -> %s",
@@ -297,8 +297,8 @@ class TurboQuantAttentionBackend(AttentionBackend):
         # the factor the gather reshape failed on.
         prev = getattr(spec, "state_content_bytes", None)
         try:
-            cfg = TurboQuantCuteConfig.from_env()
-            layout = TurboQuantCacheLayout(
+            cfg = ThunderCuteConfig.from_env()
+            layout = ThunderCacheLayout(
                 num_kv_heads=spec.num_kv_heads,
                 head_dim=spec.head_size,
                 k_bits=cfg.k_bits,
@@ -364,7 +364,7 @@ def _copy_blocks_one(kv_caches: Any, src: Any, dst: Any) -> None:
         cache[dst].copy_(cache[src])
 
 
-class TurboQuantAttentionImpl(AttentionImplBase):
+class ThunderAttentionImpl(AttentionImplBase):
     """Owns the compiled kernel, the gather buffers, and the scratch pools."""
 
     supports_quant_query_input: bool = False
@@ -386,9 +386,9 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         **kwargs: Any,
     ) -> None:
         if alibi_slopes is not None:
-            raise NotImplementedError("TURBOQUANT_CUTE does not support alibi")
+            raise NotImplementedError("THUNDER_CUTE does not support alibi")
         if logits_soft_cap:
-            raise NotImplementedError("TURBOQUANT_CUTE does not support logits_soft_cap")
+            raise NotImplementedError("THUNDER_CUTE does not support logits_soft_cap")
 
         self.num_heads = int(num_heads)
         self.head_size = int(head_size)
@@ -399,7 +399,7 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         self.sliding_window = sliding_window
         self.attn_type = attn_type
 
-        cfg = TurboQuantCuteConfig.from_env(kv_cache_dtype)
+        cfg = ThunderCuteConfig.from_env(kv_cache_dtype)
         if K_BITS is not None or V_BITS is not None:
             cfg = replace(
                 cfg,
@@ -408,7 +408,7 @@ class TurboQuantAttentionImpl(AttentionImplBase):
             )
         self.cfg = cfg
 
-        self.layout = TurboQuantCacheLayout(
+        self.layout = ThunderCacheLayout(
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_size,
             k_bits=cfg.k_bits,
@@ -428,9 +428,9 @@ class TurboQuantAttentionImpl(AttentionImplBase):
     # ------------------------------------------------------------------ #
     def _ensure_quantizer(self, device: torch.device) -> Any:
         if self._quantizer is None:
-            from turboquant_vllm.quant.quantizer import TurboQuantQuantizer
+            from thunder_vllm.quant.quantizer import ThunderQuantizer
 
-            self._quantizer = TurboQuantQuantizer(
+            self._quantizer = ThunderQuantizer(
                 self.head_size,
                 self.cfg.k_bits,
                 self.cfg.v_bits,
@@ -462,7 +462,7 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         kernel = self._kernels.get(key)
         if kernel is None:
             mod = _kernel_module()
-            kernel = mod.TurboQuantAttentionForward(
+            kernel = mod.ThunderAttentionForward(
                 head_dim=head_dim,
                 K_BITS=self.cfg.k_bits,
                 V_BITS=self.cfg.v_bits,
@@ -519,7 +519,7 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: TurboQuantMetadata | None,
+        attn_metadata: ThunderMetadata | None,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -547,22 +547,22 @@ class TurboQuantAttentionImpl(AttentionImplBase):
             _v = getattr(attn_metadata, _name, None)
             if _v is None:
                 raise RuntimeError(
-                    f"TurboQuantAttentionImpl.forward: attn_metadata.{_name} is None; "
+                    f"ThunderAttentionImpl.forward: attn_metadata.{_name} is None; "
                     f"metadata type={type(attn_metadata).__name__} "
                     f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)} "
                     f"num_reqs={getattr(attn_metadata, 'num_reqs', None)}"
                 )
             if not torch.is_tensor(_v):
                 raise RuntimeError(
-                    f"TurboQuantAttentionImpl.forward: attn_metadata.{_name} is "
+                    f"ThunderAttentionImpl.forward: attn_metadata.{_name} is "
                     f"{type(_v).__name__}, expected a tensor"
                 )
             if not _v.is_cuda:
                 raise RuntimeError(
-                    f"TurboQuantAttentionImpl.forward: attn_metadata.{_name} is on "
+                    f"ThunderAttentionImpl.forward: attn_metadata.{_name} is on "
                     f"{_v.device}, expected CUDA"
                 )
-        if os.environ.get("TURBOQUANT_DEBUG_LAUNCH"):
+        if os.environ.get("THUNDER_DEBUG_LAUNCH"):
             print(
                 f"[TQ-LAUNCH] q={tuple(query.shape)}/{query.dtype} n={n} "
                 f"kv={tuple(kv_cache.shape)} "
@@ -637,7 +637,7 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         q = query[:n].reshape(n, self.num_heads, self.head_size)
         o = output[:n].reshape(n, self.num_heads, self.head_size)
 
-        from turboquant_vllm.attention.cute_kernel import launch_turboquant_attention
+        from thunder_vllm.attention.cute_kernel import launch_thunder_attention
 
         quantizer = self._ensure_quantizer(query.device)
 
@@ -647,7 +647,7 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         # applied to the output below. Without this, a stock vLLM model yields
         # scores in a different basis and results are silently wrong.
         q = (q.float() @ quantizer.rotation.matrix).to(q.dtype)
-        launch_turboquant_attention(
+        launch_thunder_attention(
             kernel,
             q,
             gathered,
@@ -671,7 +671,7 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         vLLM 0.29 calls this via ``torch.ops.vllm.unified_kv_cache_update`` and
         asserts the impl exposes it:
 
-            AssertionError: TurboQuantAttentionImpl does not support kv cache update
+            AssertionError: ThunderAttentionImpl does not support kv cache update
 
         The write itself is the same ``reshape_and_cache`` the forward path used
         to do inline, so the forward path now only has to handle the case where
@@ -680,9 +680,9 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         The positional convention is discovered rather than assumed: identify the
         cache (largest tensor), the slot mapping (1-D integer), and take
         (key, value) as the remaining two fp16 tensors in order. Set
-        ``TURBOQUANT_DEBUG_KV=1`` to log exactly what arrives.
+        ``THUNDER_DEBUG_KV=1`` to log exactly what arrives.
         """
-        if os.environ.get("TURBOQUANT_DEBUG_KV"):
+        if os.environ.get("THUNDER_DEBUG_KV"):
             logger.info(
                 "do_kv_cache_update args=%s kwargs=%s",
                 [(type(a).__name__, tuple(getattr(a, "shape", ()))) for a in args],
@@ -713,7 +713,7 @@ class TurboQuantAttentionImpl(AttentionImplBase):
         if kv_cache is None or key is None or value is None or slot_mapping is None:
             raise RuntimeError(
                 "do_kv_cache_update could not identify its arguments; set "
-                "TURBOQUANT_DEBUG_KV=1 to log them"
+                "THUNDER_DEBUG_KV=1 to log them"
             )
 
         quantizer = self._ensure_quantizer(key.device)
@@ -786,8 +786,8 @@ def allocate(
 
 __all__ = [
     "BACKEND_NAME",
-    "TurboQuantAttentionBackend",
-    "TurboQuantAttentionImpl",
-    "TurboQuantCuteConfig",
+    "ThunderAttentionBackend",
+    "ThunderAttentionImpl",
+    "ThunderCuteConfig",
     "allocate",
 ]

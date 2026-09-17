@@ -13,13 +13,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from turboquant_vllm.attention.cache_layout import (
-    TurboQuantCacheLayout,
+from thunder_vllm.attention.cache_layout import (
+    ThunderCacheLayout,
     allocate_kv_cache,
     reshape_and_cache_ref,
 )
-from turboquant_vllm.attention.paged_kv import make_paged_kv_manager
-from turboquant_vllm.quant.quantizer import TurboQuantQuantizer
+from thunder_vllm.attention.paged_kv import make_paged_kv_manager
+from thunder_vllm.quant.quantizer import ThunderQuantizer
 
 pytestmark = [pytest.mark.cuda, pytest.mark.sm100]
 
@@ -62,9 +62,9 @@ def _reference(q, k_hat, v_hat, causal, scale):
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("k_bits,v_bits", [(4, 4), (3, 4), (2, 2)])
 def test_kernel_matches_dequant_reference(causal, k_bits, v_bits):
-    from turboquant_vllm.attention.cute_kernel import (
+    from thunder_vllm.attention.cute_kernel import (
         KernelNotReadyError,
-        launch_turboquant_attention,
+        launch_thunder_attention,
     )
 
     torch.manual_seed(0)
@@ -76,8 +76,8 @@ def test_kernel_matches_dequant_reference(causal, k_bits, v_bits):
     k = torch.randn(nk, hk, d, device=device, dtype=torch.float16)
     v = torch.randn(nk, hk, d, device=device, dtype=torch.float16)
 
-    quant = TurboQuantQuantizer(d, k_bits, v_bits, device=device)
-    layout = TurboQuantCacheLayout(
+    quant = ThunderQuantizer(d, k_bits, v_bits, device=device)
+    layout = ThunderCacheLayout(
         num_kv_heads=hk, head_dim=d, k_bits=k_bits, v_bits=v_bits, block_size=16
     )
     nb = (nk + 15) // 16
@@ -108,7 +108,7 @@ def test_kernel_matches_dequant_reference(causal, k_bits, v_bits):
 
     try:
         out = _run_kernel(
-            q, kv, scales, layout, launch_turboquant_attention, quant,
+            q, kv, scales, layout, launch_thunder_attention, quant,
             nq, nk, hq, hk, d, scale, causal,
         )
     except KernelNotReadyError:
@@ -122,7 +122,7 @@ def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale
 
     The kernel scores in the rotated basis (exact, since the rotation is
     orthonormal) and accumulates ``P @ (R V)``, so the caller must apply ``R^T``
-    to the output -- which ``TurboQuantAttentionImpl.forward`` does as its output
+    to the output -- which ``ThunderAttentionImpl.forward`` does as its output
     projection GEMM.
     """
     block_table = torch.arange(
@@ -146,9 +146,9 @@ def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale
             "slot_mapping": torch.arange(nq, device=q.device, dtype=torch.long),
         },
     )()
-    from turboquant_vllm.attention.cute_kernel import TurboQuantAttentionForward
+    from thunder_vllm.attention.cute_kernel import ThunderAttentionForward
 
-    kernel = TurboQuantAttentionForward(
+    kernel = ThunderAttentionForward(
         head_dim=d, K_BITS=layout.k_bits, V_BITS=layout.v_bits,
         qhead_per_kvhead=hq // hk, is_causal=causal,
         m_block_size=64, n_block_size=64, num_threads=128,

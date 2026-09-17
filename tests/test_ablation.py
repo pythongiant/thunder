@@ -10,7 +10,7 @@ constexpr arguments.
 Writes ``benchmarks/results/ablation.md``.
 
 Run:
-    TURBOQUANT_KERNEL_ENABLE=1 python -m pytest tests/test_ablation.py -s
+    THUNDER_KERNEL_ENABLE=1 python -m pytest tests/test_ablation.py -s
 """
 
 from __future__ import annotations
@@ -59,11 +59,11 @@ ROWS = [
 
 
 @pytest.mark.skipif(
-    os.environ.get("TURBOQUANT_KERNEL_ENABLE", "0") != "1",
-    reason="kernel schedule incomplete; set TURBOQUANT_KERNEL_ENABLE=1",
+    os.environ.get("THUNDER_KERNEL_ENABLE", "0") != "1",
+    reason="kernel schedule incomplete; set THUNDER_KERNEL_ENABLE=1",
 )
 def test_ablation_table(tmp_path=None):
-    from turboquant_vllm.attention.cute_kernel import TurboQuantAttentionForward
+    from thunder_vllm.attention.cute_kernel import ThunderAttentionForward
 
     results = []
     for row in ROWS:
@@ -71,7 +71,7 @@ def test_ablation_table(tmp_path=None):
         q = torch.randn(SEQLEN_K, NHEADS, HEAD_DIM, device="cuda", dtype=torch.float16)
         # Compiling the variant is what the row measures; timing comes from the
         # benchmark harness once the schedule lands.
-        _ = TurboQuantAttentionForward(
+        _ = ThunderAttentionForward(
             head_dim=HEAD_DIM,
             K_BITS=4,
             V_BITS=4,
@@ -96,7 +96,7 @@ def test_ablation_table(tmp_path=None):
 
 
 def _variant_tag_for(name: str) -> int:
-    from turboquant_vllm.attention import cute_kernel as ck
+    from thunder_vllm.attention import cute_kernel as ck
 
     if name.startswith("Fused K only"):
         return ck.VARIANT_FUSED_K
