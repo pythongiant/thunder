@@ -814,6 +814,17 @@ class ThunderAttentionImpl(AttentionImplBase):
         pointer. Populated by :meth:`bind_scales` at allocation time.
         """
         scales = getattr(self, "_kv_scales", None)
+        num_blocks = int(kv_cache.shape[0])
+        # Re-derive if the cache changed size. vLLM's KV-cache profile/warmup can
+        # call this with a 1-block cache first; caching that buffer left a
+        # 1-block norm tensor for a ~122k-block cache, so gathering norms for
+        # block ids ran off the end (ScatterGather "index out of bounds") and,
+        # once clamped, silently used block 0's norms. Never resize while a graph
+        # is being captured -- it would move a pointer already baked in.
+        if scales is not None and int(scales.shape[0]) != num_blocks:
+            if torch.cuda.is_current_stream_capturing():
+                return scales
+            scales = None
         if scales is None:
             # vLLM allocates the KV cache itself and threads only that one tensor
             # through the backend API, so nothing calls bind_scales(). Allocate the
@@ -822,7 +833,6 @@ class ThunderAttentionImpl(AttentionImplBase):
             # NOTE: this side buffer is not counted by vLLM's cache accounting;
             # the tidy fix is a view into the norms region of the packed slot.
             try:
-                num_blocks = int(kv_cache.shape[0])
                 shape = self.layout.get_scales_shape(num_blocks)
                 dtype = getattr(self.layout, "scale_dtype", torch.float16) or torch.float16
                 scales = torch.zeros(shape, dtype=dtype, device=kv_cache.device)

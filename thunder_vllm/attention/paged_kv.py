@@ -212,23 +212,45 @@ class PagedKVManager:
         else:
             b_live = b
         b_live = max(1, min(b_live, self.max_blocks_per_req))
-        # Clamp block ids into the cache. vLLM's post-capture kernel warm-up
-        # passes a block table whose entries can exceed the allocated block
-        # count; the raw advanced index then trips a CUDA device assert
-        # (ATen IndexKernel "index out of bounds"). Those positions are padding
-        # -- ``seq_lens`` masks them and the kernel never reads them -- so
-        # clamping to a valid block is correct and keeps the gather faultless.
-        nb = int(kv_cache.shape[0])
-        bt_live = bt[:r, :b_live].clamp(0, max(nb - 1, 0)).contiguous()
 
         k_codes = self.layout.k_codes(kv_cache)
         v_codes = self.layout.v_codes(kv_cache)
         kn = self.layout.k_norm(kv_scales)
         vn = self.layout.v_norm(kv_scales)
 
+        # Clamp block ids into every tensor we are about to index. vLLM's
+        # post-capture kernel warm-up hands a block table whose entries can
+        # exceed the allocated block count; a raw index then trips a CUDA device
+        # assert ("index out of bounds"/"scatter gather kernel index out of
+        # bounds"). Those positions are padding -- masked by seq_lens and never
+        # read by the kernel -- so clamping is correct. Use the minimum of the
+        # four source sizes: the norm buffers (`kv_scales`) are a separate
+        # tensor from the cache and need not have the same block count.
+        nb = min(
+            int(k_codes.shape[0]), int(v_codes.shape[0]),
+            int(kn.shape[0]), int(vn.shape[0]),
+        )
+        bt_live = bt[:r, :b_live].clamp(0, max(nb - 1, 0)).contiguous()
+        bt_flat = bt_live.reshape(-1)
+
+        if env_flag("THUNDER_DEBUG_GATHER") and not capturing:
+            print(
+                f"[TQ-GATHER-CHK] nb={nb} r={r} b_live={b_live} "
+                f"bt_min={int(bt_flat.min())} bt_max={int(bt_flat.max())} "
+                f"k_codes0={int(k_codes.shape[0])} kn0={int(kn.shape[0])}",
+                flush=True,
+            )
+
+        # ``torch.index_select`` on the cache's block axis instead of advanced
+        # indexing ``k_codes[bt_live]``: the advanced-index kernel runs inside a
+        # CUDA graph capture here and poisons the context (the failure surfaces
+        # later at the next cuBLAS op). index_select on a static-shape index is
+        # the capture-safe equivalent.
         # (r, b_live, bs, Hk, pb) in request-major order.
-        k = k_codes[bt_live].reshape(r, b_live, bs, hk, k_pb)
-        v = v_codes[bt_live].reshape(r, b_live, bs, hk, v_pb)
+        k = torch.index_select(k_codes, 0, bt_flat).reshape(r, b_live, bs, hk, k_pb)
+        v = torch.index_select(v_codes, 0, bt_flat).reshape(r, b_live, bs, hk, v_pb)
+        kn_sel = torch.index_select(kn, 0, bt_flat).reshape(r, b_live, bs, hk)
+        vn_sel = torch.index_select(vn, 0, bt_flat).reshape(r, b_live, bs, hk)
 
         kv_view = out.k_packed.view(
             self.max_num_reqs, self.max_blocks_per_req, bs, hk, k_pb
@@ -241,8 +263,8 @@ class PagedKVManager:
 
         kv_view[:r, :b_live].copy_(k)
         vv_view[:r, :b_live].copy_(v)
-        kn_view[:r, :b_live].copy_(kn[bt_live])
-        vn_view[:r, :b_live].copy_(vn[bt_live])
+        kn_view[:r, :b_live].copy_(kn_sel)
+        vn_view[:r, :b_live].copy_(vn_sel)
         if env_flag("THUNDER_DEBUG_LAYOUT"):
             print(
                 f"[TQ-GATHER-TRIM] r={r} b={b} b_live={b_live} "
