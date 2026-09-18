@@ -814,15 +814,15 @@ def choose_split_count(
     *,
     tile_n: int = 64,
     target_ctas: int = 128,
-    max_splits: int = 8,
+    max_splits: int = 4,
     min_tiles_per_split: int = 2,
 ) -> int:
     """Smallest split count that reaches roughly ``target_ctas`` CTAs.
 
     Measured on B200/Qwen3-8B: the split-K knee is ~128 CTAs (S=4 at 32 q-heads,
-    batch 1); S=8/16 add ~nothing and S=32 only ~10-15% at the longest contexts,
-    so ``max_splits`` is capped at 8. Split counts stay powers of two so the
-    number of distinct captured launches stays small. Never splits below
+    batch 1); S=8/16 add nothing and S=32 only ~10-15% at the longest contexts,
+    so decode is FROZEN at ``max_splits=4``. Split counts stay powers of two so
+    the number of distinct captured launches stays small. Never splits below
     ``min_tiles_per_split`` tiles per CTA (a split with no tiles is pure merge
     overhead).
     """
