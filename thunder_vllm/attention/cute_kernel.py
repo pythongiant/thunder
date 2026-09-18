@@ -302,6 +302,7 @@ class ThunderAttentionForward:
         split_mode: cutlass.Constexpr[int] = 0,
         gqa_pack: cutlass.Constexpr[int] = 0,
         onepass: cutlass.Constexpr[int] = 0,
+        reg_rescale: cutlass.Constexpr[int] = 0,
         stream=None,
     ):
         # (rows, Hq, hdim) -> (rows, hdim, Hq) so a head slice is rank 2.
@@ -352,6 +353,7 @@ class ThunderAttentionForward:
             split_mode,
             gqa_pack,
             onepass,
+            reg_rescale,
             tiled_mma_qk,
             tiled_mma_pv,
             SharedStorage,
@@ -399,6 +401,7 @@ class ThunderAttentionForward:
         split_mode: cutlass.Constexpr[int],
         gqa_pack: cutlass.Constexpr[int],
         onepass: cutlass.Constexpr[int],
+        reg_rescale: cutlass.Constexpr[int],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
@@ -521,6 +524,11 @@ class ThunderAttentionForward:
             thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdim)), Float32
         )
         acc_O.fill(0.0)
+        # Per-element M row of the accumulator fragment, for the one-pass online
+        # rescale (multiply each element by alpha[row]).
+        cO = thr_mma_pv.partition_C(
+            cute.make_identity_tensor((self.tile_m, self.tile_hdim))
+        )
 
         # Plain 32-bit universal SMEM->register copies. ldmatrix would be the
         # performance choice but requires a swizzle-compatible SMEM layout and
@@ -675,18 +683,26 @@ class ThunderAttentionForward:
                     sRowSum[tidx] = sRowSum[tidx] + acc
             cute.arch.barrier()
             if const_expr(onepass):
-                # Rescale the running PV accumulator by alpha (per row) before
-                # adding this tile. Done through the existing fp32 sOf staging
-                # buffer: no fragment-coordinate arithmetic.
-                cute.copy(smem_copy_atom_O, taccOrO, tOsOf)
-                cute.arch.barrier()
-                if tidx < self.tile_m:
-                    a = sAlpha[tidx]
-                    for c in cutlass.range_constexpr(self.tile_hdim):
-                        sOf[tidx, c] = sOf[tidx, c] * a
-                cute.arch.barrier()
-                cute.copy(smem_copy_atom_O, tOsOf, taccOrO)
-                cute.arch.barrier()
+                if const_expr(reg_rescale):
+                    # Fragment-local rescale: no SMEM round-trip, no barrier per
+                    # copy. cO carries each accumulator element's M row.
+                    cute.arch.barrier()
+                    for e in cutlass.range_constexpr(cute.size(acc_O)):
+                        acc_O[e] = acc_O[e] * sAlpha[cute.get(cO[e], 0)]
+                    cute.arch.barrier()
+                else:
+                    # Rescale the running PV accumulator by alpha (per row) before
+                    # adding this tile. Done through the existing fp32 sOf staging
+                    # buffer: no fragment-coordinate arithmetic.
+                    cute.copy(smem_copy_atom_O, taccOrO, tOsOf)
+                    cute.arch.barrier()
+                    if tidx < self.tile_m:
+                        a = sAlpha[tidx]
+                        for c in cutlass.range_constexpr(self.tile_hdim):
+                            sOf[tidx, c] = sOf[tidx, c] * a
+                    cute.arch.barrier()
+                    cute.copy(smem_copy_atom_O, tOsOf, taccOrO)
+                    cute.arch.barrier()
             # P and V are produced in this iteration; re-read them for the PV MMA.
             cute.copy(thr_copy_v, thr_copy_v.partition_S(sV_code), thr_copy_v.retile(rV))
             cute.copy(thr_copy_p, thr_copy_p.partition_S(sP), thr_copy_p.retile(rP))
@@ -943,6 +959,7 @@ def launch_thunder_attention(
     num_splits: int = 1,
     gqa_pack: bool = False,
     onepass: bool = False,
+    reg_rescale: bool = False,
 ) -> None:
     """Launch the compiled cooperative kernel on gathered, contiguous tensors.
 
@@ -1060,6 +1077,7 @@ def launch_thunder_attention(
         int(split_mode),
         int(gqa_mode),
         int(1 if onepass else 0),
+        int(1 if reg_rescale else 0),
         cuda.CUstream(stream),
     )
 
