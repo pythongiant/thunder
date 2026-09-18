@@ -561,6 +561,14 @@ class ThunderAttentionImpl(AttentionImplBase):
         if n <= 0:
             return output.zero_()
 
+        # Diagnostic only: skip the entire TurboQuant forward (no gather, no
+        # cache write, no launch) so a capture-path fault can be attributed to
+        # this backend vs vLLM. Set THUNDER_SKIP_BACKEND=1.
+        if os.environ.get("THUNDER_SKIP_BACKEND", "0").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        ):
+            return output.zero_()
+
         # Validate what the launch path dereferences. Without this, a missing or
         # oddly-shaped field during vLLM's warm-up surfaces as
         # CUDA_ERROR_ILLEGAL_ADDRESS (700) inside run_compiled_program instead of
@@ -648,13 +656,19 @@ class ThunderAttentionImpl(AttentionImplBase):
                 1,
                 int(((_sl_cpu[:_r].to(torch.int64) + _bs - 1) // _bs).max().item()),
             )
-        gathered = paged.gather_packed_tiles(
-            attn_metadata.block_table,
-            kv_cache,
-            self._scales_for(kv_cache),
-            attn_metadata.seq_lens,
-            live_blocks=live_blocks,
-        )
+        if os.environ.get("THUNDER_SKIP_GATHER", "0").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        ):
+            # Diagnostic: use the reserved buffers without the torch gather.
+            gathered = paged.reserve()
+        else:
+            gathered = paged.gather_packed_tiles(
+                attn_metadata.block_table,
+                kv_cache,
+                self._scales_for(kv_cache),
+                attn_metadata.seq_lens,
+                live_blocks=live_blocks,
+            )
 
         q = query[:n].reshape(n, self.num_heads, self.head_size)
         o = output[:n].reshape(n, self.num_heads, self.head_size)
@@ -668,7 +682,10 @@ class ThunderAttentionImpl(AttentionImplBase):
         # basis (q_rot = q @ R) and produces O in that basis; the inverse is
         # applied to the output below. Without this, a stock vLLM model yields
         # scores in a different basis and results are silently wrong.
-        q = (q.float() @ quantizer.rotation.matrix).to(q.dtype)
+        _skip_rot = os.environ.get("THUNDER_SKIP_ROT", "0").strip().lower() not in (
+            "", "0", "false", "no", "off")
+        if not _skip_rot:
+            q = (q.float() @ quantizer.rotation.matrix).to(q.dtype)
         launch_thunder_attention(
             kernel,
             q,
@@ -688,7 +705,8 @@ class ThunderAttentionImpl(AttentionImplBase):
         # rotation once, on the flattened head axis. This is the plugin's
         # "final weight-absorbed output projection" GEMM -- a single linear
         # projection over the head dimension, not a second attention pass.
-        o.copy_(quantizer.rotation.inverse(o.float()).to(o.dtype))
+        if not _skip_rot:
+            o.copy_(quantizer.rotation.inverse(o.float()).to(o.dtype))
         return output
 
     def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:

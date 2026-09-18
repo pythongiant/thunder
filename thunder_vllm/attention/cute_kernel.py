@@ -970,6 +970,16 @@ def launch_thunder_attention(
     if quantizer is None:
         raise ValueError("quantizer is required to source the K/V LUTs")
 
+    # Diagnostic only: skip the CuTe launch so a capture-path CUDA fault can be
+    # attributed to this kernel vs the surrounding torch ops. Set
+    # THUNDER_SKIP_KERNEL=1; the output is left untouched.
+    import os as _os
+
+    if _os.environ.get("THUNDER_SKIP_KERNEL", "0").strip().lower() not in (
+        "", "0", "false", "no", "off"
+    ):
+        return
+
     hk = int(gathered.k_packed.shape[2])
     hq = int(q.shape[1])
     hd = int(q.shape[2])
