@@ -289,10 +289,15 @@ class ThunderAttentionForward:
         mSeqLens: cute.Tensor,  # (num_reqs,) int32
         mQStart: cute.Tensor,  # (num_reqs + 1,) int32
         mDbg: cute.Tensor,  # (>= 8 + num_reqs,) int32
+        mPartO: cute.Tensor,  # (num_reqs*num_splits, Hq, hdim) fp32, split mode
+        mPartM: cute.Tensor,  # (num_reqs*num_splits, Hq) fp32, split mode
+        mPartL: cute.Tensor,  # (num_reqs*num_splits, Hq) fp32, split mode
         softmax_scale: Float32,
         kv_row_stride: int = 1,
         debug: cutlass.Constexpr[int] = 0,
         max_query_len: int = 0,
+        num_splits: int = 1,
+        split_mode: cutlass.Constexpr[int] = 0,
         stream=None,
     ):
         # (rows, Hq, hdim) -> (rows, hdim, Hq) so a head slice is rank 2.
@@ -333,15 +338,23 @@ class ThunderAttentionForward:
             mSeqLens,
             mQStart,
             mDbg,
+            mPartO,
+            mPartM,
+            mPartL,
             softmax_scale,
             Int32(kv_row_stride),
+            Int32(num_splits),
             debug,
+            split_mode,
             tiled_mma_qk,
             tiled_mma_pv,
             SharedStorage,
             stream,
         ).launch(
-            grid=(num_q_blocks, num_q_heads, num_reqs),
+            # Split-K: the request axis is multiplied by num_splits; block idx z
+            # maps z -> (req = z // S, split = z % S). With S == 1 this is exactly
+            # the baseline grid.
+            grid=(num_q_blocks, num_q_heads, num_reqs * num_splits),
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -363,9 +376,14 @@ class ThunderAttentionForward:
         mSeqLens: cute.Tensor,
         mQStart: cute.Tensor,
         mDbg: cute.Tensor,
+        mPartO: cute.Tensor,
+        mPartM: cute.Tensor,
+        mPartL: cute.Tensor,
         softmax_scale: Float32,
         kv_row_stride: Int32,
+        num_splits: Int32,
         debug: cutlass.Constexpr[int],
+        split_mode: cutlass.Constexpr[int],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
@@ -374,7 +392,11 @@ class ThunderAttentionForward:
         tidx = cute.arch.thread_idx()[0]
         q_block = cute.arch.block_idx()[0]
         q_head = cute.arch.block_idx()[1]
-        req = cute.arch.block_idx()[2]
+        z = cute.arch.block_idx()[2]
+        # z -> (request, split). num_splits == 1 leaves this identical to the
+        # baseline (req = z, split = 0).
+        req = z // num_splits
+        split = z % num_splits
         kv_head = q_head // self.qhead_per_kvhead
         # Block-unique debug slot, defined before any control-flow region: every
         # write below is keyed by (z, y) so the snapshot is coherent.
@@ -499,8 +521,18 @@ class ThunderAttentionForward:
         q_off = q_block * self.tile_m
         q_row_base = q_start + q_off
 
+        # This CTA's contiguous tile range within the request's KV. num_splits == 1
+        # covers every tile, so the baseline schedule is unchanged.
+        tiles_per_split = cute.ceil_div(n_tiles, num_splits)
+        nt_lo = split * tiles_per_split
+        nt_hi = nt_lo + tiles_per_split
+        if nt_hi > n_tiles:
+            nt_hi = n_tiles
+        n_local = nt_hi - nt_lo
+
         # ============================ PASS 1: row max ====================
-        for nt in cutlass.range(n_tiles, unroll=1):
+        for i in cutlass.range(n_local, unroll=1):
+            nt = nt_lo + i
             _load_kv_packed(mK, mV, mKN, mVN, sK_packed, sV_packed, sKNorm, sVNorm,
                             kv_head, req_base, nt, kv_len, tidx, self,
                             want_v=False)
@@ -527,7 +559,8 @@ class ThunderAttentionForward:
             cute.arch.barrier()
 
         # ============================ PASS 2: softmax + PV ===============
-        for nt in cutlass.range(n_tiles, unroll=1):
+        for i in cutlass.range(n_local, unroll=1):
+            nt = nt_lo + i
             _load_kv_packed(mK, mV, mKN, mVN, sK_packed, sV_packed, sKNorm, sVNorm,
                             kv_head, req_base, nt, kv_len, tidx, self,
                             want_v=True)
@@ -577,14 +610,25 @@ class ThunderAttentionForward:
         # ============================ Epilogue ==========================
         cute.copy(smem_copy_atom_O, taccOrO, tOsOf)
         cute.arch.barrier()
-        if tidx < self.tile_m:
-            rs = sRowSum[tidx]
-            if rs <= Float32(0.0):
-                rs = Float32(1.0)
-            row_global = q_row_base + tidx
-            if row_global < q_start + q_len:
-                for c in cutlass.range_constexpr(self.tile_hdim):
-                    mOh[row_global, c] = (sOf[tidx, c] / rs).to(cutlass.Float16)
+        if const_expr(split_mode):
+            # Split-K: publish the UNNORMALISED partial state for this
+            # (request, head, split) so the host merge can rescale by the global
+            # max. Decode has q_len == 1, so only row 0 is a live query row.
+            if tidx < self.tile_m:
+                if tidx == 0:
+                    for c in cutlass.range_constexpr(self.tile_hdim):
+                        mPartO[z, q_head, c] = sOf[0, c]
+                    mPartM[z, q_head] = sRowMax[0]
+                    mPartL[z, q_head] = sRowSum[0]
+        else:
+            if tidx < self.tile_m:
+                rs = sRowSum[tidx]
+                if rs <= Float32(0.0):
+                    rs = Float32(1.0)
+                row_global = q_row_base + tidx
+                if row_global < q_start + q_len:
+                    for c in cutlass.range_constexpr(self.tile_hdim):
+                        mOh[row_global, c] = (sOf[tidx, c] / rs).to(cutlass.Float16)
         cute.arch.barrier()
 
 
@@ -702,6 +746,51 @@ class KernelNotReadyError(RuntimeError):
 
 
 _DBG_BUFFER = None
+_SPLIT_BUFFERS: dict = {}
+
+
+def _split_buffers(num_reqs: int, num_splits: int, hq: int, hd: int, device, dtype):
+    """Persistent split-K partial buffers (pointer-stable for CUDA graphs).
+
+    ``part_o`` holds the UNNORMALISED PV accumulator per (req, head, split);
+    ``part_m`` / ``part_l`` the per-split row max and exp-sum. Decode has one
+    live query row, so only row 0 is published.
+    """
+    import torch
+
+    key = (int(num_reqs), int(num_splits), int(hq), int(hd), str(device))
+    bufs = _SPLIT_BUFFERS.get(key)
+    if bufs is None:
+        rows = int(num_reqs) * int(num_splits)
+        bufs = (
+            torch.empty((rows, hq, hd), dtype=torch.float32, device=device),
+            torch.empty((rows, hq), dtype=torch.float32, device=device),
+            torch.empty((rows, hq), dtype=torch.float32, device=device),
+        )
+        _SPLIT_BUFFERS[key] = bufs
+    return bufs
+
+
+def _merge_splits(part_o, part_m, part_l, num_reqs, num_splits, hq, hd, o3, q_start):
+    """Rescale and reduce split-K partials, then scatter into the output rows.
+
+    Same online-softmax algebra the kernel uses across tiles: with global
+    ``M = max_s m_s``, each split contributes ``exp(m_s - M)``.
+    """
+    import torch
+
+    S = int(num_splits)
+    po = part_o[: num_reqs * S].view(num_reqs, S, hq, hd)
+    pm = part_m[: num_reqs * S].view(num_reqs, S, hq)
+    pl = part_l[: num_reqs * S].view(num_reqs, S, hq)
+    M = pm.amax(dim=1)  # (R, Hq)
+    M = torch.where(torch.isfinite(M), M, torch.zeros_like(M))
+    w = torch.exp(pm - M[:, None, :])  # (R, S, Hq)
+    acc = (po * w[..., None]).sum(dim=1)  # (R, Hq, Hd)
+    den = (pl * w).sum(dim=1)  # (R, Hq)
+    res = acc / den.clamp_min(1e-20)[..., None]
+    # Decode: exactly one query row per request, so q_start indexes the output row.
+    o3.index_copy_(0, q_start[:num_reqs].to(torch.int64), res.to(o3.dtype))
 
 
 def launch_thunder_attention(
@@ -714,6 +803,7 @@ def launch_thunder_attention(
     *,
     quantizer,
     debug: bool = False,
+    num_splits: int = 1,
 ) -> None:
     """Launch the compiled cooperative kernel on gathered, contiguous tensors.
 
@@ -721,6 +811,11 @@ def launch_thunder_attention(
     straight to the ``@cute.jit`` entry point. On the first call this triggers
     compilation and caches it (keyed by the constexpr arguments); subsequent
     calls are pure launches, which is what a CUDA graph records.
+
+    ``num_splits > 1`` selects split-K decode: the request axis is multiplied by
+    the split count, each CTA covers a contiguous slice of the KV tiles and
+    publishes unnormalised partial state, and ``_merge_splits`` reduces them.
+    Only valid for single-query decode (``max_query_len == 1``).
     """
     import torch
     from cutlass.cute.runtime import from_dlpack
@@ -729,6 +824,8 @@ def launch_thunder_attention(
         raise ValueError("quantizer is required to source the K/V LUTs")
 
     hk = int(gathered.k_packed.shape[2])
+    hq = int(q.shape[1])
+    hd = int(q.shape[2])
     page_rows, bs = gathered.k_packed.shape[0], gathered.k_packed.shape[1]
     total_kv = page_rows * bs
 
@@ -790,13 +887,38 @@ def launch_thunder_attention(
         max_query_len = int(q.shape[0])
     max_query_len = max(max_query_len, 1)
 
+    # Split-K partials. num_splits == 1 passes one split's worth of buffers and
+    # compiles the baseline epilogue (split_mode = 0), so that path is unchanged.
+    S = max(int(num_splits), 1)
+    split_mode = 1 if S > 1 else 0
+    if split_mode and max_query_len > 1:
+        raise ValueError(
+            "split-K decode requires max_query_len == 1, "
+            f"got {max_query_len}"
+        )
+    part_o_t, part_m_t, part_l_t = _split_buffers(
+        num_reqs, S, hq, hd, q.device, q.dtype
+    )
+    args = args + [
+        from_dlpack(part_o_t),
+        from_dlpack(part_m_t),
+        from_dlpack(part_l_t),
+    ]
+
     kernel(
         *args,
         softmax_scale,
         kv_row_stride,
         int(debug),
         max_query_len,
+        S,
+        int(split_mode),
         cuda.CUstream(stream),
     )
+
+    if split_mode:
+        _merge_splits(
+            part_o_t, part_m_t, part_l_t, num_reqs, S, hq, hd, o3, q_start
+        )
 
 
