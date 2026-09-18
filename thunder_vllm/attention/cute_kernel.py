@@ -37,6 +37,8 @@ Notes
 
 from __future__ import annotations
 
+import os
+
 from typing import NamedTuple
 
 import cutlass
@@ -901,6 +903,25 @@ class KernelNotReadyError(RuntimeError):
 
 _DBG_BUFFER = None
 _SPLIT_BUFFERS: dict = {}
+_FAST: dict = {}
+_FASTLAUNCH = os.environ.get("THUNDER_FASTLAUNCH", "0").strip().lower() not in (
+    "", "0", "false", "no", "off"
+)
+
+
+def _jitcache_keys(cache) -> set:
+    """Keys of a CuTeDSL ``JitCacheDict`` (its backing dict is ``_dict``)."""
+    d = getattr(cache, "_dict", None)
+    return set(d.keys()) if isinstance(d, dict) else set()
+
+
+def _dsl_object(kernel):
+    """The CuTeDSL object behind ``kernel``'s ``@cute.jit __call__``."""
+    wrapper = getattr(type(kernel), "__call__", None)
+    orig = getattr(wrapper, "__wrapped__", None)
+    if orig is None:
+        orig = getattr(getattr(kernel, "__call__", None), "__wrapped__", None)
+    return getattr(orig, "_dsl_object", None)
 
 # Host-stage timing for THUNDER_TIME_LAUNCH, dumped at exit. Separates the torch
 # plumbing (reshape/contiguous/from_dlpack) from the CuTeDSL host call and the
@@ -1049,10 +1070,8 @@ def launch_thunder_attention(
     q_start = metadata.query_start_loc.to(torch.int32).contiguous()
     o3 = out.reshape(q.shape[0], q.shape[1], q.shape[2]).contiguous()
 
-    args = [
-        from_dlpack(t)
-        for t in (q.contiguous(), k, v, kn, vn, k_lut, v_lut, o3, seq_lens, q_start)
-    ]
+    _torch_args = [q.contiguous(), k, v, kn, vn, k_lut, v_lut, o3, seq_lens, q_start]
+    args = [from_dlpack(t) for t in _torch_args]
     stream = torch.cuda.current_stream().cuda_stream
     import cuda.bindings.driver as cuda
 
@@ -1085,8 +1104,10 @@ def launch_thunder_attention(
         if _DBG_BUFFER is None or _DBG_BUFFER.device != q.device or _DBG_BUFFER.numel() < want:
             _DBG_BUFFER = torch.zeros(want, dtype=torch.int32, device=q.device)
         dbg_arg = from_dlpack(_DBG_BUFFER)
+        _torch_args.append(_DBG_BUFFER)
     else:
         dbg_arg = from_dlpack(seq_lens)
+        _torch_args.append(seq_lens)
     args = list(args) + [dbg_arg]
 
     # The q-block grid is per-request, so it must cover the LONGEST request, not
@@ -1120,11 +1141,12 @@ def launch_thunder_attention(
         from_dlpack(part_m_t),
         from_dlpack(part_l_t),
     ]
+    _torch_args += [part_o_t, part_m_t, part_l_t]
 
     if _TIME:
         _t1 = _time.perf_counter()
 
-    kernel(
+    _all_args = (
         *args,
         softmax_scale,
         kv_row_stride,
@@ -1138,6 +1160,38 @@ def launch_thunder_attention(
         int(1 if causal_bound else 0),
         cuda.CUstream(stream),
     )
+    if _FASTLAUNCH:
+        # EXPERIMENTAL. ``generate_mlir`` regenerates the MLIR module to recompute
+        # its hash on every call (~400ms) even though the compiled function is
+        # already in ``jit_cache``; only then does it run the cached function.
+        # This tries to cache the jit_cache entry and call it directly. Status:
+        # the direct call currently fails inside the DSL with "cannot be converted
+        # to pointer" (arg adaptation differs from the generate_mlir path), so this
+        # needs the proper CUTLASS compiled-function reuse API. Default off.
+        key = (
+            id(kernel),
+            tuple(tuple(t.shape) for t in _torch_args),
+            num_reqs, max_query_len, S, int(debug), int(split_mode), int(gqa_mode),
+            int(1 if onepass else 0), int(1 if reg_rescale else 0),
+            int(1 if causal_bound else 0),
+        )
+        jf = _FAST.get(key)
+        if jf is None:
+            dsl = _dsl_object(kernel)
+            before = _jitcache_keys(dsl.jit_cache) if dsl is not None else set()
+            kernel(*_all_args)
+            if dsl is not None:
+                new = _jitcache_keys(dsl.jit_cache) - before
+                if not new and len(before) == 1:
+                    new = before
+                if new:
+                    jf = dsl.jit_cache.get(next(iter(new)))
+                    if jf is not None:
+                        _FAST[key] = jf
+        else:
+            jf(*_all_args)
+    else:
+        kernel(*_all_args)
 
     if _TIME:
         _t2 = _time.perf_counter()

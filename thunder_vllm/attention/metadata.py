@@ -122,9 +122,11 @@ class ThunderMetadata(AttentionMetadata):
 class ThunderMetadataBuilder(AttentionMetadataBuilder[ThunderMetadata]):
     """Builds :class:`ThunderMetadata` from ``CommonAttentionMetadata``.
 
-    ``_cudagraph_support`` is declared as ``UNIFORM_SINGLE_TOKEN_DECODE``: the
-    CuTe kernel is only captured for pure single-token decode batches, which is
-    what the gather buffers are sized for. Anything else runs eager.
+    ``_cudagraph_support`` is ``UNIFORM_SINGLE_TOKEN_DECODE``: vLLM's FULL graphs
+    capture single-token decode (attention included), which is what the gather
+    buffers are sized for. PIECEWISE (prefill) always breaks at attention, so
+    prefill attention runs eager regardless of this value -- see the TTFT note in
+    the session log: the CuTeDSL per-launch host cost is the prefill bottleneck.
     """
 
     _cudagraph_support: ClassVar[int] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
