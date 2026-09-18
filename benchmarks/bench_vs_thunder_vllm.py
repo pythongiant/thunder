@@ -68,14 +68,30 @@ def _run_vllm(model: str, backend: str, prompts, gen_len: int, max_model_len: in
 
         kwargs: dict = dict(
             model=model,
-            attention_backend=backend,
             enforce_eager=False,
             max_model_len=max_model_len,
             dtype="float16",
         )
+        # Do NOT force attention_backend for the upstream TurboQuant baseline:
+        # vLLM perturbs kv_cache_dtype to "auto" for the boundary layers in
+        # cache_config.kv_cache_dtype_skip_layers (auto-populated for
+        # turboquant_* in arg_utils.py), and an explicitly-forced TURBOQUANT
+        # backend rejects those layers ("kv_cache_dtype not supported"). With the
+        # dtype set and the backend left unforced, vLLM auto-selects TURBOQUANT
+        # for the compressed layers and the default backend for the skipped ones,
+        # which is the documented stock-vLLM path.
+        if backend:
+            kwargs["attention_backend"] = backend
         if kv_cache_dtype:
             kwargs["kv_cache_dtype"] = kv_cache_dtype
         llm = LLM(**kwargs)
+        try:
+            cfg = llm.llm_engine.vllm_config.cache_config
+            print(f"  [diag] cache_dtype={getattr(cfg, 'cache_dtype', '?')} "
+                  f"kv_cache_dtype={getattr(cfg, 'kv_cache_dtype', '?')} "
+                  f"block_size={getattr(cfg, 'block_size', '?')}", flush=True)
+        except Exception as _e:  # noqa: BLE001
+            print(f"  [diag] cache_config introspection failed: {_e}", flush=True)
         # TTFT pass.
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -125,7 +141,8 @@ def bench_workload(model: str, name: str, batch: int, prompt_len: int,
     ]
 
     with nvml_sampler() as gpu:
-        base = _run_vllm(model, "TURBOQUANT", prompts, gen_len, max_model_len,
+        # backend=None: let vLLM auto-select TURBOQUANT from the cache dtype.
+        base = _run_vllm(model, None, prompts, gen_len, max_model_len,
                          kv_cache_dtype=baseline_kv_cache_dtype)
     base["gpu_util"] = gpu["util_gpu"]
     base["mem_used_mb"] = gpu["mem_used_mb"]
