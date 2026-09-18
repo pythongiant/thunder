@@ -34,6 +34,21 @@ logger = get_logger("attention.backend")
 
 _ENGINE_HOOK = {"done": False}
 
+# Capture audit: count forward invocations by (capturing?, max_query_len). If the
+# decode step is captured, forward is NOT called per decode step during replay.
+import collections as _collections
+import atexit as _atexit
+
+_FWD_COUNT: "_collections.Counter" = _collections.Counter()
+
+
+def _dump_fwd_count() -> None:
+    if env_flag("THUNDER_COUNT"):
+        print(f"[TQ-COUNT] {dict(_FWD_COUNT)}", flush=True)
+
+
+_atexit.register(_dump_fwd_count)
+
 try:  # pragma: no cover - CPU-only machines have no vLLM
     from vllm.v1.attention.backend import (  # type: ignore
         AttentionBackend,
@@ -549,6 +564,10 @@ class ThunderAttentionImpl(AttentionImplBase):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = query.shape[0]
+        if env_flag("THUNDER_COUNT") and attn_metadata is not None:
+            _cap = bool(torch.cuda.is_current_stream_capturing())
+            _mql = int(getattr(attn_metadata, "max_query_len", 0) or 0)
+            _FWD_COUNT[(f"cap={int(_cap)}", f"mql={_mql}")] += 1
         if output is None:
             output = torch.empty(
                 num_tokens,

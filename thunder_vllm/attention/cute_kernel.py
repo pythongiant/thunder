@@ -901,6 +901,39 @@ class KernelNotReadyError(RuntimeError):
 
 _DBG_BUFFER = None
 _SPLIT_BUFFERS: dict = {}
+_STREAMS: dict = {}
+
+# Host-stage timing for THUNDER_TIME_LAUNCH, dumped at exit. Separates the torch
+# plumbing (reshape/contiguous/from_dlpack) from the CuTeDSL host call and the
+# split-K merge so a slow launch can be attributed.
+_LAUNCH_TIME: dict = {"plumbing": 0.0, "kernel": 0.0, "merge": 0.0, "n": 0}
+
+
+def _dump_launch_time() -> None:
+    import os
+
+    if os.environ.get("THUNDER_TIME_LAUNCH", "0").strip().lower() in (
+        "", "0", "false", "no", "off"
+    ):
+        return
+    n = max(_LAUNCH_TIME["n"], 1)
+    print(
+        "[TQ-LAUNCH] n=%d  plumbing=%.2fms  kernel=%.2fms  merge=%.2fms  "
+        "total=%.2fms"
+        % (
+            _LAUNCH_TIME["n"],
+            _LAUNCH_TIME["plumbing"] / n * 1e3,
+            _LAUNCH_TIME["kernel"] / n * 1e3,
+            _LAUNCH_TIME["merge"] / n * 1e3,
+            sum(_LAUNCH_TIME[k] for k in ("plumbing", "kernel", "merge")) / n * 1e3,
+        ),
+        flush=True,
+    )
+
+
+import atexit as _atexit
+
+_atexit.register(_dump_launch_time)
 
 
 
@@ -992,6 +1025,14 @@ def launch_thunder_attention(
     ):
         return
 
+    _TIME = _os.environ.get("THUNDER_TIME_LAUNCH", "0").strip().lower() not in (
+        "", "0", "false", "no", "off"
+    )
+    if _TIME:
+        import time as _time
+
+        _t0 = _time.perf_counter()
+
     hk = int(gathered.k_packed.shape[2])
     hq = int(q.shape[1])
     hd = int(q.shape[2])
@@ -1015,6 +1056,15 @@ def launch_thunder_attention(
     ]
     stream = torch.cuda.current_stream().cuda_stream
     import cuda.bindings.driver as cuda
+
+    # Reuse one CUstream object per raw stream value. CuTeDSL keys its compiled
+    # cache on the call arguments; a freshly constructed CUstream each call has a
+    # new identity and misses the cache, re-specializing the kernel every launch
+    # (~0.45s warm) -- the whole e2e perf problem.
+    sobj = _STREAMS.get(stream)
+    if sobj is None:
+        sobj = cuda.CUstream(stream)
+        _STREAMS[stream] = sobj
 
     # Request-major row base. The gather emits row = req * max_blocks_per_req +
     # block, so the kernel needs that stride to keep request identity in the
@@ -1080,6 +1130,9 @@ def launch_thunder_attention(
         from_dlpack(part_l_t),
     ]
 
+    if _TIME:
+        _t1 = _time.perf_counter()
+
     kernel(
         *args,
         softmax_scale,
@@ -1092,12 +1145,22 @@ def launch_thunder_attention(
         int(1 if onepass else 0),
         int(1 if reg_rescale else 0),
         int(1 if causal_bound else 0),
-        cuda.CUstream(stream),
+        sobj,
     )
+
+    if _TIME:
+        _t2 = _time.perf_counter()
 
     if split_mode:
         _merge_splits(
             part_o_t, part_m_t, part_l_t, num_reqs, S, hq, hd, o3, q_start
         )
+
+    if _TIME:
+        _t3 = _time.perf_counter()
+        _LAUNCH_TIME["plumbing"] += _t1 - _t0
+        _LAUNCH_TIME["kernel"] += _t2 - _t1
+        _LAUNCH_TIME["merge"] += _t3 - _t2
+        _LAUNCH_TIME["n"] += 1
 
 
