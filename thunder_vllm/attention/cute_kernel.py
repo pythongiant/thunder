@@ -244,6 +244,7 @@ class ThunderAttentionForward:
             "sVNorm": f16((self.tile_n,)),
             "sRowMax": f16((self.tile_m,)),
             "sRowSum": f16((self.tile_m,)),
+            "sAlpha": f16((self.tile_m,)),
         }
 
     @cute.jit
@@ -269,6 +270,7 @@ class ThunderAttentionForward:
             sVNorm: cute.struct.Align[cute.struct.MemRange[dt, tn], 128]
             sRowMax: cute.struct.Align[cute.struct.MemRange[f32, tm], 128]
             sRowSum: cute.struct.Align[cute.struct.MemRange[f32, tm], 128]
+            sAlpha: cute.struct.Align[cute.struct.MemRange[f32, tm], 128]
 
         return SharedStorage
 
@@ -299,6 +301,7 @@ class ThunderAttentionForward:
         num_splits: int = 1,
         split_mode: cutlass.Constexpr[int] = 0,
         gqa_pack: cutlass.Constexpr[int] = 0,
+        onepass: cutlass.Constexpr[int] = 0,
         stream=None,
     ):
         # (rows, Hq, hdim) -> (rows, hdim, Hq) so a head slice is rank 2.
@@ -348,6 +351,7 @@ class ThunderAttentionForward:
             debug,
             split_mode,
             gqa_pack,
+            onepass,
             tiled_mma_qk,
             tiled_mma_pv,
             SharedStorage,
@@ -394,6 +398,7 @@ class ThunderAttentionForward:
         debug: cutlass.Constexpr[int],
         split_mode: cutlass.Constexpr[int],
         gqa_pack: cutlass.Constexpr[int],
+        onepass: cutlass.Constexpr[int],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
@@ -462,6 +467,7 @@ class ThunderAttentionForward:
         sVNorm = storage.sVNorm.get_tensor(layouts["sVNorm"])
         sRowMax = storage.sRowMax.get_tensor(layouts["sRowMax"])
         sRowSum = storage.sRowSum.get_tensor(layouts["sRowSum"])
+        sAlpha = storage.sAlpha.get_tensor(layouts["sAlpha"])
 
         # ---- LUT staging (request independent) -------------------------
         _copy_lut_to_smem(mKLut, sKLut, tidx, self.K_BITS, self.tile_hdim, self.num_threads)
@@ -569,9 +575,15 @@ class ThunderAttentionForward:
         if nt_hi > n_tiles:
             nt_hi = n_tiles
         n_local = nt_hi - nt_lo
+        # One-pass: PASS 1 is skipped and PASS 2 performs the online-softmax
+        # update itself. The loop bound (not an `if`) keeps both branches in the
+        # same staged scope.
+        n_p1 = n_local
+        if const_expr(onepass):
+            n_p1 = Int32(0)
 
         # ============================ PASS 1: row max ====================
-        for i in cutlass.range(n_local, unroll=1):
+        for i in cutlass.range(n_p1, unroll=1):
             nt = nt_lo + i
             _load_kv_packed(mK, mV, mKN, mVN, sK_packed, sV_packed, sKNorm, sVNorm,
                             kv_head, req_base, nt, kv_len, tidx, self,
@@ -628,6 +640,25 @@ class ThunderAttentionForward:
             cute.gemm(tiled_mma_qk, acc_S, rQ, rK, acc_S)
             cute.copy(smem_copy_atom_S, taccSrS, tSsS)
             cute.arch.barrier()
+            if const_expr(onepass):
+                # Online-softmax update: this tile is the only time K is
+                # reconstructed and QK is run. Fold the tile max into the running
+                # max and record the rescale factor for the accumulator and l.
+                if tidx < self.tile_m:
+                    cur = -Float32.inf
+                    for n in cutlass.range_constexpr(self.tile_n):
+                        kv = nt * self.tile_n + n
+                        if _valid(kv, tidx, kv_len, q_off_v, q_len_v, self.is_causal):
+                            cur = cute.arch.fmax(
+                                cur, sS[tidx, n] * Float32(sKNorm[n]) * softmax_scale)
+                    new_m = cute.arch.fmax(sRowMax[tidx], cur)
+                    alpha = Float32(1.0)
+                    if new_m != -Float32.inf:
+                        alpha = cute.math.exp2(
+                            (sRowMax[tidx] - new_m) * _LOG2E, fastmath=True)
+                    sAlpha[tidx] = alpha
+                    sRowMax[tidx] = new_m
+                cute.arch.barrier()
             if tidx < self.tile_m:
                 acc = Float32(0.0)
                 for n in cutlass.range_constexpr(self.tile_n):
@@ -638,8 +669,24 @@ class ThunderAttentionForward:
                         p = cute.math.exp2((x - sRowMax[tidx]) * _LOG2E, fastmath=True)
                     sP[tidx, n] = (p * Float32(sVNorm[n])).to(cutlass.Float16)
                     acc += p
-                sRowSum[tidx] = sRowSum[tidx] + acc
+                if const_expr(onepass):
+                    sRowSum[tidx] = sRowSum[tidx] * sAlpha[tidx] + acc
+                else:
+                    sRowSum[tidx] = sRowSum[tidx] + acc
             cute.arch.barrier()
+            if const_expr(onepass):
+                # Rescale the running PV accumulator by alpha (per row) before
+                # adding this tile. Done through the existing fp32 sOf staging
+                # buffer: no fragment-coordinate arithmetic.
+                cute.copy(smem_copy_atom_O, taccOrO, tOsOf)
+                cute.arch.barrier()
+                if tidx < self.tile_m:
+                    a = sAlpha[tidx]
+                    for c in cutlass.range_constexpr(self.tile_hdim):
+                        sOf[tidx, c] = sOf[tidx, c] * a
+                cute.arch.barrier()
+                cute.copy(smem_copy_atom_O, tOsOf, taccOrO)
+                cute.arch.barrier()
             # P and V are produced in this iteration; re-read them for the PV MMA.
             cute.copy(thr_copy_v, thr_copy_v.partition_S(sV_code), thr_copy_v.retile(rV))
             cute.copy(thr_copy_p, thr_copy_p.partition_S(sP), thr_copy_p.retile(rP))
@@ -895,6 +942,7 @@ def launch_thunder_attention(
     debug: bool = False,
     num_splits: int = 1,
     gqa_pack: bool = False,
+    onepass: bool = False,
 ) -> None:
     """Launch the compiled cooperative kernel on gathered, contiguous tensors.
 
@@ -1011,6 +1059,7 @@ def launch_thunder_attention(
         S,
         int(split_mode),
         int(gqa_mode),
+        int(1 if onepass else 0),
         cuda.CUstream(stream),
     )
 
