@@ -901,7 +901,6 @@ class KernelNotReadyError(RuntimeError):
 
 _DBG_BUFFER = None
 _SPLIT_BUFFERS: dict = {}
-_STREAMS: dict = {}
 
 # Host-stage timing for THUNDER_TIME_LAUNCH, dumped at exit. Separates the torch
 # plumbing (reshape/contiguous/from_dlpack) from the CuTeDSL host call and the
@@ -1057,14 +1056,6 @@ def launch_thunder_attention(
     stream = torch.cuda.current_stream().cuda_stream
     import cuda.bindings.driver as cuda
 
-    # Reuse one CUstream object per raw stream value. CuTeDSL keys its compiled
-    # cache on the call arguments; a freshly constructed CUstream each call has a
-    # new identity and misses the cache, re-specializing the kernel every launch
-    # (~0.45s warm) -- the whole e2e perf problem.
-    sobj = _STREAMS.get(stream)
-    if sobj is None:
-        sobj = cuda.CUstream(stream)
-        _STREAMS[stream] = sobj
 
     # Request-major row base. The gather emits row = req * max_blocks_per_req +
     # block, so the kernel needs that stride to keep request identity in the
@@ -1145,7 +1136,7 @@ def launch_thunder_attention(
         int(1 if onepass else 0),
         int(1 if reg_rescale else 0),
         int(1 if causal_bound else 0),
-        sobj,
+        cuda.CUstream(stream),
     )
 
     if _TIME:
