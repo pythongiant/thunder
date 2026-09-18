@@ -48,6 +48,8 @@ from thunder_vllm.utils.logging import get_logger
 
 logger = get_logger("attention.cute_kernel")
 
+from thunder_vllm.attention.splits import choose_split_count  # noqa: E402  (re-export)
+
 KERNEL_STATUS = "coop-two-pass-b200-verified"
 
 VARIANT_BASELINE = 0
@@ -888,37 +890,6 @@ class KernelNotReadyError(RuntimeError):
 _DBG_BUFFER = None
 _SPLIT_BUFFERS: dict = {}
 
-
-def choose_split_count(
-    seq_len: int,
-    batch: int,
-    num_q_heads: int,
-    *,
-    tile_n: int = 64,
-    target_ctas: int = 128,
-    max_splits: int = 4,
-    min_tiles_per_split: int = 2,
-) -> int:
-    """Smallest split count that reaches roughly ``target_ctas`` CTAs.
-
-    Measured on B200/Qwen3-8B: the split-K knee is ~128 CTAs (S=4 at 32 q-heads,
-    batch 1); S=8/16 add nothing and S=32 only ~10-15% at the longest contexts,
-    so decode is FROZEN at ``max_splits=4``. Split counts stay powers of two so
-    the number of distinct captured launches stays small. Never splits below
-    ``min_tiles_per_split`` tiles per CTA (a split with no tiles is pure merge
-    overhead).
-    """
-    import math
-
-    if seq_len <= 0 or batch <= 0 or num_q_heads <= 0:
-        return 1
-    want = math.ceil(target_ctas / (batch * num_q_heads))
-    n_tiles = math.ceil(seq_len / tile_n)
-    cap = min(max_splits, max(1, n_tiles // max(min_tiles_per_split, 1)))
-    splits = 1
-    while splits * 2 <= min(want, cap):
-        splits *= 2
-    return max(1, min(splits, cap, max_splits))
 
 
 def _split_buffers(num_reqs: int, num_splits: int, hq: int, hd: int, device, dtype):

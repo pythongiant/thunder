@@ -93,11 +93,27 @@ class ThunderCuteConfig:
     # Paged-cache block size. Distinct from n_block_size, which is the kernel's
     # KV tile width.
     cache_block_size: int = 16
+    # Kernel fast paths validated by the prefill A/Bs. Off by default: each is an
+    # isolated, correctness-checked optimization that should be turned on
+    # together only after the end-to-end regression suite is green.
+    #   onepass      single-pass online softmax (removes PASS1's K dequant + QK)
+    #   reg_rescale  register-local accumulator rescale (drops 2 SMEM trips/tile)
+    #   causal_bound skip fully-masked causal KV tiles (requires is_causal)
+    onepass: bool = False
+    reg_rescale: bool = False
+    causal_bound: bool = False
 
     @classmethod
     def from_env(cls, kv_cache_dtype: str | None = None) -> ThunderCuteConfig:
         k_bits, v_bits = _bits_from_kv_cache_dtype(kv_cache_dtype)
         env = os.environ
+
+        def _flag(name: str, default: bool = False) -> bool:
+            val = env.get(name)
+            if val is None:
+                return default
+            return val.strip().lower() not in ("", "0", "false", "no", "off")
+
         return cls(
             k_bits=int(env.get("THUNDER_K_BITS", k_bits)),
             v_bits=int(env.get("THUNDER_V_BITS", v_bits)),
@@ -107,7 +123,10 @@ class ThunderCuteConfig:
             m_block_size=int(env.get("THUNDER_M_BLOCK", 64)),
             n_block_size=int(env.get("THUNDER_N_BLOCK", 64)),
             q_stage=int(env.get("THUNDER_Q_STAGE", 2)),
-            use_2cta_instrs=env.get("THUNDER_USE_2CTA", "0") == "1",
+            use_2cta_instrs=_flag("THUNDER_USE_2CTA"),
+            onepass=_flag("THUNDER_ONEPASS"),
+            reg_rescale=_flag("THUNDER_REG_RESCALE"),
+            causal_bound=_flag("THUNDER_CAUSAL_BOUND"),
         )
 
     def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool) -> tuple:
@@ -125,6 +144,9 @@ class ThunderCuteConfig:
             self.use_2cta_instrs,
             self.q_stage,
             self.cache_block_size,
+            self.onepass,
+            self.reg_rescale,
+            self.causal_bound,
         )
 
 
@@ -656,6 +678,9 @@ class ThunderAttentionImpl(AttentionImplBase):
             self.scale,
             quantizer=quantizer,
             num_splits=self._decode_split_count(attn_metadata, is_causal),
+            onepass=self.cfg.onepass,
+            reg_rescale=self.cfg.reg_rescale,
+            causal_bound=self.cfg.causal_bound,
         )
 
         # The kernel accumulates ``O_rot = P @ (R V) = R (P @ V)``: scores are
@@ -691,7 +716,7 @@ class ThunderAttentionImpl(AttentionImplBase):
             seq_len = int(attn_metadata.seq_lens[:n_reqs].max().item())
         else:
             return 1
-        from thunder_vllm.attention.cute_kernel import choose_split_count
+        from thunder_vllm.attention.splits import choose_split_count
 
         return choose_split_count(
             seq_len, n_reqs, self.num_heads, tile_n=self.cfg.n_block_size
