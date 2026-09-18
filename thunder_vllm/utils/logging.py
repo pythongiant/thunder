@@ -49,3 +49,16 @@ def log_once(logger: logging.Logger, message: str, *args: object) -> None:
         return
     logger.info(message, *args)
     setattr(logger, key, True)
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Whether a boolean env var is set.
+
+    A plain ``os.environ.get(name)`` is wrong for this: ``"0"`` is a non-empty
+    string and therefore truthy, so ``THUNDER_DEBUG_LAYOUT=0`` turned the debug
+    path ON. Accept the usual false spellings.
+    """
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in ("", "0", "false", "no", "off")

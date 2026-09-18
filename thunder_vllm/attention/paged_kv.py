@@ -31,7 +31,7 @@ import os as _os
 import torch
 
 from thunder_vllm.attention.cache_layout import ThunderCacheLayout
-from thunder_vllm.utils.logging import get_logger
+from thunder_vllm.utils.logging import env_flag, get_logger
 
 logger = get_logger("attention.paged_kv")
 
@@ -212,7 +212,14 @@ class PagedKVManager:
         else:
             b_live = b
         b_live = max(1, min(b_live, self.max_blocks_per_req))
-        bt_live = bt[:r, :b_live].contiguous()
+        # Clamp block ids into the cache. vLLM's post-capture kernel warm-up
+        # passes a block table whose entries can exceed the allocated block
+        # count; the raw advanced index then trips a CUDA device assert
+        # (ATen IndexKernel "index out of bounds"). Those positions are padding
+        # -- ``seq_lens`` masks them and the kernel never reads them -- so
+        # clamping to a valid block is correct and keeps the gather faultless.
+        nb = int(kv_cache.shape[0])
+        bt_live = bt[:r, :b_live].clamp(0, max(nb - 1, 0)).contiguous()
 
         k_codes = self.layout.k_codes(kv_cache)
         v_codes = self.layout.v_codes(kv_cache)
@@ -236,7 +243,7 @@ class PagedKVManager:
         vv_view[:r, :b_live].copy_(v)
         kn_view[:r, :b_live].copy_(kn[bt_live])
         vn_view[:r, :b_live].copy_(vn[bt_live])
-        if _os.environ.get("THUNDER_DEBUG_LAYOUT"):
+        if env_flag("THUNDER_DEBUG_LAYOUT"):
             print(
                 f"[TQ-GATHER-TRIM] r={r} b={b} b_live={b_live} "
                 f"live_page_rows={r * b_live} reserved_page_rows={self.max_page_rows}",
@@ -286,7 +293,10 @@ class PagedKVManager:
         # with, and a fixed-target reshape then fails with
         #   shape '[32768, 16, 8, 64]' is invalid for input of size 1879048192
         page_rows = int(bt.shape[0]) * int(bt.shape[1])
-        if _os.environ.get("THUNDER_DEBUG_LAYOUT"):
+        # Same clamp as the in-place path: padding / post-capture warm-up block
+        # ids can exceed the cache and would otherwise fault the advanced index.
+        bt = bt.clamp(0, max(int(kv_cache.shape[0]) - 1, 0))
+        if env_flag("THUNDER_DEBUG_LAYOUT"):
             print(
                 f"[TQ-GATHER] bt={tuple(bt.shape)} reserved=({self.max_num_reqs},"
             f"{self.max_blocks_per_req}) max_page_rows={self.max_page_rows} "
@@ -303,7 +313,7 @@ class PagedKVManager:
         # (R, B, bs, Hk, pb) -> (R*B*bs, Hk, pb)
         k = k_codes[bt].reshape(-1, self.layout.num_kv_heads, self.layout.k_packed_bytes)
         v = v_codes[bt].reshape(-1, self.layout.num_kv_heads, self.layout.v_packed_bytes)
-        if _os.environ.get("THUNDER_DEBUG_LAYOUT"):
+        if env_flag("THUNDER_DEBUG_LAYOUT"):
             print(
                 f"[TQ-GATHER] k_codes={tuple(k_codes.shape)} v_codes={tuple(v_codes.shape)} "
                 f"k={tuple(k.shape)} v={tuple(v.shape)}",

@@ -28,7 +28,7 @@ from thunder_vllm.attention.metadata import (
 )
 from thunder_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
 from thunder_vllm.attention.scratch import ScratchState, new_scratch, reserve_scratch
-from thunder_vllm.utils.logging import get_logger, log_once
+from thunder_vllm.utils.logging import env_flag, get_logger, log_once
 
 logger = get_logger("attention.backend")
 
@@ -210,7 +210,7 @@ class ThunderAttentionBackend(AttentionBackend):
         #   ['block_size not supported']
         # Accept None and let the kernel's own cache_block_size govern.
         result = True if block_size is None else block_size in SUPPORTED_BLOCK_SIZES
-        if os.environ.get("THUNDER_DEBUG_BLOCK"):
+        if env_flag("THUNDER_DEBUG_BLOCK"):
             logger.info(
                 "supports_block_size(%r) -> %s (supported=%s)",
                 block_size, result, SUPPORTED_BLOCK_SIZES,
@@ -271,7 +271,7 @@ class ThunderAttentionBackend(AttentionBackend):
             block_size=block_size,
         )
         shape = layout.get_kv_cache_shape(num_blocks)
-        if os.environ.get("THUNDER_DEBUG_LAYOUT"):
+        if env_flag("THUNDER_DEBUG_LAYOUT"):
             logger.info(
                 "get_kv_cache_shape(num_blocks=%d, block_size=%d, num_kv_heads=%d, "
                 "head_size=%d) -> %s",
@@ -562,7 +562,7 @@ class ThunderAttentionImpl(AttentionImplBase):
                     f"ThunderAttentionImpl.forward: attn_metadata.{_name} is on "
                     f"{_v.device}, expected CUDA"
                 )
-        if os.environ.get("THUNDER_DEBUG_LAUNCH"):
+        if env_flag("THUNDER_DEBUG_LAUNCH"):
             print(
                 f"[TQ-LAUNCH] q={tuple(query.shape)}/{query.dtype} n={n} "
                 f"kv={tuple(kv_cache.shape)} "
@@ -682,7 +682,7 @@ class ThunderAttentionImpl(AttentionImplBase):
         (key, value) as the remaining two fp16 tensors in order. Set
         ``THUNDER_DEBUG_KV=1`` to log exactly what arrives.
         """
-        if os.environ.get("THUNDER_DEBUG_KV"):
+        if env_flag("THUNDER_DEBUG_KV"):
             logger.info(
                 "do_kv_cache_update args=%s kwargs=%s",
                 [(type(a).__name__, tuple(getattr(a, "shape", ()))) for a in args],

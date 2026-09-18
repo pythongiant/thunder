@@ -51,27 +51,41 @@ N_REP = 100
 
 def _run_vllm(model: str, backend: str, prompts, gen_len: int) -> dict:
     """Run one generation pass under vLLM with the given attention backend."""
-    from vllm import LLM, SamplingParams  # type: ignore
+    try:
+        from vllm import LLM, SamplingParams  # type: ignore
 
-    llm = LLM(
-        model=model,
-        attention_backend=backend,
-        enforce_eager=False,
-        max_model_len=16384,
-    )
-    params = SamplingParams(temperature=0.0, max_tokens=gen_len)
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    outputs = llm.generate(prompts, params)
-    torch.cuda.synchronize()
-    dt = time.perf_counter() - t0
-    tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
-    return {
-        "latency_s": dt,
-        "tokens": tokens,
-        "tokens_per_s": tokens / dt if dt > 0 else float("nan"),
-        "text": outputs[0].outputs[0].text if outputs else "",
-    }
+        llm = LLM(
+            model=model,
+            attention_backend=backend,
+            enforce_eager=False,
+            max_model_len=16384,
+        )
+        params = SamplingParams(temperature=0.0, max_tokens=gen_len)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outputs = llm.generate(prompts, params)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+        return {
+            "latency_s": dt,
+            "tokens": tokens,
+            "tokens_per_s": tokens / dt if dt > 0 else float("nan"),
+            "text": outputs[0].outputs[0].text if outputs else "",
+        }
+    except Exception as exc:  # noqa: BLE001
+        # One backend failing must not lose the other's numbers: the upstream
+        # baseline is the point of this harness, so record the error and move on.
+        import traceback
+
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc()[-1500:],
+            "latency_s": float("nan"),
+            "tokens": 0,
+            "tokens_per_s": float("nan"),
+            "text": "",
+        }
 
 
 def bench_workload(model: str, name: str, batch: int, prompt_len: int, gen_len: int) -> dict:
@@ -109,14 +123,33 @@ def bench_workload(model: str, name: str, batch: int, prompt_len: int, gen_len: 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3-4B")
+    ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--out", default="benchmarks/results/vs_thunder_vllm.md")
+    ap.add_argument("--sweep", default=os.environ.get("TQ_VS_SWEEP", ""),
+                    help="comma-separated workload names; empty = full sweep")
     args = ap.parse_args()
 
+    sweep = SWEEP
+    if args.sweep:
+        want = {s.strip() for s in args.sweep.split(",") if s.strip()}
+        sweep = [s for s in SWEEP if s[0] in want]
+
     rows = []
-    for name, batch, prompt_len, gen_len in SWEEP:
+    for name, batch, prompt_len, gen_len in sweep:
         print(f"[vs_tq_vllm] {name}", flush=True)
-        rows.append(bench_workload(args.model, name, batch, prompt_len, gen_len))
+        row = bench_workload(args.model, name, batch, prompt_len, gen_len)
+        b, o = row["baseline"], row["ours"]
+        if b.get("error") or o.get("error"):
+            print(f"[vs] {name:<18} baseline_err={b.get('error')} ours_err={o.get('error')}",
+                  flush=True)
+        else:
+            pct = o["tokens_per_s"] / b["tokens_per_s"] * 100 if b["tokens_per_s"] else float("nan")
+            print(f"[vs] {name:<18} baseline={b['tokens_per_s']:.1f} tok/s "
+                  f"ours={o['tokens_per_s']:.1f} tok/s ours%={pct:.1f} "
+                  f"latency base/ours={b['latency_s']:.3f}/{o['latency_s']:.3f}s "
+                  f"kv_base={b['mem_used_mb']:.0f}MB kv_ours={o['mem_used_mb']:.0f}MB",
+                  flush=True)
+        rows.append(row)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:

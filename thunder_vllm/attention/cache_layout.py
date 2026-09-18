@@ -42,7 +42,7 @@ import torch
 
 _log = _logging.getLogger("thunder_vllm.cache_layout")
 
-from thunder_vllm.utils.logging import get_logger
+from thunder_vllm.utils.logging import env_flag, get_logger
 
 logger = get_logger("attention.cache_layout")
 
@@ -199,7 +199,7 @@ class ThunderCacheLayout:
         The cache is ``(nb, Hk, bs, head_slot)``; this is the single transpose
         boundary between vLLM's convention and the kernels'.
         """
-        if _os.environ.get("THUNDER_DEBUG_LAYOUT"):
+        if env_flag("THUNDER_DEBUG_LAYOUT"):
             _log.info(
                 "k_codes received shape=%s dtype=%s stride=%s contiguous=%s",
                 tuple(kv_cache.shape), kv_cache.dtype, tuple(kv_cache.stride()),
@@ -452,7 +452,7 @@ if _HAS_TRITON:
         n = key.shape[0]
         if n == 0:
             return
-        if _os.environ.get("THUNDER_DEBUG_KV") and not (
+        if env_flag("THUNDER_DEBUG_KV") and not (
             slot_mapping.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
             # NOTE: this block reads slot min/max back to the host. That is a D2H
