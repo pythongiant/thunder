@@ -638,6 +638,18 @@ class ThunderAttentionImpl(AttentionImplBase):
             _cap_reqs = int(attn_metadata.num_reqs)
         if _cap_len <= 0:
             _cap_len = int(attn_metadata.max_blocks_per_req) * self.layout.block_size
+        # Engine-path profiling/capture: only on the first true single-request
+        # decode step (max_query_len == 1, num_reqs == 1), where the oracle is
+        # cheap and unambiguous. Times each stage once.
+        _cap = (
+            env_flag("THUNDER_ENGINE_HOOK")
+            and not _ENGINE_HOOK["done"]
+            and int(getattr(attn_metadata, "max_query_len", 0) or 0) == 1
+            and int(getattr(attn_metadata, "num_reqs", 0) or 0) == 1
+        )
+        if _cap:
+            _ev0 = torch.cuda.Event(enable_timing=True)
+            _ev0.record()
         paged = self._ensure_paged(
             query.device,
             max_num_reqs=max(_cap_reqs, 1),
@@ -672,6 +684,9 @@ class ThunderAttentionImpl(AttentionImplBase):
                 live_blocks=live_blocks,
             )
 
+        if _cap:
+            _ev1 = torch.cuda.Event(enable_timing=True)
+            _ev1.record()
         q = query[:n].reshape(n, self.num_heads, self.head_size)
         o = output[:n].reshape(n, self.num_heads, self.head_size)
 
@@ -688,6 +703,9 @@ class ThunderAttentionImpl(AttentionImplBase):
             "", "0", "false", "no", "off")
         if not _skip_rot:
             q = (q.float() @ quantizer.rotation.matrix).to(q.dtype)
+        if _cap:
+            _ev2 = torch.cuda.Event(enable_timing=True)
+            _ev2.record()
         launch_thunder_attention(
             kernel,
             q,
@@ -701,18 +719,29 @@ class ThunderAttentionImpl(AttentionImplBase):
             reg_rescale=self.cfg.reg_rescale,
             causal_bound=self.cfg.causal_bound,
         )
+        if _cap:
+            _ev3 = torch.cuda.Event(enable_timing=True)
+            _ev3.record()
+            _o_pre = o.detach().clone()
 
         # The kernel accumulates ``O_rot = P @ (R V) = R (P @ V)``: scores are
         # rotation invariant but the value contribution is not. Undo the
         # rotation once, on the flattened head axis. This is the plugin's
         # "final weight-absorbed output projection" GEMM -- a single linear
         # projection over the head dimension, not a second attention pass.
-        if env_flag("THUNDER_ENGINE_HOOK") and not _ENGINE_HOOK["done"] and int(
-            getattr(attn_metadata, "max_query_len", 0) or 0
-        ) <= 2:
-            # Capture the first DECODE step's engine-internal tensors (rotated Q,
-            # gathered packed K/V + norms, pre-inverse output) so a probe can run
-            # the rotated-dequant oracle on exactly what the kernel consumed.
+        if not _skip_rot:
+            o.copy_(quantizer.rotation.inverse(o.float()).to(o.dtype))
+        if _cap:
+            _ev4 = torch.cuda.Event(enable_timing=True)
+            _ev4.record()
+            torch.cuda.synchronize()
+            _times = {
+                "gather_ms": _ev0.elapsed_time(_ev1),
+                "qrot_ms": _ev1.elapsed_time(_ev2),
+                "launch_ms": _ev2.elapsed_time(_ev3),
+                "inverse_ms": _ev3.elapsed_time(_ev4),
+                "total_ms": _ev0.elapsed_time(_ev4),
+            }
             _ENGINE_HOOK["done"] = True
             try:
                 torch.save(
@@ -722,19 +751,20 @@ class ThunderAttentionImpl(AttentionImplBase):
                         "v": gathered.v_packed.detach().cpu(),
                         "kn": gathered.k_norm.detach().float().cpu(),
                         "vn": gathered.v_norm.detach().float().cpu(),
-                        "o_pre": o.detach().float().cpu(),
+                        "o_pre": _o_pre.detach().float().cpu(),
+                        "o_final": o.detach().float().cpu(),
                         "seq_lens": attn_metadata.seq_lens.detach().cpu(),
+                        "block_table": attn_metadata.block_table.detach().cpu(),
                         "max_blocks_per_req": int(attn_metadata.max_blocks_per_req),
                         "hq": self.num_heads, "hk": self.num_kv_heads,
                         "hd": self.head_size, "bs": self.layout.block_size,
                         "is_causal": bool(is_causal),
+                        "times": _times,
                     },
                     os.environ.get("THUNDER_HOOK_PATH", "/tmp/thunder_hook.pt"),
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("THUNDER_ENGINE_HOOK dump failed")
-        if not _skip_rot:
-            o.copy_(quantizer.rotation.inverse(o.float()).to(o.dtype))
         return output
 
     def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:
