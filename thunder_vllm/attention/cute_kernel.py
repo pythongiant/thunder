@@ -298,6 +298,7 @@ class ThunderAttentionForward:
         max_query_len: int = 0,
         num_splits: int = 1,
         split_mode: cutlass.Constexpr[int] = 0,
+        gqa_pack: cutlass.Constexpr[int] = 0,
         stream=None,
     ):
         # (rows, Hq, hdim) -> (rows, hdim, Hq) so a head slice is rank 2.
@@ -346,6 +347,7 @@ class ThunderAttentionForward:
             Int32(num_splits),
             debug,
             split_mode,
+            gqa_pack,
             tiled_mma_qk,
             tiled_mma_pv,
             SharedStorage,
@@ -354,7 +356,14 @@ class ThunderAttentionForward:
             # Split-K: the request axis is multiplied by num_splits; block idx z
             # maps z -> (req = z // S, split = z % S). With S == 1 this is exactly
             # the baseline grid.
-            grid=(num_q_blocks, num_q_heads, num_reqs * num_splits),
+            #
+            # gqa_pack puts KV heads, not query heads, on the y axis: one CTA
+            # reconstructs a KV tile once and scores every query head sharing it.
+            grid=(
+                num_q_blocks,
+                mK.shape[2] if gqa_pack else num_q_heads,
+                num_reqs * num_splits,
+            ),
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -384,6 +393,7 @@ class ThunderAttentionForward:
         num_splits: Int32,
         debug: cutlass.Constexpr[int],
         split_mode: cutlass.Constexpr[int],
+        gqa_pack: cutlass.Constexpr[int],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
@@ -391,13 +401,19 @@ class ThunderAttentionForward:
     ):
         tidx = cute.arch.thread_idx()[0]
         q_block = cute.arch.block_idx()[0]
-        q_head = cute.arch.block_idx()[1]
+        head_or_kv = cute.arch.block_idx()[1]
         z = cute.arch.block_idx()[2]
         # z -> (request, split). num_splits == 1 leaves this identical to the
         # baseline (req = z, split = 0).
         req = z // num_splits
         split = z % num_splits
-        kv_head = q_head // self.qhead_per_kvhead
+        if const_expr(gqa_pack):
+            # y axis is the KV head; the query heads sharing it are the M rows.
+            kv_head = head_or_kv
+            q_head = head_or_kv * self.qhead_per_kvhead
+        else:
+            q_head = head_or_kv
+            kv_head = q_head // self.qhead_per_kvhead
         # Block-unique debug slot, defined before any control-flow region: every
         # write below is keyed by (z, y) so the snapshot is coherent.
         n_q_heads: cutlass.Constexpr[int] = mQ.shape[2]
@@ -456,18 +472,33 @@ class ThunderAttentionForward:
         mOh = mO[None, None, q_head]
         q_total: cutlass.Constexpr[int] = self.tile_m * self.tile_hdim
         q_iters: cutlass.Constexpr[int] = (q_total + self.num_threads - 1) // self.num_threads
-        for e in cutlass.range_constexpr(q_iters):
-            idx = tidx + e * self.num_threads
-            if idx < q_total:
-                row = idx // self.tile_hdim
-                col = idx % self.tile_hdim
-                # ``row < q_len`` alone is NOT a bounds check: the address adds
-                # q_block*tile_m, so a block past this request's query length must
-                # be skipped entirely (and zeroed) or it reads past mQ.
-                if q_block * self.tile_m + row < q_len:
-                    sQ[row, col] = mQh[q_start + q_block * self.tile_m + row, col]
-                else:
-                    sQ[row, col] = cutlass.Float16(0.0)
+        if const_expr(gqa_pack):
+            # Decode: one query token, qhead_per_kvhead heads sharing this KV
+            # head. M row r is (token = q_start + q_block*tile_m, head =
+            # kv_head*G + r); rows >= G are padding.
+            token_q = q_start + q_block * self.tile_m
+            for e in cutlass.range_constexpr(q_iters):
+                idx = tidx + e * self.num_threads
+                if idx < q_total:
+                    row = idx // self.tile_hdim
+                    col = idx % self.tile_hdim
+                    if row < self.qhead_per_kvhead:
+                        sQ[row, col] = mQ[token_q, col, kv_head * self.qhead_per_kvhead + row]
+                    else:
+                        sQ[row, col] = cutlass.Float16(0.0)
+        else:
+            for e in cutlass.range_constexpr(q_iters):
+                idx = tidx + e * self.num_threads
+                if idx < q_total:
+                    row = idx // self.tile_hdim
+                    col = idx % self.tile_hdim
+                    # ``row < q_len`` alone is NOT a bounds check: the address adds
+                    # q_block*tile_m, so a block past this request's query length must
+                    # be skipped entirely (and zeroed) or it reads past mQ.
+                    if q_block * self.tile_m + row < q_len:
+                        sQ[row, col] = mQh[q_start + q_block * self.tile_m + row, col]
+                    else:
+                        sQ[row, col] = cutlass.Float16(0.0)
 
         if tidx < self.tile_m:
             sRowMax[tidx] = -Float32.inf
@@ -519,7 +550,16 @@ class ThunderAttentionForward:
 
         n_tiles = cute.ceil_div(kv_len, self.tile_n)
         q_off = q_block * self.tile_m
-        q_row_base = q_start + q_off
+        # Query validity / causal use these. gqa_pack: every M row is the SAME
+        # query token at a different head, so the row validity test is "row < G"
+        # and causal must not advance with the row (decode is not causal anyway;
+        # gqa_pack is only enabled for decode).
+        q_off_v = q_off
+        q_len_v = q_len
+        if const_expr(gqa_pack):
+            q_off_v = Int32(0)
+            q_len_v = Int32(self.qhead_per_kvhead)
+        q_row_base = q_start + q_off_v
 
         # This CTA's contiguous tile range within the request's KV. num_splits == 1
         # covers every tile, so the baseline schedule is unchanged.
@@ -553,7 +593,7 @@ class ThunderAttentionForward:
                 for n in cutlass.range_constexpr(self.tile_n):
                     kv = nt * self.tile_n + n
                     val = sS[tidx, n] * Float32(sKNorm[n]) * softmax_scale
-                    if _valid(kv, tidx, kv_len, q_off, q_len, self.is_causal):
+                    if _valid(kv, tidx, kv_len, q_off_v, q_len_v, self.is_causal):
                         cur = cute.arch.fmax(cur, val)
                 sRowMax[tidx] = cute.arch.fmax(sRowMax[tidx], cur)
             cute.arch.barrier()
@@ -593,7 +633,7 @@ class ThunderAttentionForward:
                 for n in cutlass.range_constexpr(self.tile_n):
                     kv = nt * self.tile_n + n
                     p = Float32(0.0)
-                    if _valid(kv, tidx, kv_len, q_off, q_len, self.is_causal):
+                    if _valid(kv, tidx, kv_len, q_off_v, q_len_v, self.is_causal):
                         x = sS[tidx, n] * Float32(sKNorm[n]) * softmax_scale
                         p = cute.math.exp2((x - sRowMax[tidx]) * _LOG2E, fastmath=True)
                     sP[tidx, n] = (p * Float32(sVNorm[n])).to(cutlass.Float16)
@@ -610,7 +650,25 @@ class ThunderAttentionForward:
         # ============================ Epilogue ==========================
         cute.copy(smem_copy_atom_O, taccOrO, tOsOf)
         cute.arch.barrier()
-        if const_expr(split_mode):
+        if const_expr(gqa_pack):
+            # M row r is the query head kv_head*G + r; all rows share the same
+            # query token (q_row_base). Only G rows are live.
+            if tidx < self.qhead_per_kvhead:
+                head_t = kv_head * self.qhead_per_kvhead + tidx
+                if const_expr(split_mode):
+                    for c in cutlass.range_constexpr(self.tile_hdim):
+                        mPartO[z, head_t, c] = sOf[tidx, c]
+                    mPartM[z, head_t] = sRowMax[tidx]
+                    mPartL[z, head_t] = sRowSum[tidx]
+                else:
+                    rs = sRowSum[tidx]
+                    if rs <= Float32(0.0):
+                        rs = Float32(1.0)
+                    mOh_t = mO[None, None, head_t]
+                    if q_row_base < q_start + q_len:
+                        for c in cutlass.range_constexpr(self.tile_hdim):
+                            mOh_t[q_row_base, c] = (sOf[tidx, c] / rs).to(cutlass.Float16)
+        elif const_expr(split_mode):
             # Split-K: publish the UNNORMALISED partial state for this
             # (request, head, split) so the host merge can rescale by the global
             # max. Decode has q_len == 1, so only row 0 is a live query row.
@@ -749,6 +807,38 @@ _DBG_BUFFER = None
 _SPLIT_BUFFERS: dict = {}
 
 
+def choose_split_count(
+    seq_len: int,
+    batch: int,
+    num_q_heads: int,
+    *,
+    tile_n: int = 64,
+    target_ctas: int = 128,
+    max_splits: int = 8,
+    min_tiles_per_split: int = 2,
+) -> int:
+    """Smallest split count that reaches roughly ``target_ctas`` CTAs.
+
+    Measured on B200/Qwen3-8B: the split-K knee is ~128 CTAs (S=4 at 32 q-heads,
+    batch 1); S=8/16 add ~nothing and S=32 only ~10-15% at the longest contexts,
+    so ``max_splits`` is capped at 8. Split counts stay powers of two so the
+    number of distinct captured launches stays small. Never splits below
+    ``min_tiles_per_split`` tiles per CTA (a split with no tiles is pure merge
+    overhead).
+    """
+    import math
+
+    if seq_len <= 0 or batch <= 0 or num_q_heads <= 0:
+        return 1
+    want = math.ceil(target_ctas / (batch * num_q_heads))
+    n_tiles = math.ceil(seq_len / tile_n)
+    cap = min(max_splits, max(1, n_tiles // max(min_tiles_per_split, 1)))
+    splits = 1
+    while splits * 2 <= min(want, cap):
+        splits *= 2
+    return max(1, min(splits, cap, max_splits))
+
+
 def _split_buffers(num_reqs: int, num_splits: int, hq: int, hd: int, device, dtype):
     """Persistent split-K partial buffers (pointer-stable for CUDA graphs).
 
@@ -804,6 +894,7 @@ def launch_thunder_attention(
     quantizer,
     debug: bool = False,
     num_splits: int = 1,
+    gqa_pack: bool = False,
 ) -> None:
     """Launch the compiled cooperative kernel on gathered, contiguous tensors.
 
@@ -896,6 +987,12 @@ def launch_thunder_attention(
             "split-K decode requires max_query_len == 1, "
             f"got {max_query_len}"
         )
+    gqa_mode = 1 if (gqa_pack and int(kernel.qhead_per_kvhead) > 1) else 0
+    if gqa_mode and max_query_len > 1:
+        raise ValueError(
+            "gqa_pack decode requires max_query_len == 1, "
+            f"got {max_query_len}"
+        )
     part_o_t, part_m_t, part_l_t = _split_buffers(
         num_reqs, S, hq, hd, q.device, q.dtype
     )
@@ -913,6 +1010,7 @@ def launch_thunder_attention(
         max_query_len,
         S,
         int(split_mode),
+        int(gqa_mode),
         cuda.CUstream(stream),
     )
 

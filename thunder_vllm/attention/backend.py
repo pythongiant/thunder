@@ -655,6 +655,7 @@ class ThunderAttentionImpl(AttentionImplBase):
             attn_metadata,
             self.scale,
             quantizer=quantizer,
+            num_splits=self._decode_split_count(attn_metadata, is_causal),
         )
 
         # The kernel accumulates ``O_rot = P @ (R V) = R (P @ V)``: scores are
@@ -664,6 +665,37 @@ class ThunderAttentionImpl(AttentionImplBase):
         # projection over the head dimension, not a second attention pass.
         o.copy_(quantizer.rotation.inverse(o.float()).to(o.dtype))
         return output
+
+    def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:
+        """Split-K count for a decode step, or 1 when splitting would not help.
+
+        Decode only (``is_causal`` is False and there is one query token per
+        request); prefill keeps the baseline schedule. The count must be known on
+        the host before the launch -- under CUDA-graph capture a device read is
+        illegal -- so it comes from vLLM's CPU seq-len mirror when present, or a
+        non-capturing sync, and otherwise falls back to no split. Override with
+        ``THUNDER_SPLITS`` for experiments.
+        """
+        import os
+
+        forced = os.environ.get("THUNDER_SPLITS")
+        if forced:
+            return max(1, int(forced))
+        if is_causal or self.num_kv_groups <= 1:
+            return 1
+        n_reqs = max(int(attn_metadata.num_reqs), 1)
+        sl_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        if torch.is_tensor(sl_cpu) and sl_cpu.numel() > 0 and not sl_cpu.is_cuda:
+            seq_len = int(sl_cpu[:n_reqs].max().item())
+        elif not torch.cuda.is_current_stream_capturing():
+            seq_len = int(attn_metadata.seq_lens[:n_reqs].max().item())
+        else:
+            return 1
+        from thunder_vllm.attention.cute_kernel import choose_split_count
+
+        return choose_split_count(
+            seq_len, n_reqs, self.num_heads, tile_n=self.cfg.n_block_size
+        )
 
     def do_kv_cache_update(self, *args: Any, **kwargs: Any) -> None:
         """vLLM's separate KV-cache write hook.
