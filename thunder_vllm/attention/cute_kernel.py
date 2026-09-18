@@ -303,6 +303,7 @@ class ThunderAttentionForward:
         gqa_pack: cutlass.Constexpr[int] = 0,
         onepass: cutlass.Constexpr[int] = 0,
         reg_rescale: cutlass.Constexpr[int] = 0,
+        causal_bound: cutlass.Constexpr[int] = 0,
         stream=None,
     ):
         # (rows, Hq, hdim) -> (rows, hdim, Hq) so a head slice is rank 2.
@@ -354,6 +355,7 @@ class ThunderAttentionForward:
             gqa_pack,
             onepass,
             reg_rescale,
+            causal_bound,
             tiled_mma_qk,
             tiled_mma_pv,
             SharedStorage,
@@ -402,6 +404,7 @@ class ThunderAttentionForward:
         gqa_pack: cutlass.Constexpr[int],
         onepass: cutlass.Constexpr[int],
         reg_rescale: cutlass.Constexpr[int],
+        causal_bound: cutlass.Constexpr[int],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
@@ -575,13 +578,29 @@ class ThunderAttentionForward:
             q_len_v = Int32(self.qhead_per_kvhead)
         q_row_base = q_start + q_off_v
 
+        # Causal bound: a q-block only attends KV at or below its highest query
+        # position, so tiles entirely past that are fully masked. Skipping them
+        # removes real work (~half the tile iterations for causal prefill).
+        n_eff = n_tiles
+        if const_expr(causal_bound):
+            if self.is_causal:
+                max_row = q_len - q_off_v - 1
+                if max_row > self.tile_m - 1:
+                    max_row = self.tile_m - 1
+                max_kv = (kv_len - q_len) + q_off_v + max_row
+                n_eff = cute.ceil_div(max_kv + 1, self.tile_n)
+                if n_eff > n_tiles:
+                    n_eff = n_tiles
+                if n_eff < 0:
+                    n_eff = Int32(0)
+
         # This CTA's contiguous tile range within the request's KV. num_splits == 1
         # covers every tile, so the baseline schedule is unchanged.
-        tiles_per_split = cute.ceil_div(n_tiles, num_splits)
+        tiles_per_split = cute.ceil_div(n_eff, num_splits)
         nt_lo = split * tiles_per_split
         nt_hi = nt_lo + tiles_per_split
-        if nt_hi > n_tiles:
-            nt_hi = n_tiles
+        if nt_hi > n_eff:
+            nt_hi = n_eff
         n_local = nt_hi - nt_lo
         # One-pass: PASS 1 is skipped and PASS 2 performs the online-softmax
         # update itself. The loop bound (not an `if`) keeps both branches in the
@@ -960,6 +979,7 @@ def launch_thunder_attention(
     gqa_pack: bool = False,
     onepass: bool = False,
     reg_rescale: bool = False,
+    causal_bound: bool = False,
 ) -> None:
     """Launch the compiled cooperative kernel on gathered, contiguous tensors.
 
@@ -1078,6 +1098,7 @@ def launch_thunder_attention(
         int(gqa_mode),
         int(1 if onepass else 0),
         int(1 if reg_rescale else 0),
+        int(1 if causal_bound else 0),
         cuda.CUstream(stream),
     )
 
