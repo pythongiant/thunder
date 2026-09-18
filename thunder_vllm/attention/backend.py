@@ -32,6 +32,8 @@ from thunder_vllm.utils.logging import env_flag, get_logger, log_once
 
 logger = get_logger("attention.backend")
 
+_ENGINE_HOOK = {"done": False}
+
 try:  # pragma: no cover - CPU-only machines have no vLLM
     from vllm.v1.attention.backend import (  # type: ignore
         AttentionBackend,
@@ -705,6 +707,32 @@ class ThunderAttentionImpl(AttentionImplBase):
         # rotation once, on the flattened head axis. This is the plugin's
         # "final weight-absorbed output projection" GEMM -- a single linear
         # projection over the head dimension, not a second attention pass.
+        if env_flag("THUNDER_ENGINE_HOOK") and not _ENGINE_HOOK["done"] and int(
+            getattr(attn_metadata, "max_query_len", 0) or 0
+        ) <= 2:
+            # Capture the first DECODE step's engine-internal tensors (rotated Q,
+            # gathered packed K/V + norms, pre-inverse output) so a probe can run
+            # the rotated-dequant oracle on exactly what the kernel consumed.
+            _ENGINE_HOOK["done"] = True
+            try:
+                torch.save(
+                    {
+                        "q_rot": q.detach().float().cpu(),
+                        "k": gathered.k_packed.detach().cpu(),
+                        "v": gathered.v_packed.detach().cpu(),
+                        "kn": gathered.k_norm.detach().float().cpu(),
+                        "vn": gathered.v_norm.detach().float().cpu(),
+                        "o_pre": o.detach().float().cpu(),
+                        "seq_lens": attn_metadata.seq_lens.detach().cpu(),
+                        "max_blocks_per_req": int(attn_metadata.max_blocks_per_req),
+                        "hq": self.num_heads, "hk": self.num_kv_heads,
+                        "hd": self.head_size, "bs": self.layout.block_size,
+                        "is_causal": bool(is_causal),
+                    },
+                    os.environ.get("THUNDER_HOOK_PATH", "/tmp/thunder_hook.pt"),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("THUNDER_ENGINE_HOOK dump failed")
         if not _skip_rot:
             o.copy_(quantizer.rotation.inverse(o.float()).to(o.dtype))
         return output
