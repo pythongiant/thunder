@@ -37,29 +37,52 @@ from benchmarks.bench_common import (  # noqa: E402
 )
 
 SWEEP = [
-    ("short-decode", 1, 128, 512),
-    ("mixed", 1, 512, 512),
-    ("decode-heavy", 1, 64, 1024),
-    ("high-load", 500, 512, 128),
-    ("long-prefill", 1, 4096, 128),
-    ("very-long-prefill", 1, 8192, 64),
+    ("decode-ctx-4k", 1, 4096, 64),
+    ("decode-ctx-8k", 1, 8192, 64),
+    ("decode-ctx-16k", 1, 16384, 64),
+    ("decode-ctx-32k", 1, 32768, 64),
+    ("prefill-4k", 1, 4096, 1),
+    ("prefill-32k", 1, 32768, 1),
 ]
 
 N_WARMUP = 25
 N_REP = 100
 
 
-def _run_vllm(model: str, backend: str, prompts, gen_len: int) -> dict:
-    """Run one generation pass under vLLM with the given attention backend."""
+def _run_vllm(model: str, backend: str, prompts, gen_len: int, max_model_len: int,
+              kv_cache_dtype: str | None = None) -> dict:
+    """Run one generation pass under vLLM with the given attention backend.
+
+    Also measures TTFT with a separate ``max_tokens=1`` pass (prefill + first
+    token) and derives inter-token latency from the full pass, so the baseline
+    is comparable to a decode-kernel number.
+
+    dtype is pinned to float16: upstream TURBOQUANT needs a ``turboquant_*``
+    kv_cache_dtype (it is rejected with 'kv_cache_dtype not supported'
+    otherwise), and this plugin's cache write rotates in fp16, so bf16 weights
+    hit "Both operands must be same dtype. Got bf16 and fp16" in its Triton
+    store kernel.
+    """
     try:
         from vllm import LLM, SamplingParams  # type: ignore
 
-        llm = LLM(
+        kwargs: dict = dict(
             model=model,
             attention_backend=backend,
             enforce_eager=False,
-            max_model_len=16384,
+            max_model_len=max_model_len,
+            dtype="float16",
         )
+        if kv_cache_dtype:
+            kwargs["kv_cache_dtype"] = kv_cache_dtype
+        llm = LLM(**kwargs)
+        # TTFT pass.
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _ = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=1))
+        torch.cuda.synchronize()
+        ttft_s = time.perf_counter() - t0
+
         params = SamplingParams(temperature=0.0, max_tokens=gen_len)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -67,8 +90,11 @@ def _run_vllm(model: str, backend: str, prompts, gen_len: int) -> dict:
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+        n_req = max(len(outputs), 1)
         return {
             "latency_s": dt,
+            "ttft_s": ttft_s,
+            "itl_ms": (dt - ttft_s) / max(gen_len - 1, 1) * 1e3,
             "tokens": tokens,
             "tokens_per_s": tokens / dt if dt > 0 else float("nan"),
             "text": outputs[0].outputs[0].text if outputs else "",
@@ -82,20 +108,25 @@ def _run_vllm(model: str, backend: str, prompts, gen_len: int) -> dict:
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc()[-1500:],
             "latency_s": float("nan"),
+            "ttft_s": float("nan"),
+            "itl_ms": float("nan"),
             "tokens": 0,
             "tokens_per_s": float("nan"),
             "text": "",
         }
 
 
-def bench_workload(model: str, name: str, batch: int, prompt_len: int, gen_len: int) -> dict:
+def bench_workload(model: str, name: str, batch: int, prompt_len: int,
+                   gen_len: int, max_model_len: int = 40960,
+                   baseline_kv_cache_dtype: str = "turboquant_3bit_nc") -> dict:
     torch.manual_seed(0)
     prompts = [
         " ".join(["token"] * prompt_len) for _ in range(batch)
     ]
 
     with nvml_sampler() as gpu:
-        base = _run_vllm(model, "TURBOQUANT", prompts, gen_len)
+        base = _run_vllm(model, "TURBOQUANT", prompts, gen_len, max_model_len,
+                         kv_cache_dtype=baseline_kv_cache_dtype)
     base["gpu_util"] = gpu["util_gpu"]
     base["mem_used_mb"] = gpu["mem_used_mb"]
 
@@ -106,7 +137,7 @@ def bench_workload(model: str, name: str, batch: int, prompt_len: int, gen_len: 
     reg.register()
 
     with nvml_sampler() as gpu:
-        ours = _run_vllm(model, "CUSTOM", prompts, gen_len)
+        ours = _run_vllm(model, "CUSTOM", prompts, gen_len, max_model_len)
     ours["gpu_util"] = gpu["util_gpu"]
     ours["mem_used_mb"] = gpu["mem_used_mb"]
 
@@ -127,6 +158,8 @@ def main() -> None:
     ap.add_argument("--out", default="benchmarks/results/vs_thunder_vllm.md")
     ap.add_argument("--sweep", default=os.environ.get("TQ_VS_SWEEP", ""),
                     help="comma-separated workload names; empty = full sweep")
+    ap.add_argument("--baseline-kv-cache-dtype", default="turboquant_3bit_nc",
+                    help="kv_cache_dtype for the upstream TURBOQUANT baseline")
     args = ap.parse_args()
 
     sweep = SWEEP
@@ -137,16 +170,18 @@ def main() -> None:
     rows = []
     for name, batch, prompt_len, gen_len in sweep:
         print(f"[vs_tq_vllm] {name}", flush=True)
-        row = bench_workload(args.model, name, batch, prompt_len, gen_len)
+        row = bench_workload(args.model, name, batch, prompt_len, gen_len,
+                             baseline_kv_cache_dtype=args.baseline_kv_cache_dtype)
         b, o = row["baseline"], row["ours"]
         if b.get("error") or o.get("error"):
             print(f"[vs] {name:<18} baseline_err={b.get('error')} ours_err={o.get('error')}",
                   flush=True)
         else:
             pct = o["tokens_per_s"] / b["tokens_per_s"] * 100 if b["tokens_per_s"] else float("nan")
-            print(f"[vs] {name:<18} baseline={b['tokens_per_s']:.1f} tok/s "
-                  f"ours={o['tokens_per_s']:.1f} tok/s ours%={pct:.1f} "
-                  f"latency base/ours={b['latency_s']:.3f}/{o['latency_s']:.3f}s "
+            print(f"[vs] {name:<16} baseline={b['tokens_per_s']:7.1f} tok/s "
+                  f"ttft={b['ttft_s'] * 1e3:7.1f}ms itl={b['itl_ms']:6.2f}ms | "
+                  f"ours={o['tokens_per_s']:7.1f} tok/s ttft={o['ttft_s'] * 1e3:7.1f}ms "
+                  f"itl={o['itl_ms']:6.2f}ms | ours%={pct:5.1f} "
                   f"kv_base={b['mem_used_mb']:.0f}MB kv_ours={o['mem_used_mb']:.0f}MB",
                   flush=True)
         rows.append(row)

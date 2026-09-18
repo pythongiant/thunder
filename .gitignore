@@ -12,3 +12,7 @@ benchmarks/results/*.csv
 .modal/
 
 experiments/
+
+# Local agent/memory files
+AGENTS.md
+CLAUDE.md
