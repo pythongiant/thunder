@@ -844,6 +844,12 @@ def _load_kv_packed(
                 sK_packed[row, i % self.k_packed_bytes] = mKh[
                     base + nt * self.tile_n + row, i % self.k_packed_bytes
                 ]
+            else:
+                # Zero rows past kv_len instead of leaving stale SMEM. They are
+                # masked out of the softmax, but the PV GEMM multiplies p (=0)
+                # against the dequantized V, and 0 * NaN = NaN -- which is how a
+                # stale tail tile turned the output NaN.
+                sK_packed[row, i % self.k_packed_bytes] = cutlass.Uint8(0)
     v_tot: cutlass.Constexpr[int] = self.tile_n * self.v_packed_bytes
     v_iters: cutlass.Constexpr[int] = (v_tot + self.num_threads - 1) // self.num_threads
     if const_expr(want_v):
@@ -855,11 +861,17 @@ def _load_kv_packed(
                     sV_packed[row, i % self.v_packed_bytes] = mVh[
                         base + nt * self.tile_n + row, i % self.v_packed_bytes
                     ]
+                else:
+                    sV_packed[row, i % self.v_packed_bytes] = cutlass.Uint8(0)
     if tidx < self.tile_n:
         if nt * self.tile_n + tidx < kv_len:
             sKNorm[tidx] = mKN[base + nt * self.tile_n + tidx, kv_head]
             if const_expr(want_v):
                 sVNorm[tidx] = mVN[base + nt * self.tile_n + tidx, kv_head]
+        else:
+            sKNorm[tidx] = cutlass.Float16(0.0)
+            if const_expr(want_v):
+                sVNorm[tidx] = cutlass.Float16(0.0)
 
 
 @cute.jit
