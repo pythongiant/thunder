@@ -906,9 +906,11 @@ class KernelNotReadyError(RuntimeError):
 _DBG_BUFFER = None
 _SPLIT_BUFFERS: dict = {}
 _FAST: dict = {}
-# Verified standalone (407ms -> 0.35ms, bit-identical output) but NOT yet verified
-# end-to-end in the engine, so default off. Enable with THUNDER_FASTLAUNCH=1.
-_FASTLAUNCH = os.environ.get("THUNDER_FASTLAUNCH", "0").strip().lower() not in (
+# Reuse the cached compiled function instead of re-tracing MLIR per launch.
+# Verified: standalone 407ms -> 0.35ms bit-identical; engine (Qwen3-0.6B) TTFT
+# 12205ms -> 474ms, decode 81 -> 122 tok/s, same output text. Set
+# THUNDER_FASTLAUNCH=0 to fall back to the plain @cute.jit path.
+_FASTLAUNCH = os.environ.get("THUNDER_FASTLAUNCH", "1").strip().lower() not in (
     "", "0", "false", "no", "off"
 )
 
