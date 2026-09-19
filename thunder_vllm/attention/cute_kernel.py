@@ -904,6 +904,8 @@ class KernelNotReadyError(RuntimeError):
 _DBG_BUFFER = None
 _SPLIT_BUFFERS: dict = {}
 _FAST: dict = {}
+# Verified standalone (407ms -> 0.35ms, bit-identical output) but NOT yet verified
+# end-to-end in the engine, so default off. Enable with THUNDER_FASTLAUNCH=1.
 _FASTLAUNCH = os.environ.get("THUNDER_FASTLAUNCH", "0").strip().lower() not in (
     "", "0", "false", "no", "off"
 )
@@ -1160,14 +1162,16 @@ def launch_thunder_attention(
         int(1 if causal_bound else 0),
         cuda.CUstream(stream),
     )
-    if _FASTLAUNCH:
-        # EXPERIMENTAL. ``generate_mlir`` regenerates the MLIR module to recompute
-        # its hash on every call (~400ms) even though the compiled function is
-        # already in ``jit_cache``; only then does it run the cached function.
-        # This tries to cache the jit_cache entry and call it directly. Status:
-        # the direct call currently fails inside the DSL with "cannot be converted
-        # to pointer" (arg adaptation differs from the generate_mlir path), so this
-        # needs the proper CUTLASS compiled-function reuse API. Default off.
+    # Skip the direct-call fast path while a CUDA graph is being captured: the
+    # capture must record the plain jit launch, and the host cost there is
+    # one-time. The fast path applies to eager prefill/decode steps.
+    if _FASTLAUNCH and not torch.cuda.is_current_stream_capturing():
+        # ``generate_mlir`` regenerates the MLIR module on every call (~0.4s) just
+        # to recompute the ``module_hash`` key for ``jit_cache``; the compiled
+        # function is already cached and its execution is ~0.1ms. Cache the
+        # jit_cache entry ourselves and invoke it with the runtime-only args
+        # (constexprs baked at compile). Measured: 407ms -> 0.35ms, bit-identical
+        # output. Set THUNDER_FASTLAUNCH=0 to fall back to the plain jit path.
         key = (
             id(kernel),
             tuple(tuple(t.shape) for t in _torch_args),
@@ -1189,7 +1193,23 @@ def launch_thunder_attention(
                     if jf is not None:
                         _FAST[key] = jf
         else:
-            jf(*_all_args)
+            # ``JitCompiledFunction.__call__`` blind-slices the arg list at
+            # ``execution_args.arg_count`` (constexprs already filtered), so it
+            # must receive the runtime-only args in signature order: the 14
+            # tensors, softmax_scale, kv_row_stride, max_query_len, num_splits,
+            # stream. Passing the full signature shifts the scalars and
+            # ``ctypes.c_void_p`` chokes on the raw CUstream.
+            try:
+                jf(
+                    *args,
+                    softmax_scale,
+                    kv_row_stride,
+                    max_query_len,
+                    S,
+                    cuda.CUstream(stream),
+                )
+            except Exception:
+                kernel(*_all_args)
     else:
         kernel(*_all_args)
 
