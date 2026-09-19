@@ -353,27 +353,14 @@ class ThunderAttentionBackend(AttentionBackend):
             # Our head slot is head_slot_bytes (= k_packed + v_packed), so the
             # value must be 2 * head_slot_bytes. The fp16 norms live in the
             # plugin's own paired buffer, not in this slot.
-            # vLLM computes the cache's per-position inner dim as
-            # ``state_content_bytes / dtype.itemsize``. With an fp16 cache the
-            # value had to be doubled to land on the packed slot; now that the
-            # spec dtype is uint8 (itemsize 1) it must be the byte slot directly,
-            # otherwise the inner dim is 224 and every K/V view is mis-strided
-            # (v row = bs*Hk*176 -> reshape r*b_live*bs*Hk*64 fails).
-            packed = layout.head_slot_bytes
+            packed = 2 * layout.head_slot_bytes
             if prev is not None and int(prev) != packed:
                 logger.info(
                     "customize_spec: overriding state_content_bytes %s -> %s "
-                    "(fp16 K+V -> packed TurboQuant slot, uint8 cache)",
+                    "(fp16 K+V -> packed TurboQuant slot)",
                     prev, packed,
                 )
-            updates: dict = {"state_content_bytes": packed}
-            # The cache holds packed BYTES, not fp16 elements. Without this the
-            # spec dtype stays the model dtype (fp16), vLLM allocates an fp16
-            # cache and its store path does ``index_put`` Half<-Byte ->
-            # "Index put requires the source and destination dtypes match".
-            if hasattr(spec, "dtype") and spec.dtype != torch.uint8:
-                updates["dtype"] = torch.uint8
-            return replace(spec, **updates)
+            return replace(spec, state_content_bytes=packed)
         except Exception as exc:  # noqa: BLE001
             log_once(logger, "customize_spec skipped: %s", exc)
             return spec
