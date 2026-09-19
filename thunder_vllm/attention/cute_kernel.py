@@ -37,6 +37,8 @@ Notes
 
 from __future__ import annotations
 
+import atexit
+import collections
 import os
 
 from typing import NamedTuple
@@ -911,6 +913,49 @@ _FASTLAUNCH = os.environ.get("THUNDER_FASTLAUNCH", "0").strip().lower() not in (
 )
 
 
+_COUNTS: "collections.Counter" = collections.Counter()
+_DIAG = os.environ.get("THUNDER_DIAG", "0").strip().lower() not in (
+    "", "0", "false", "no", "off"
+)
+
+
+def _dump_counts() -> None:
+    if _DIAG:
+        print(f"[TQ-DIAG] {dict(_COUNTS)}", flush=True)
+
+
+atexit.register(_dump_counts)
+
+
+_LAST_JF: dict = {"v": None}
+
+
+def _ensure_cache_probe(dsl) -> None:
+    """Record the compiled function returned by ``jit_cache.get`` on a cache hit.
+
+    Arming off a *new* jit_cache key misses the common case where a different
+    Python key maps to the same compiled module_hash (vLLM profiling re-calls
+    with varied shapes), so the fast path never populated and every call paid the
+    ~0.4s MLIR regen.
+    """
+    cache = getattr(dsl, "jit_cache", None) if dsl is not None else None
+    if cache is None or getattr(cache, "_tq_probed", False):
+        return
+    orig = cache.get
+
+    def _probe(key):
+        v = orig(key)
+        if v is not None:
+            _LAST_JF["v"] = v
+        return v
+
+    try:
+        cache.get = _probe
+        cache._tq_probed = True
+    except Exception:
+        pass
+
+
 def _jitcache_keys(cache) -> set:
     """Keys of a CuTeDSL ``JitCacheDict`` (its backing dict is ``_dict``)."""
     d = getattr(cache, "_dict", None)
@@ -1166,6 +1211,9 @@ def launch_thunder_attention(
     # capture must record the plain jit launch, and the host cost there is
     # one-time. The fast path applies to eager prefill/decode steps.
     if _FASTLAUNCH and not torch.cuda.is_current_stream_capturing():
+        _COUNTS["attn_calls_eager"] += 1
+        if _DIAG and max_query_len > 1:
+            _COUNTS["attn_calls_eager_prefill"] += 1
         # ``generate_mlir`` regenerates the MLIR module on every call (~0.4s) just
         # to recompute the ``module_hash`` key for ``jit_cache``; the compiled
         # function is already cached and its execution is ~0.1ms. Cache the
@@ -1182,16 +1230,21 @@ def launch_thunder_attention(
         jf = _FAST.get(key)
         if jf is None:
             dsl = _dsl_object(kernel)
+            _ensure_cache_probe(dsl)
+            _LAST_JF["v"] = None
             before = _jitcache_keys(dsl.jit_cache) if dsl is not None else set()
             kernel(*_all_args)
-            if dsl is not None:
+            if jf is None:
+                jf = _LAST_JF["v"]
+            if jf is None and dsl is not None:
                 new = _jitcache_keys(dsl.jit_cache) - before
                 if not new and len(before) == 1:
                     new = before
                 if new:
                     jf = dsl.jit_cache.get(next(iter(new)))
-                    if jf is not None:
-                        _FAST[key] = jf
+            if jf is not None:
+                _FAST[key] = jf
+                _COUNTS["fast_armed"] += 1
         else:
             # ``JitCompiledFunction.__call__`` blind-slices the arg list at
             # ``execution_args.arg_count`` (constexprs already filtered), so it
@@ -1208,9 +1261,12 @@ def launch_thunder_attention(
                     S,
                     cuda.CUstream(stream),
                 )
+                _COUNTS["fast_hit"] += 1
             except Exception:
+                _COUNTS["fast_fallback"] += 1
                 kernel(*_all_args)
     else:
+        _COUNTS["slow_path"] += 1
         kernel(*_all_args)
 
     if _TIME:
