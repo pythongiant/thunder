@@ -36,7 +36,25 @@ from thunder_vllm.utils.logging import env_flag, get_logger
 logger = get_logger("attention.paged_kv")
 
 # Narrow debug counters (branch): how often CSR metadata is rebuilt/uploaded.
-CSR_COUNTS = {"gather_calls": 0, "uploads": 0, "reserve_calls": 0}
+CSR_COUNTS = {
+    "gather_calls": 0,      # CSR METADATA builds (indptr + page index): 1/step
+    "uploads": 0,           # indptr H2D: 1/step
+    "payload_gathers": 0,   # per-layer KV select: N_layers/step (per-layer cache)
+    "index_hits": 0,
+    "index_misses": 0,
+    "reserve_calls": 0,
+}
+
+
+@dataclass
+class CsrIndex:
+    """Per-step, layer-independent CSR metadata (shared by every layer)."""
+
+    indptr: torch.Tensor   # (r+1,) int32, token base per request
+    sel: torch.Tensor      # (nrows,) int64, physical page id in CSR order
+    nrows: int
+    num_blocks: int
+    key: tuple = ()
 
 
 @dataclass
@@ -75,6 +93,8 @@ class PagedKVManager:
         self.device = torch.device(device)
         self._buffers: GatheredKV | None = None
         self._rows: int | None = None
+        self._csr: "CsrIndex | None" = None
+        self._csr_md: object | None = None
 
     # ------------------------------------------------------------------ #
     # Shape / reservation
@@ -286,47 +306,50 @@ class PagedKVManager:
             )
         return out
 
-    def gather_csr(
-        self,
-        block_table: torch.Tensor,
-        kv_cache: torch.Tensor,
-        kv_scales: torch.Tensor,
-        blocks_per_req: list[int],
-    ) -> GatheredKV:
-        """CSR gather: pack each request's live blocks contiguously (no padding).
+    # -- Phase A: shared per-step CSR metadata ---------------------------
+    def _step_key(self, metadata, num_blocks: int):
+        """Key that is identical across the layers of one step and differs across
+        steps. vLLM hands the SAME metadata object to every layer of a step and
+        builds a fresh one per step (supports_update_block_table=False), so
+        ``id(metadata)`` is stable-within-step; ``seq_lens_cpu`` content is the
+        per-step discriminator (block_table/seq_lens pointers are persistent
+        sliced buffers). Returns ``None`` when no host mirror exists -> never
+        memoize (correctness over speed, no device sync)."""
+        bt = metadata.block_table
+        sl = getattr(metadata, "seq_lens_cpu", None)
+        if not (torch.is_tensor(sl) and sl.numel() > 0 and not sl.is_cuda):
+            return None
+        return (
+            id(metadata), bt.data_ptr(), tuple(bt.shape),
+            int(getattr(metadata, "num_actual_tokens", 0) or 0),
+            int(getattr(metadata, "max_query_len", 0) or 0),
+            bool(getattr(metadata, "is_prefill", False)),
+            int(num_blocks),
+            (sl.data_ptr(), tuple(sl.shape), tuple(int(x) for x in sl.tolist())),
+        )
 
-        Produces ``token_base[req] = sum(blocks_0..blocks_{req-1}) * block_size``
-        in a device ``indptr``, so the attention kernel needs no request stride and
-        the buffer capacity is bounded by the physical block count
-        (``len(index) <= num_blocks``), not ``max_num_reqs * max_blocks_per_req``.
-        Eager only (``blocks_per_req`` is a host list).
-        """
-        CSR_COUNTS["gather_calls"] += 1
-        out = self.reserve(int(kv_cache.shape[0]))
+    def _blocks_per_req(self, metadata) -> list[int]:
+        r = int(metadata.block_table.shape[0])
         bs = self.layout.block_size
-        hk = self.layout.num_kv_heads
-        k_pb = self.layout.k_packed_bytes
-        v_pb = self.layout.v_packed_bytes
+        sl = getattr(metadata, "seq_lens_cpu", None)
+        if not (torch.is_tensor(sl) and sl.numel() > 0 and not sl.is_cuda):
+            sl = metadata.seq_lens[:r].to(torch.int64).cpu()
+        return [max(0, int((int(s) + bs - 1) // bs)) for s in sl.tolist()]
+
+    def _build_csr_index(self, block_table, blocks_per_req, num_blocks) -> "CsrIndex":
+        CSR_COUNTS["gather_calls"] += 1
+        bs = self.layout.block_size
         bt = block_table.to(torch.int64)
         r = len(blocks_per_req)
         b = int(bt.shape[1])
-        k_codes = self.layout.k_codes(kv_cache)
-        v_codes = self.layout.v_codes(kv_cache)
-        kn = self.layout.k_norm(kv_scales)
-        vn = self.layout.v_norm(kv_scales)
-        nb = min(int(k_codes.shape[0]), int(v_codes.shape[0]),
-                 int(kn.shape[0]), int(vn.shape[0]))
-
         dev = bt.device
         idx_parts = []
         base = 0
         indptr = [0]
-        for i, bn in enumerate(blocks_per_req):
+        for bn in blocks_per_req:
             bn = max(0, min(int(bn), b))
             if bn:
-                idx_parts.append(
-                    torch.arange(base, base + bn, device=dev, dtype=torch.int64)
-                )
+                idx_parts.append(torch.arange(base, base + bn, device=dev, dtype=torch.int64))
                 base += b
             indptr.append(indptr[-1] + bn * bs)
         flat_idx = (
@@ -335,24 +358,70 @@ class PagedKVManager:
         )
         nrows = int(flat_idx.numel())
         if nrows:
-            flat_idx = flat_idx.clamp_(0, max(nb - 1, 0))
+            flat_idx = flat_idx.clamp_(0, max(num_blocks - 1, 0))
         self._indptr = torch.tensor(indptr, dtype=torch.int32, device=dev)
         CSR_COUNTS["uploads"] += 1
+        sel = bt.reshape(-1)[flat_idx] if nrows else torch.empty(0, dtype=torch.int64, device=dev)
+        return CsrIndex(self._indptr, sel, nrows, int(num_blocks))
 
-        sel = bt.reshape(-1)
-        k = torch.index_select(k_codes, 0, sel[flat_idx]).reshape(nrows, bs, hk, k_pb) if nrows else None
-        v = torch.index_select(v_codes, 0, sel[flat_idx]).reshape(nrows, bs, hk, v_pb) if nrows else None
-        kn_sel = torch.index_select(kn, 0, sel[flat_idx]).reshape(nrows, bs, hk) if nrows else None
-        vn_sel = torch.index_select(vn, 0, sel[flat_idx]).reshape(nrows, bs, hk) if nrows else None
+    def csr_for_step(self, metadata, num_blocks: int) -> "CsrIndex":
+        """Memoized CSR metadata: one build/upload per step, shared by all layers."""
+        key = self._step_key(metadata, num_blocks)
+        if (
+            key is not None
+            and self._csr is not None
+            and self._csr_md is metadata
+            and self._csr.key == key
+        ):
+            CSR_COUNTS["index_hits"] += 1
+            return self._csr
+        CSR_COUNTS["index_misses"] += 1
+        idx = self._build_csr_index(
+            metadata.block_table, self._blocks_per_req(metadata), num_blocks
+        )
+        idx.key = key
+        self._csr, self._csr_md = idx, metadata
+        return idx
+
+    def gather_csr_payload(self, index: "CsrIndex", kv_cache, kv_scales) -> GatheredKV:
+        """Per-layer KV select driven by the shared CSR index (36x/step)."""
+        CSR_COUNTS["payload_gathers"] += 1
+        out = self.reserve(int(kv_cache.shape[0]))
+        bs = self.layout.block_size
+        hk = self.layout.num_kv_heads
+        k_pb = self.layout.k_packed_bytes
+        v_pb = self.layout.v_packed_bytes
+        nrows = index.nrows
         if nrows:
+            sel = index.sel
+            k = torch.index_select(self.layout.k_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, k_pb)
+            v = torch.index_select(self.layout.v_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, v_pb)
+            ksn = torch.index_select(self.layout.k_norm(kv_scales), 0, sel).reshape(nrows, bs, hk)
+            vsn = torch.index_select(self.layout.v_norm(kv_scales), 0, sel).reshape(nrows, bs, hk)
             out.k_packed.view(-1, bs, hk, k_pb)[:nrows].copy_(k)
             out.v_packed.view(-1, bs, hk, v_pb)[:nrows].copy_(v)
-            out.k_norm.view(-1, bs, hk)[:nrows].copy_(kn_sel)
-            out.v_norm.view(-1, bs, hk)[:nrows].copy_(vn_sel)
+            out.k_norm.view(-1, bs, hk)[:nrows].copy_(ksn)
+            out.v_norm.view(-1, bs, hk)[:nrows].copy_(vsn)
         if env_flag("THUNDER_DEBUG_GATHER"):
-            print(f"[TQ-CSR] r={r} nrows={nrows} capacity={self.page_rows} "
-                  f"num_blocks={int(kv_cache.shape[0])}", flush=True)
+            print(f"[TQ-CSR] nrows={nrows} capacity={self.page_rows}", flush=True)
         return out
+
+    def gather_csr(
+        self,
+        block_table: torch.Tensor,
+        kv_cache: torch.Tensor,
+        kv_scales: torch.Tensor,
+        blocks_per_req: list[int],
+    ) -> GatheredKV:
+        """Non-memoized CSR gather (tests/probes): build index then select."""
+        k_codes = self.layout.k_codes(kv_cache)
+        v_codes = self.layout.v_codes(kv_cache)
+        kn = self.layout.k_norm(kv_scales)
+        vn = self.layout.v_norm(kv_scales)
+        nb = min(int(k_codes.shape[0]), int(v_codes.shape[0]),
+                 int(kn.shape[0]), int(vn.shape[0]))
+        idx = self._build_csr_index(block_table, blocks_per_req, nb)
+        return self.gather_csr_payload(idx, kv_cache, kv_scales)
 
     @property
     def indptr(self) -> torch.Tensor | None:

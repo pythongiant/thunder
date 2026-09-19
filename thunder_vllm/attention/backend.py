@@ -710,19 +710,24 @@ class ThunderAttentionImpl(AttentionImplBase):
             # Diagnostic: use the reserved buffers without the torch gather.
             gathered = paged.reserve()
         elif _indirect:
-            # CSR packing: no request-major payload, capacity bounded by the
-            # physical block count. Eager only for now.
-            _sl = getattr(attn_metadata, "seq_lens_cpu", None)
-            if not (torch.is_tensor(_sl) and _sl.numel() > 0 and not _sl.is_cuda):
-                _sl = attn_metadata.seq_lens[: attn_metadata.block_table.shape[0]].cpu()
-            _bs = self.layout.block_size
-            _bpr = [
-                max(0, int((int(s) + _bs - 1) // _bs)) for s in _sl.tolist()
-            ]
-            gathered = paged.gather_csr(
-                attn_metadata.block_table, kv_cache, self._scales_for(kv_cache), _bpr
-            )
-            _indptr = paged.indptr
+            # Phase A: build CSR metadata once per step (shared by all layers);
+            # only the KV payload select is per-layer (each layer has its own
+            # kv_cache).
+            _scales = self._scales_for(kv_cache)
+            _kc = self.layout.k_codes(kv_cache)
+            _vc = self.layout.v_codes(kv_cache)
+            _kn = self.layout.k_norm(_scales)
+            _vn = self.layout.v_norm(_scales)
+            _nb = min(int(_kc.shape[0]), int(_vc.shape[0]),
+                      int(_kn.shape[0]), int(_vn.shape[0]))
+            _csr = paged.csr_for_step(attn_metadata, _nb)
+            gathered = paged.gather_csr_payload(_csr, kv_cache, _scales)
+            _indptr = _csr.indptr
+            if env_flag("THUNDER_CSR_TRACE"):
+                print(f"[csr-step] md={id(attn_metadata)} indptr_ptr={_indptr.data_ptr()} "
+                      f"sel_ptr={_csr.sel.data_ptr()} "
+                      f"gathered_ptr={gathered.k_packed.data_ptr()} nrows={_csr.nrows}",
+                      flush=True)
             if (
                 os.environ.get("THUNDER_CSR_DUMP", "0").strip().lower()
                 not in ("", "0", "false", "no", "off")
@@ -730,18 +735,18 @@ class ThunderAttentionImpl(AttentionImplBase):
             ):
                 try:
                     _bt = attn_metadata.block_table
-                    _r0 = int(_bt.shape[0])
-                    _nb = max(1, int((int(_sl[0]) + _bs - 1) // _bs))
-                    _kc = self.layout.k_codes(kv_cache)
-                    _phys = _bt[0, :_nb].to(torch.int64).clamp_(0, max(int(_kc.shape[0]) - 1, 0))
+                    _nb0 = int(_csr.nrows)
+                    _phys = _bt[0, :max(1, _nb0)].to(torch.int64).clamp_(
+                        0, max(int(_kc.shape[0]) - 1, 0))
                     torch.save(
                         {
-                            "r": _r0,
-                            "blocks_req0": _nb,
-                            "indptr": paged.indptr.detach().cpu(),
-                            "gathered_k": gathered.k_packed[:_nb].detach().cpu(),
+                            "r": int(_bt.shape[0]),
+                            "blocks_req0": int(_nb0),
+                            "indptr": _csr.indptr.detach().cpu(),
+                            "gathered_k": gathered.k_packed[:_nb0].detach().cpu(),
                             "cache_k_bt0": _kc[_phys].detach().cpu(),
-                            "bs": _bs, "hk": int(self.num_kv_heads),
+                            "bs": self.layout.block_size,
+                            "hk": int(self.num_kv_heads),
                         },
                         os.environ.get("THUNDER_CSR_DUMP_PATH", "/tmp/thunder_csr.pt"),
                     )
