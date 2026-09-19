@@ -188,3 +188,31 @@ def test_gather_csr_packs_live_blocks_and_bounds_capacity():
             )
             off += 1
     assert off == nrows // 16
+
+
+def test_build_csr_device_matches_host_build():
+    """Phase B: device-side CSR build must equal the host build (indptr + sel)."""
+    layout = ThunderCacheLayout(
+        num_kv_heads=8, head_dim=128, k_bits=4, v_bits=4, block_size=16
+    )
+    nb = 40
+    kv, scales = allocate_kv_cache(nb, 16, 8, 128, 4, 4, device="cpu")
+    mgr = PagedKVManager(layout, max_num_reqs=8, max_blocks_per_req=4, device="cpu")
+    gen = torch.Generator().manual_seed(3)
+    table = torch.randperm(nb, generator=gen)[:8 * 4].reshape(8, 4).to(torch.int32)
+
+    class _MD:
+        pass
+    md = _MD()
+    md.block_table = table
+    md.seq_lens = torch.tensor([1, 16, 17, 64, 33, 128, 5, 80])
+    md.seq_lens_cpu = md.seq_lens
+    md.num_actual_tokens = 8
+    md.max_query_len = 1
+    md.is_prefill = False
+
+    host = mgr._build_csr_index(table, mgr._blocks_per_req(md), nb)
+    dev = mgr.build_csr_device(md, nb)
+    assert torch.equal(host.indptr, dev.indptr)
+    assert host.nrows == dev.nrows
+    assert torch.equal(host.sel[:host.nrows], dev.sel[:host.nrows])

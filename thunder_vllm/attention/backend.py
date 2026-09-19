@@ -701,8 +701,8 @@ class ThunderAttentionImpl(AttentionImplBase):
         _indirect = (
             os.environ.get("THUNDER_8B_INDIRECT", "0").strip().lower()
             not in ("", "0", "false", "no", "off")
-            and not torch.cuda.is_current_stream_capturing()
         )
+        _capturing = torch.cuda.is_current_stream_capturing()
         _indptr = None
         if os.environ.get("THUNDER_SKIP_GATHER", "0").strip().lower() not in (
             "", "0", "false", "no", "off"
@@ -720,8 +720,22 @@ class ThunderAttentionImpl(AttentionImplBase):
             _vn = self.layout.v_norm(_scales)
             _nb = min(int(_kc.shape[0]), int(_vc.shape[0]),
                       int(_kn.shape[0]), int(_vn.shape[0]))
-            _csr = paged.csr_for_step(attn_metadata, _nb)
-            gathered = paged.gather_csr_payload(_csr, kv_cache, _scales)
+            if _capturing:
+                # Capture-safe: device-built CSR metadata (persistent buffers,
+                # no host sync) + a STATIC payload row count so replay records a
+                # fixed topology. The kernel masks the surplus rows by seq_lens.
+                _csr = paged.build_csr_device(attn_metadata, _nb, compute_nrows=False)
+                _cap = min(
+                    int(attn_metadata.block_table.shape[0])
+                    * int(attn_metadata.block_table.shape[1]),
+                    paged.page_rows,
+                )
+                gathered = paged.gather_csr_payload(
+                    _csr, kv_cache, _scales, nrows=max(int(_cap), 0)
+                )
+            else:
+                _csr = paged.csr_for_step(attn_metadata, _nb)
+                gathered = paged.gather_csr_payload(_csr, kv_cache, _scales)
             _indptr = _csr.indptr
             if env_flag("THUNDER_CSR_TRACE"):
                 print(f"[csr-step] md={id(attn_metadata)} indptr_ptr={_indptr.data_ptr()} "
@@ -732,6 +746,7 @@ class ThunderAttentionImpl(AttentionImplBase):
                 os.environ.get("THUNDER_CSR_DUMP", "0").strip().lower()
                 not in ("", "0", "false", "no", "off")
                 and not _CSR_DEBUG["done"]
+                and not _capturing
             ):
                 try:
                     _bt = attn_metadata.block_table

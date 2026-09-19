@@ -95,6 +95,8 @@ class PagedKVManager:
         self._rows: int | None = None
         self._csr: "CsrIndex | None" = None
         self._csr_md: object | None = None
+        # Persistent, capture-safe CSR scratch (allocated with the buffers).
+        self._csr_bufs: dict | None = None
 
     # ------------------------------------------------------------------ #
     # Shape / reservation
@@ -130,6 +132,19 @@ class PagedKVManager:
             CSR_COUNTS["reserve_calls"] += 1
             if cap_rows is not None:
                 self._rows = min(self.max_page_rows, max(int(cap_rows), 1))
+            # CSR metadata scratch, sized to the FULL table so no step can exceed
+            # it (dest indices use max_blocks_per_req); address-stable for capture.
+            cap = self.max_num_reqs * self.max_blocks_per_req
+            self._csr_bufs = {
+                "indptr": torch.zeros(self.max_num_reqs + 1, dtype=torch.int32,
+                                      device=self.device),
+                "bpr": torch.zeros(self.max_num_reqs, dtype=torch.int64,
+                                   device=self.device),
+                "sel": torch.zeros(cap, dtype=torch.int64, device=self.device),
+                "padded": torch.zeros(cap + 1, dtype=torch.int64, device=self.device),
+            }
+            self._csr = None
+            self._csr_md = None
             shapes = self.shape
             self._buffers = GatheredKV(
                 k_packed=torch.empty(
@@ -364,6 +379,53 @@ class PagedKVManager:
         sel = bt.reshape(-1)[flat_idx] if nrows else torch.empty(0, dtype=torch.int64, device=dev)
         return CsrIndex(self._indptr, sel, nrows, int(num_blocks))
 
+    def build_csr_device(self, metadata, num_blocks: int,
+                         compute_nrows: bool = True) -> "CsrIndex":
+        """Capture-safe CSR build: persistent buffers, device ops only, no sync.
+
+        Sizes come from HOST-STATIC shapes (block_table, max blocks), never from
+        ``seq_lens`` values, so capture metadata (seq_lens=1) records the same
+        ops. ``sel``/``indptr`` addresses are stable; only values change per
+        replay.
+        """
+        CSR_COUNTS["gather_calls"] += 1
+        bufs = self._csr_bufs
+        if bufs is None:
+            self.reserve(int(num_blocks))
+            bufs = self._csr_bufs
+        bs = self.layout.block_size
+        b = int(metadata.block_table.shape[1])
+        r = int(metadata.block_table.shape[0])
+        cap = self.max_num_reqs * self.max_blocks_per_req
+        dev = metadata.block_table.device
+        indptr = bufs["indptr"]
+        bpr = bufs["bpr"]
+        sel = bufs["sel"]
+        padded = bufs["padded"]
+        indptr.zero_()
+        if r > 0:
+            bpr.zero_()
+            bpr[:r].copy_(
+                ((metadata.seq_lens[:r].to(torch.int64) + bs - 1) // bs)
+                .clamp_(0, b)
+            )
+            ar = torch.arange(b, device=dev, dtype=torch.int64).unsqueeze(0)
+            valid = ar < bpr[:r].unsqueeze(1)
+            off = bpr[:r].cumsum(0) - bpr[:r]
+            dest = (off.unsqueeze(1) + ar).clamp_(0, cap - 1)
+            dest = torch.where(valid, dest, torch.full_like(dest, cap))
+            padded.zero_()
+            padded.scatter_(
+                0, dest.reshape(-1), metadata.block_table[:r].reshape(-1).to(torch.int64)
+            )
+            sel.copy_(padded[:cap])
+            sel.clamp_(0, max(int(num_blocks) - 1, 0))
+            indptr[1:r + 1].copy_((bpr[:r].cumsum(0) * bs).to(torch.int32))
+        nrows = int(bpr[:r].sum().item()) if (compute_nrows and r > 0) else -1
+        self._indptr = indptr
+        CSR_COUNTS["uploads"] += 1
+        return CsrIndex(indptr, sel, nrows, int(num_blocks))
+
     def csr_for_step(self, metadata, num_blocks: int) -> "CsrIndex":
         """Memoized CSR metadata: one build/upload per step, shared by all layers."""
         key = self._step_key(metadata, num_blocks)
@@ -383,7 +445,8 @@ class PagedKVManager:
         self._csr, self._csr_md = idx, metadata
         return idx
 
-    def gather_csr_payload(self, index: "CsrIndex", kv_cache, kv_scales) -> GatheredKV:
+    def gather_csr_payload(self, index: "CsrIndex", kv_cache, kv_scales,
+                           nrows: int | None = None) -> GatheredKV:
         """Per-layer KV select driven by the shared CSR index (36x/step)."""
         CSR_COUNTS["payload_gathers"] += 1
         out = self.reserve(int(kv_cache.shape[0]))
@@ -391,7 +454,8 @@ class PagedKVManager:
         hk = self.layout.num_kv_heads
         k_pb = self.layout.k_packed_bytes
         v_pb = self.layout.v_packed_bytes
-        nrows = index.nrows
+        if nrows is None:
+            nrows = index.nrows
         if nrows:
             sel = index.sel
             k = torch.index_select(self.layout.k_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, k_pb)
