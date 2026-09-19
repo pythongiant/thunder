@@ -1243,8 +1243,16 @@ def launch_thunder_attention(
         # jit_cache entry ourselves and invoke it with the runtime-only args
         # (constexprs baked at compile). Measured: 407ms -> 0.35ms, bit-identical
         # output. Set THUNDER_FASTLAUNCH=0 to fall back to the plain jit path.
+        # Key on the kernel's CONFIG, not its object identity: ``id(kernel)``
+        # varies across the transient ThunderAttentionForward instances the
+        # engine creates, so the key never repeated and the fast path never hit
+        # (measured: 251 distinct arm keys, 0 hits).
         key = (
-            id(kernel),
+            (
+                int(kernel.head_dim), int(kernel.K_BITS), int(kernel.V_BITS),
+                int(kernel.qhead_per_kvhead), bool(kernel.is_causal),
+                int(kernel.tile_m), int(kernel.tile_n), int(kernel.num_threads),
+            ),
             tuple(tuple(t.shape) for t in _torch_args),
             num_reqs, max_query_len, S, int(debug), int(split_mode), int(gqa_mode),
             int(1 if onepass else 0), int(1 if reg_rescale else 0),
