@@ -941,6 +941,9 @@ atexit.register(_dump_counts)
 
 
 _LAST_JF: dict = {"v": None}
+_FDBG = os.environ.get("THUNDER_FAST_DEBUG", "0").strip().lower() not in (
+    "", "0", "false", "no", "off"
+)
 
 
 def _ensure_cache_probe(dsl) -> None:
@@ -1265,6 +1268,9 @@ def launch_thunder_attention(
             if jf is not None:
                 _FAST[key] = jf
                 _COUNTS["fast_armed"] += 1
+                if _FDBG:
+                    print(f"[fast] ARM key={key} jf={id(jf)} indirect={int(indirect)}",
+                          flush=True)
         else:
             # ``JitCompiledFunction.__call__`` blind-slices the arg list at
             # ``execution_args.arg_count`` (constexprs already filtered), so it
@@ -1272,6 +1278,9 @@ def launch_thunder_attention(
             # tensors, softmax_scale, kv_row_stride, max_query_len, num_splits,
             # stream. Passing the full signature shifts the scalars and
             # ``ctypes.c_void_p`` chokes on the raw CUstream.
+            if _FDBG:
+                print(f"[fast] LOOKUP key={key} jf={id(jf)} indirect={int(indirect)}",
+                      flush=True)
             try:
                 jf(
                     *args,
