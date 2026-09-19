@@ -35,6 +35,9 @@ from thunder_vllm.utils.logging import env_flag, get_logger
 
 logger = get_logger("attention.paged_kv")
 
+# Narrow debug counters (branch): how often CSR metadata is rebuilt/uploaded.
+CSR_COUNTS = {"gather_calls": 0, "uploads": 0, "reserve_calls": 0}
+
 
 @dataclass
 class GatheredKV:
@@ -104,6 +107,7 @@ class PagedKVManager:
         cap and is unchanged.
         """
         if self._buffers is None:
+            CSR_COUNTS["reserve_calls"] += 1
             if cap_rows is not None:
                 self._rows = min(self.max_page_rows, max(int(cap_rows), 1))
             shapes = self.shape
@@ -297,6 +301,7 @@ class PagedKVManager:
         (``len(index) <= num_blocks``), not ``max_num_reqs * max_blocks_per_req``.
         Eager only (``blocks_per_req`` is a host list).
         """
+        CSR_COUNTS["gather_calls"] += 1
         out = self.reserve(int(kv_cache.shape[0]))
         bs = self.layout.block_size
         hk = self.layout.num_kv_heads
@@ -332,6 +337,7 @@ class PagedKVManager:
         if nrows:
             flat_idx = flat_idx.clamp_(0, max(nb - 1, 0))
         self._indptr = torch.tensor(indptr, dtype=torch.int32, device=dev)
+        CSR_COUNTS["uploads"] += 1
 
         sel = bt.reshape(-1)
         k = torch.index_select(k_codes, 0, sel[flat_idx]).reshape(nrows, bs, hk, k_pb) if nrows else None

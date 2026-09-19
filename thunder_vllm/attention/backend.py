@@ -34,6 +34,7 @@ logger = get_logger("attention.backend")
 
 _ENGINE_HOOK = {"done": False}
 _PAGED_CACHE: dict = {}
+_CSR_DEBUG = {"done": False}
 
 # Capture audit: count forward invocations by (capturing?, max_query_len). If the
 # decode step is captured, forward is NOT called per decode step during replay.
@@ -499,6 +500,7 @@ class ThunderAttentionImpl(AttentionImplBase):
             # Allocation deferred to the first gather so the indirect path can
             # cap it by the physical block count.
             _PAGED_CACHE[key] = mgr
+            _CSR_DEBUG["manager_create"] = _CSR_DEBUG.get("manager_create", 0) + 1
         self._paged = mgr
         return self._paged
 
@@ -721,6 +723,31 @@ class ThunderAttentionImpl(AttentionImplBase):
                 attn_metadata.block_table, kv_cache, self._scales_for(kv_cache), _bpr
             )
             _indptr = paged.indptr
+            if (
+                os.environ.get("THUNDER_CSR_DUMP", "0").strip().lower()
+                not in ("", "0", "false", "no", "off")
+                and not _CSR_DEBUG["done"]
+            ):
+                try:
+                    _bt = attn_metadata.block_table
+                    _r0 = int(_bt.shape[0])
+                    _nb = max(1, int((int(_sl[0]) + _bs - 1) // _bs))
+                    _kc = self.layout.k_codes(kv_cache)
+                    _phys = _bt[0, :_nb].to(torch.int64).clamp_(0, max(int(_kc.shape[0]) - 1, 0))
+                    torch.save(
+                        {
+                            "r": _r0,
+                            "blocks_req0": _nb,
+                            "indptr": paged.indptr.detach().cpu(),
+                            "gathered_k": gathered.k_packed[:_nb].detach().cpu(),
+                            "cache_k_bt0": _kc[_phys].detach().cpu(),
+                            "bs": _bs, "hk": int(self.num_kv_heads),
+                        },
+                        os.environ.get("THUNDER_CSR_DUMP_PATH", "/tmp/thunder_csr.pt"),
+                    )
+                    _CSR_DEBUG["done"] = True
+                except Exception:  # noqa: BLE001
+                    logger.exception("CSR dump failed")
         else:
             gathered = paged.gather_packed_tiles(
                 attn_metadata.block_table,

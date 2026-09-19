@@ -1208,6 +1208,7 @@ def launch_thunder_attention(
     args = args + [from_dlpack(indptr)]
     _torch_args += [part_o_t, part_m_t, part_l_t, indptr]
 
+    _COUNTS["launch_indirect" if indirect else "launch_reqmajor"] += 1
     if _TIME:
         _t1 = _time.perf_counter()
 
