@@ -34,9 +34,6 @@ logger = get_logger("attention.backend")
 
 _ENGINE_HOOK = {"done": False}
 
-# Shared per-(device, shape, capacities) gather managers (see _ensure_paged).
-_PAGED_CACHE: dict = {}
-
 # Capture audit: count forward invocations by (capturing?, max_query_len). If the
 # decode step is captured, forward is NOT called per decode step during replay.
 import collections as _collections
@@ -488,29 +485,14 @@ class ThunderAttentionImpl(AttentionImplBase):
         max_num_reqs: int,
         max_model_len: int,
     ) -> PagedKVManager:
-        # Share one manager across every layer of the same shape: the gathered
-        # cache only depends on the engine capacities, and attention runs layer
-        # by layer, so a per-layer copy just multiplies memory. On Qwen3-8B the
-        # profile batch reserves 1024 x 256 rows (~4 GB) and 36 per-layer copies
-        # OOM the GPU. Pointer identity is still stable (same object every call).
-        dev = torch.device(device)
-        key = (
-            dev.type, dev.index,
-            self.layout.block_size, self.layout.num_kv_heads,
-            self.cfg.k_bits, self.cfg.v_bits,
-            int(max_num_reqs), int(max_model_len),
-        )
-        mgr = _PAGED_CACHE.get(key)
-        if mgr is None:
-            mgr = make_paged_kv_manager(
+        if self._paged is None or self._paged.device != torch.device(device):
+            self._paged = make_paged_kv_manager(
                 self.layout,
                 max_num_reqs=max_num_reqs,
                 max_model_len=max_model_len,
                 device=device,
             )
-            mgr.reserve()
-            _PAGED_CACHE[key] = mgr
-        self._paged = mgr
+            self._paged.reserve()
         return self._paged
 
     def get_kernel(self, head_dim: int, is_causal: bool) -> Any:
