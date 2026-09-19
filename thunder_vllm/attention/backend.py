@@ -33,6 +33,7 @@ from thunder_vllm.utils.logging import env_flag, get_logger, log_once
 logger = get_logger("attention.backend")
 
 _ENGINE_HOOK = {"done": False}
+_PAGED_CACHE: dict = {}
 
 # Capture audit: count forward invocations by (capturing?, max_query_len). If the
 # decode step is captured, forward is NOT called per decode step during replay.
@@ -485,16 +486,19 @@ class ThunderAttentionImpl(AttentionImplBase):
         max_num_reqs: int,
         max_model_len: int,
     ) -> PagedKVManager:
-        if self._paged is None or self._paged.device != torch.device(device):
-            self._paged = make_paged_kv_manager(
-                self.layout,
-                max_num_reqs=max_num_reqs,
-                max_model_len=max_model_len,
-                device=device,
+        dev = torch.device(device)
+        key = (dev.type, dev.index, self.layout.block_size, self.layout.num_kv_heads,
+               self.cfg.k_bits, self.cfg.v_bits, int(max_num_reqs), int(max_model_len))
+        mgr = _PAGED_CACHE.get(key)
+        if mgr is None:
+            mgr = make_paged_kv_manager(
+                self.layout, max_num_reqs=max_num_reqs,
+                max_model_len=max_model_len, device=device,
             )
             # Allocation deferred to the first gather so the indirect path can
-            # cap it by the physical block count; the request-major path passes no
-            # cap and is unchanged.
+            # cap it by the physical block count.
+            _PAGED_CACHE[key] = mgr
+        self._paged = mgr
         return self._paged
 
     def get_kernel(self, head_dim: int, is_causal: bool) -> Any:
