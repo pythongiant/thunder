@@ -300,6 +300,7 @@ class ThunderAttentionForward:
         mPartO: cute.Tensor,  # (num_reqs*num_splits, Hq, hdim) fp32, split mode
         mPartM: cute.Tensor,  # (num_reqs*num_splits, Hq) fp32, split mode
         mPartL: cute.Tensor,  # (num_reqs*num_splits, Hq) fp32, split mode
+        mIndptr: cute.Tensor,  # (num_reqs + 1,) int32 token base, indirect mode
         softmax_scale: Float32,
         kv_row_stride: int = 1,
         debug: cutlass.Constexpr[int] = 0,
@@ -310,6 +311,7 @@ class ThunderAttentionForward:
         onepass: cutlass.Constexpr[int] = 0,
         reg_rescale: cutlass.Constexpr[int] = 0,
         causal_bound: cutlass.Constexpr[int] = 0,
+        indirect: cutlass.Constexpr[int] = 0,
         stream=None,
     ):
         # (rows, Hq, hdim) -> (rows, hdim, Hq) so a head slice is rank 2.
@@ -353,6 +355,7 @@ class ThunderAttentionForward:
             mPartO,
             mPartM,
             mPartL,
+            mIndptr,
             softmax_scale,
             Int32(kv_row_stride),
             Int32(num_splits),
@@ -362,6 +365,7 @@ class ThunderAttentionForward:
             onepass,
             reg_rescale,
             causal_bound,
+            indirect,
             tiled_mma_qk,
             tiled_mma_pv,
             SharedStorage,
@@ -402,6 +406,7 @@ class ThunderAttentionForward:
         mPartO: cute.Tensor,
         mPartM: cute.Tensor,
         mPartL: cute.Tensor,
+        mIndptr: cute.Tensor,
         softmax_scale: Float32,
         kv_row_stride: Int32,
         num_splits: Int32,
@@ -411,6 +416,7 @@ class ThunderAttentionForward:
         onepass: cutlass.Constexpr[int],
         reg_rescale: cutlass.Constexpr[int],
         causal_bound: cutlass.Constexpr[int],
+        indirect: cutlass.Constexpr[int],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
@@ -439,7 +445,12 @@ class ThunderAttentionForward:
         # the multi-request failing case can be diagnosed from the host instead of
         # inferred (the debug tensor is a required argument; the launcher passes a
         # small persistent dummy when nobody is watching).
-        req_base = req * kv_row_stride
+        if const_expr(indirect):
+            # CSR: the gather packed each request's live tokens contiguously, so
+            # the base is the request's token offset from the device indptr.
+            req_base = Int32(mIndptr[req])
+        else:
+            req_base = req * kv_row_stride
         if tidx == 0:
             if const_expr(debug):
                 mDbg[dbg_slot + 0] = req
@@ -1065,6 +1076,8 @@ def launch_thunder_attention(
     onepass: bool = False,
     reg_rescale: bool = False,
     causal_bound: bool = False,
+    indptr: "torch.Tensor | None" = None,
+    indirect: bool = False,
 ) -> None:
     """Launch the compiled cooperative kernel on gathered, contiguous tensors.
 
@@ -1190,7 +1203,10 @@ def launch_thunder_attention(
         from_dlpack(part_m_t),
         from_dlpack(part_l_t),
     ]
-    _torch_args += [part_o_t, part_m_t, part_l_t]
+    if indptr is None:
+        indptr = seq_lens
+    args = args + [from_dlpack(indptr)]
+    _torch_args += [part_o_t, part_m_t, part_l_t, indptr]
 
     if _TIME:
         _t1 = _time.perf_counter()
@@ -1207,6 +1223,7 @@ def launch_thunder_attention(
         int(1 if onepass else 0),
         int(1 if reg_rescale else 0),
         int(1 if causal_bound else 0),
+        int(1 if indirect else 0),
         cuda.CUstream(stream),
     )
     # Skip the direct-call fast path while a CUDA graph is being captured: the

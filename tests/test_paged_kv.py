@@ -149,3 +149,42 @@ def test_gather_at_smaller_table_than_reservation():
     assert torch.equal(
         out.v_packed.view(vshape)[:2, :4], ref.v_packed.view(vshape)[:2, :4]
     )
+
+
+def test_gather_csr_packs_live_blocks_and_bounds_capacity():
+    """CSR gather: packed per-request tokens, capacity <= physical blocks."""
+    layout = ThunderCacheLayout(
+        num_kv_heads=8, head_dim=128, k_bits=4, v_bits=4, block_size=16
+    )
+    nb = 40
+    kv, scales = allocate_kv_cache(nb, 16, 8, 128, 4, 4, device="cpu")
+    mgr = PagedKVManager(layout, max_num_reqs=64, max_blocks_per_req=256, device="cpu")
+
+    # Shuffled physical ids so a logical==physical assumption would fail.
+    gen = torch.Generator().manual_seed(0)
+    perm = torch.randperm(nb, generator=gen)[:16].to(torch.int32)
+    table = perm.reshape(4, 4)  # 4 requests, 4 logical blocks each
+    blocks_per_req = [1, 4, 2, 3]
+    seq = torch.tensor([b * 16 for b in blocks_per_req])
+
+    out = mgr.gather_csr(table, kv, scales, blocks_per_req)
+    nrows = sum(blocks_per_req) * 16
+    assert nrows <= nb * 16
+    assert mgr.page_rows == min(mgr.max_page_rows, nb) == nb
+    assert out.k_packed.shape[0] == nb
+
+    indptr = mgr.indptr.tolist()
+    assert indptr == [0] + list(torch.tensor(blocks_per_req).cumsum(0).mul(16).tolist())
+
+    # Packed rows equal the physical cache content in CSR order.
+    k_codes = layout.k_codes(kv)
+    off = 0
+    for r, bn in enumerate(blocks_per_req):
+        for lb in range(bn):
+            phys = int(table[r, lb])
+            assert torch.equal(
+                out.k_packed.view(-1, 16, 8, layout.k_packed_bytes)[off],
+                k_codes[phys],
+            )
+            off += 1
+    assert off == nrows // 16

@@ -71,6 +71,7 @@ class PagedKVManager:
         self.max_blocks_per_req = int(max_blocks_per_req)
         self.device = torch.device(device)
         self._buffers: GatheredKV | None = None
+        self._rows: int | None = None
 
     # ------------------------------------------------------------------ #
     # Shape / reservation
@@ -80,10 +81,14 @@ class PagedKVManager:
         return self.max_num_reqs * self.max_blocks_per_req
 
     @property
+    def page_rows(self) -> int:
+        return self._rows if self._rows is not None else self.max_page_rows
+
+    @property
     def shape(self) -> dict[str, tuple[int, ...]]:
         bs = self.layout.block_size
         hk = self.layout.num_kv_heads
-        rows = self.max_page_rows
+        rows = self.page_rows
         return {
             "k_packed": (rows, bs, hk, self.layout.k_packed_bytes),
             "v_packed": (rows, bs, hk, self.layout.v_packed_bytes),
@@ -91,12 +96,16 @@ class PagedKVManager:
             "v_norm": (rows, bs, hk),
         }
 
-    def reserve(self) -> GatheredKV:
-        """Allocate (or return) the worst-case gather buffers.
+    def reserve(self, cap_rows: int | None = None) -> GatheredKV:
+        """Allocate (or return) the gather buffers.
 
-        Must be called before CUDA-graph capture. Cheap and idempotent.
+        ``cap_rows`` (physical block count) bounds the reservation so it does not
+        scale with ``max_model_len``. The request-major path calls this with no
+        cap and is unchanged.
         """
         if self._buffers is None:
+            if cap_rows is not None:
+                self._rows = min(self.max_page_rows, max(int(cap_rows), 1))
             shapes = self.shape
             self._buffers = GatheredKV(
                 k_packed=torch.empty(
@@ -272,6 +281,76 @@ class PagedKVManager:
                 flush=True,
             )
         return out
+
+    def gather_csr(
+        self,
+        block_table: torch.Tensor,
+        kv_cache: torch.Tensor,
+        kv_scales: torch.Tensor,
+        blocks_per_req: list[int],
+    ) -> GatheredKV:
+        """CSR gather: pack each request's live blocks contiguously (no padding).
+
+        Produces ``token_base[req] = sum(blocks_0..blocks_{req-1}) * block_size``
+        in a device ``indptr``, so the attention kernel needs no request stride and
+        the buffer capacity is bounded by the physical block count
+        (``len(index) <= num_blocks``), not ``max_num_reqs * max_blocks_per_req``.
+        Eager only (``blocks_per_req`` is a host list).
+        """
+        out = self.reserve(int(kv_cache.shape[0]))
+        bs = self.layout.block_size
+        hk = self.layout.num_kv_heads
+        k_pb = self.layout.k_packed_bytes
+        v_pb = self.layout.v_packed_bytes
+        bt = block_table.to(torch.int64)
+        r = len(blocks_per_req)
+        b = int(bt.shape[1])
+        k_codes = self.layout.k_codes(kv_cache)
+        v_codes = self.layout.v_codes(kv_cache)
+        kn = self.layout.k_norm(kv_scales)
+        vn = self.layout.v_norm(kv_scales)
+        nb = min(int(k_codes.shape[0]), int(v_codes.shape[0]),
+                 int(kn.shape[0]), int(vn.shape[0]))
+
+        dev = bt.device
+        idx_parts = []
+        base = 0
+        indptr = [0]
+        for i, bn in enumerate(blocks_per_req):
+            bn = max(0, min(int(bn), b))
+            if bn:
+                idx_parts.append(
+                    torch.arange(base, base + bn, device=dev, dtype=torch.int64)
+                )
+                base += b
+            indptr.append(indptr[-1] + bn * bs)
+        flat_idx = (
+            torch.cat(idx_parts) if idx_parts
+            else torch.empty(0, dtype=torch.int64, device=dev)
+        )
+        nrows = int(flat_idx.numel())
+        if nrows:
+            flat_idx = flat_idx.clamp_(0, max(nb - 1, 0))
+        self._indptr = torch.tensor(indptr, dtype=torch.int32, device=dev)
+
+        sel = bt.reshape(-1)
+        k = torch.index_select(k_codes, 0, sel[flat_idx]).reshape(nrows, bs, hk, k_pb) if nrows else None
+        v = torch.index_select(v_codes, 0, sel[flat_idx]).reshape(nrows, bs, hk, v_pb) if nrows else None
+        kn_sel = torch.index_select(kn, 0, sel[flat_idx]).reshape(nrows, bs, hk) if nrows else None
+        vn_sel = torch.index_select(vn, 0, sel[flat_idx]).reshape(nrows, bs, hk) if nrows else None
+        if nrows:
+            out.k_packed.view(-1, bs, hk, k_pb)[:nrows].copy_(k)
+            out.v_packed.view(-1, bs, hk, v_pb)[:nrows].copy_(v)
+            out.k_norm.view(-1, bs, hk)[:nrows].copy_(kn_sel)
+            out.v_norm.view(-1, bs, hk)[:nrows].copy_(vn_sel)
+        if env_flag("THUNDER_DEBUG_GATHER"):
+            print(f"[TQ-CSR] r={r} nrows={nrows} capacity={self.page_rows} "
+                  f"num_blocks={int(kv_cache.shape[0])}", flush=True)
+        return out
+
+    @property
+    def indptr(self) -> torch.Tensor | None:
+        return getattr(self, "_indptr", None)
 
     def gather_packed_tiles_ref(
         self,

@@ -492,7 +492,9 @@ class ThunderAttentionImpl(AttentionImplBase):
                 max_model_len=max_model_len,
                 device=device,
             )
-            self._paged.reserve()
+            # Allocation deferred to the first gather so the indirect path can
+            # cap it by the physical block count; the request-major path passes no
+            # cap and is unchanged.
         return self._paged
 
     def get_kernel(self, head_dim: int, is_causal: bool) -> Any:
@@ -689,11 +691,31 @@ class ThunderAttentionImpl(AttentionImplBase):
                 1,
                 int(((_sl_cpu[:_r].to(torch.int64) + _bs - 1) // _bs).max().item()),
             )
+        _indirect = (
+            os.environ.get("THUNDER_8B_INDIRECT", "0").strip().lower()
+            not in ("", "0", "false", "no", "off")
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        _indptr = None
         if os.environ.get("THUNDER_SKIP_GATHER", "0").strip().lower() not in (
             "", "0", "false", "no", "off"
         ):
             # Diagnostic: use the reserved buffers without the torch gather.
             gathered = paged.reserve()
+        elif _indirect:
+            # CSR packing: no request-major payload, capacity bounded by the
+            # physical block count. Eager only for now.
+            _sl = getattr(attn_metadata, "seq_lens_cpu", None)
+            if not (torch.is_tensor(_sl) and _sl.numel() > 0 and not _sl.is_cuda):
+                _sl = attn_metadata.seq_lens[: attn_metadata.block_table.shape[0]].cpu()
+            _bs = self.layout.block_size
+            _bpr = [
+                max(0, int((int(s) + _bs - 1) // _bs)) for s in _sl.tolist()
+            ]
+            gathered = paged.gather_csr(
+                attn_metadata.block_table, kv_cache, self._scales_for(kv_cache), _bpr
+            )
+            _indptr = paged.indptr
         else:
             gathered = paged.gather_packed_tiles(
                 attn_metadata.block_table,
@@ -737,6 +759,8 @@ class ThunderAttentionImpl(AttentionImplBase):
             onepass=self.cfg.onepass,
             reg_rescale=self.cfg.reg_rescale,
             causal_bound=self.cfg.causal_bound,
+            indptr=_indptr,
+            indirect=bool(_indirect),
         )
         if _cap:
             _ev3 = torch.cuda.Event(enable_timing=True)
