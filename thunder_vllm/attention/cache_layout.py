@@ -419,11 +419,23 @@ if _HAS_TRITON:
     ):
         """Little-endian bit packing identical to ``quant/packing.py``.
 
-        Only widths that divide 8 are handled here (1/2/4/8): byte ``b`` holds
+        3-bit uses the 8-columns->24-bit word path; other widths divide 8: byte ``b`` holds
         the ``8 // bits`` indices starting at column ``b * (8 // bits)``, each
         shifted by ``k * bits``. The shifts are disjoint, so summing the
         weighted indices is the same as OR-ing them.
         """
+        if bits == 3:
+            # 3 bits does not divide 8, but 8 columns pack exactly into 24 bits
+            # (3 bytes). Build the 24-bit little-endian word with LEFT shifts only
+            # (fields are disjoint), then slice bytes -- matching packed_bytes()
+            # for head_dim=128 (48 bytes).
+            ng: tl.constexpr = head_dim // 8
+            s = tl.reshape(idx, (ROWS, ng, 8)).to(tl.int32)
+            w = 1 << (3 * tl.arange(0, 8))
+            word = tl.sum(s * w[None, None, :], axis=2)          # (ROWS, ng)
+            sub = tl.arange(0, 3)                                 # (3,)
+            byte = (word[:, :, None] >> (8 * sub)[None, None, :]) & 0xFF
+            return tl.reshape(byte.to(tl.uint8), (ROWS, n_bytes))
         n_per: tl.constexpr = 8 // bits
         reshaped = tl.reshape(idx, (ROWS, n_bytes, n_per))
         weights = tl.zeros((n_per,), dtype=tl.int32)
@@ -443,8 +455,8 @@ if _HAS_TRITON:
         block_rows: int = 16,
     ) -> None:
         """GPU cache write. Falls back to :func:`reshape_and_cache_ref` for
-        bit widths the vectorised packer does not cover (3-bit)."""
-        if layout.k_bits not in (1, 2, 4, 8) or layout.v_bits not in (1, 2, 4, 8):
+        bit widths the vectorised packer does not cover."""
+        if layout.k_bits not in (1, 2, 3, 4, 8) or layout.v_bits not in (1, 2, 3, 4, 8):
             reshape_and_cache_ref(
                 key, value, slot_mapping, kv_cache, kv_scales, quantizer, layout
             )

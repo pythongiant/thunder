@@ -216,3 +216,25 @@ def test_build_csr_device_matches_host_build():
     assert torch.equal(host.indptr, dev.indptr)
     assert host.nrows == dev.nrows
     assert torch.equal(host.sel[:host.nrows], dev.sel[:host.nrows])
+
+
+def test_pack3_word_formula_matches_pack_indices():
+    """The Triton 3-bit packer builds word = sum(idx<<3c) over 8 columns and
+    slices bytes; verify that equals quant.packing.pack_indices."""
+    from thunder_vllm.quant.packing import pack_indices
+
+    torch.manual_seed(0)
+    head_dim = 128
+    ng = head_dim // 8
+    idx = torch.randint(0, 8, (5, head_dim), dtype=torch.int32)
+
+    # word-based packing (same math as the Triton kernel)
+    s = idx.reshape(5, ng, 8).to(torch.int32)
+    w = (1 << (3 * torch.arange(8, dtype=torch.int32)))
+    word = (s * w[None, None, :]).sum(dim=2)                    # (5, ng)
+    sub = torch.arange(3, dtype=torch.int32)
+    byte = ((word[:, :, None] >> (8 * sub)[None, None, :]) & 0xFF)
+    got = byte.reshape(5, ng * 3).to(torch.uint8)
+
+    want = pack_indices(idx, 3, head_dim)
+    assert torch.equal(got, want), (got[:1, :12], want[:1, :12])
