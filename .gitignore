@@ -17,3 +17,9 @@ experiments/
 AGENTS.md
 CLAUDE.md
 learnings.md
+
+# Local-only Modal CI/probes + Vultr tooling (purged from history; kept on disk)
+ci/modal_*.py
+ci_probe/modal_*.py
+.github/workflows/modal_ci.yml
+scripts/vultr.py
