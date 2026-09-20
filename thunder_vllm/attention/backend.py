@@ -171,9 +171,13 @@ class ThunderCuteConfig:
             n_block_size=int(env.get("THUNDER_N_BLOCK", 64)),
             q_stage=int(env.get("THUNDER_Q_STAGE", 2)),
             use_2cta_instrs=_flag("THUNDER_USE_2CTA"),
-            onepass=_flag("THUNDER_ONEPASS"),
-            reg_rescale=_flag("THUNDER_REG_RESCALE"),
-            causal_bound=_flag("THUNDER_CAUSAL_BOUND"),
+            # Verified wins (L4 stage probe, 8B shapes):
+            #   reg_rescale x1.27-1.33, causal_bound x1.64 (prefill),
+            #   onepass ~1.0 alone but required for reg_rescale's win.
+            # Enabled by default; set THUNDER_* =0 to fall back.
+            onepass=_flag("THUNDER_ONEPASS", default=True),
+            reg_rescale=_flag("THUNDER_REG_RESCALE", default=True),
+            causal_bound=_flag("THUNDER_CAUSAL_BOUND", default=True),
         )
 
     def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool) -> tuple:

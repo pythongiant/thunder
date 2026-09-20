@@ -12,13 +12,18 @@ from thunder_vllm.attention.backend import ThunderCuteConfig  # noqa: E402
 FLAGS = ("onepass", "reg_rescale", "causal_bound")
 
 
-def test_fast_paths_off_by_default(monkeypatch):
+def test_fast_paths_on_by_default(monkeypatch):
+    """Verified kernel wins are on by default; THUNDER_*=0 opts out."""
     for name in FLAGS:
         monkeypatch.delenv(f"THUNDER_{name.upper()}", raising=False)
     cfg = ThunderCuteConfig.from_env()
-    assert cfg.onepass is False
-    assert cfg.reg_rescale is False
-    assert cfg.causal_bound is False
+    assert cfg.onepass is True
+    assert cfg.reg_rescale is True
+    assert cfg.causal_bound is True
+    for name in FLAGS:
+        monkeypatch.setenv(f"THUNDER_{name.upper()}", "0")
+        assert getattr(ThunderCuteConfig.from_env(), name) is False
+        monkeypatch.delenv(f"THUNDER_{name.upper()}", raising=False)
 
 
 @pytest.mark.parametrize("name", FLAGS)
@@ -35,7 +40,8 @@ def test_kernel_key_tracks_flags(monkeypatch):
         monkeypatch.delenv(f"THUNDER_{name.upper()}", raising=False)
     base = ThunderCuteConfig.from_env().kernel_key(128, 8, True)
     for name in FLAGS:
-        monkeypatch.setenv(f"THUNDER_{name.upper()}", "1")
+        # Defaults are True, so flip to 0 to change the key.
+        monkeypatch.setenv(f"THUNDER_{name.upper()}", "0")
         key = ThunderCuteConfig.from_env().kernel_key(128, 8, True)
         assert key != base, f"{name} must be part of the compiled-kernel key"
         monkeypatch.delenv(f"THUNDER_{name.upper()}", raising=False)

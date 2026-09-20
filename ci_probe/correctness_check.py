@@ -84,9 +84,12 @@ def store_and_gather(k_bits: int, v_bits: int, nt: int = 256) -> None:
           layout.v_codes(kv_e).reshape(-1, HK, layout.v_packed_bytes)[:nt]), 0.0)
 
 
-def kernel_parity(k_bits: int, v_bits: int, causal: bool, nt: int = 256) -> None:
+def kernel_parity(k_bits: int, v_bits: int, causal: bool, nt: int = 256,
+                  flags: tuple = (False, False, False)) -> None:
+    op, rr, cb = flags
     tag = "prefill" if causal else "decode"
-    print(f"[kernel] {tag} K={k_bits} V={v_bits} n={nt}", flush=True)
+    print(f"[kernel] {tag} K={k_bits} V={v_bits} n={nt} "
+          f"onepass={op} reg_rescale={rr} causal_bound={cb}", flush=True)
     layout = ThunderCacheLayout(num_kv_heads=HK, head_dim=HD, k_bits=k_bits,
                                 v_bits=v_bits, block_size=BS)
     quant = ThunderQuantizer(HD, k_bits, v_bits, device=dev)
@@ -114,7 +117,8 @@ def kernel_parity(k_bits: int, v_bits: int, causal: bool, nt: int = 256) -> None
     fwd = ThunderAttentionForward(head_dim=HD, K_BITS=k_bits, V_BITS=v_bits,
                                   qhead_per_kvhead=1, is_causal=causal,
                                   m_block_size=MB, n_block_size=NB, num_threads=128)
-    launch_thunder_attention(fwd, qr, g, out, meta, HD ** -0.5, quantizer=quant)
+    launch_thunder_attention(fwd, qr, g, out, meta, HD ** -0.5, quantizer=quant,
+                             onepass=op, reg_rescale=rr, causal_bound=cb)
     torch.cuda.synchronize()
 
     k_hat = quant.dequantize_k_rotated(
@@ -141,11 +145,12 @@ def main() -> int:
     if os.environ.get("THUNDER_STORE3", "0").strip().lower() not in (
             "", "0", "false", "no", "off"):
         store_and_gather(3, 4)
-    kernel_parity(4, 4, causal=True)
-    kernel_parity(4, 4, causal=False)
-    # Target config (3-bit K / 4-bit V).
-    kernel_parity(3, 4, causal=True)
-    kernel_parity(3, 4, causal=False)
+    # Baseline and the now-default fast paths (onepass + reg_rescale + causal).
+    for flags in ((False, False, False), (True, True, True)):
+        kernel_parity(4, 4, causal=True, flags=flags)
+        kernel_parity(4, 4, causal=False, flags=flags)
+        kernel_parity(3, 4, causal=True, flags=flags)
+        kernel_parity(3, 4, causal=False, flags=flags)
 
     print()
     if FAILURES:
