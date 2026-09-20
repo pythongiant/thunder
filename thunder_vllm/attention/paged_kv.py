@@ -597,3 +597,27 @@ def make_paged_kv_manager(
         max_blocks_per_req=blocks,
         device=device,
     )
+
+
+# ---------------------------------------------------------------------------
+# Option A (direct paged KV) addressing reference.
+#
+# The kernel will read the paged cache through the block table instead of a
+# gathered copy: for request ``req`` and token ``t`` the physical cache row is
+# ``block_table[req, t // block_size] * block_size + (t % block_size)``. A
+# ``tile_n`` tile therefore spans ``tile_n // block_size`` physical blocks. This
+# reference is what the CPU test compares against the CSR gather's ``sel``; the
+# in-kernel version must reproduce it exactly.
+# ---------------------------------------------------------------------------
+def direct_paged_tile_rows(
+    block_table: torch.Tensor,
+    req: int,
+    nt: int,
+    tile_n: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Physical cache rows (block*bs + offset) for tile ``nt`` of ``req``."""
+    tokens = nt * int(tile_n) + torch.arange(int(tile_n), device=block_table.device)
+    blk = block_table[int(req), tokens // int(block_size)].to(torch.int64)
+    off = tokens % int(block_size)
+    return blk * int(block_size) + off

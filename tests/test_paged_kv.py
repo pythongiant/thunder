@@ -238,3 +238,68 @@ def test_pack3_word_formula_matches_pack_indices():
 
     want = pack_indices(idx, 3, head_dim)
     assert torch.equal(got, want), (got[:1, :12], want[:1, :12])
+
+
+def test_direct_paged_tile_rows_match_csr_sel():
+    """Option A: block-table addressing must reproduce the CSR path's rows.
+
+    CSR `sel` holds BLOCK ids; the physical token row for tile position ``i`` is
+    ``sel[block_index]*bs + (token % bs)``. The direct-paged kernel computes
+    ``block_table[req, token//bs]*bs + token%bs`` and must land on the same rows.
+    Validating this on CPU de-risks the addressing change before the kernel is
+    rewritten.
+    """
+    from thunder_vllm.attention.paged_kv import direct_paged_tile_rows
+
+    layout = ThunderCacheLayout(
+        num_kv_heads=8, head_dim=128, k_bits=3, v_bits=4, block_size=16
+    )
+    nb, bs = 64, 16
+    kv, scales = allocate_kv_cache(nb, bs, 8, 128, 3, 4, device="cpu")
+    mgr = PagedKVManager(layout, max_num_reqs=4, max_blocks_per_req=16, device="cpu")
+
+    gen = torch.Generator().manual_seed(5)
+    table = torch.randperm(nb, generator=gen)[:4 * 16].reshape(4, 16).to(torch.int32)
+    seq_lens = torch.tensor([256, 200, 96, 48])
+    blocks_per_req = [int((s + bs - 1) // bs) for s in seq_lens]
+
+    idx = mgr._build_csr_index(table, blocks_per_req, nb)
+    sel = idx.sel                      # block ids, req-major, block-major
+
+    tile_n = 64
+    for req, nblocks in enumerate(blocks_per_req):
+        base_block = sum(blocks_per_req[:req])
+        for nt in range(nblocks * bs // tile_n):
+            tokens = nt * tile_n + torch.arange(tile_n)
+            csr_rows = sel[base_block + tokens // bs].to(torch.int64) * bs + (tokens % bs)
+            want = direct_paged_tile_rows(table, req, nt, tile_n, bs)
+            assert torch.equal(csr_rows, want), (req, nt, csr_rows[:4], want[:4])
+
+
+def test_direct_paged_tile_bytes_match_csr_gather():
+    """End-to-end: reading the raw cache via the block table yields the same
+    packed bytes the CSR gather produced (the P0-b invariant)."""
+    from thunder_vllm.attention.paged_kv import direct_paged_tile_rows
+
+    layout = ThunderCacheLayout(
+        num_kv_heads=8, head_dim=128, k_bits=3, v_bits=4, block_size=16
+    )
+    nb, bs = 64, 16
+    kv, scales = allocate_kv_cache(nb, bs, 8, 128, 3, 4, device="cpu")
+    mgr = PagedKVManager(layout, max_num_reqs=4, max_blocks_per_req=16, device="cpu")
+    gen = torch.Generator().manual_seed(9)
+    table = torch.randperm(nb, generator=gen)[:4 * 16].reshape(4, 16).to(torch.int32)
+    blocks_per_req = [16, 13, 6, 3]
+
+    out = mgr.gather_csr(table, kv, scales, blocks_per_req)
+    k_codes_flat = layout.k_codes(kv).reshape(-1, 8, layout.k_packed_bytes)
+    gathered_flat = out.k_packed.reshape(-1, 8, layout.k_packed_bytes)
+
+    tile_n = 64
+    for req, nblocks in enumerate(blocks_per_req):
+        base_token = sum(blocks_per_req[:req]) * bs
+        for nt in range(nblocks * bs // tile_n):
+            rows = direct_paged_tile_rows(table, req, nt, tile_n, bs)
+            got = k_codes_flat[rows]
+            want = gathered_flat[base_token + nt * tile_n: base_token + nt * tile_n + tile_n]
+            assert torch.equal(got, want), (req, nt)
