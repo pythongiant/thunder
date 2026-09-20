@@ -325,3 +325,36 @@ def nvml_sampler(interval_s: float = 0.1):
 
 def assert_parity(a: torch.Tensor, b: torch.Tensor, atol: float = 1e-2, rtol: float = 1e-2):
     torch.testing.assert_close(a.float(), b.float(), atol=atol, rtol=rtol)
+
+
+# ---------------------------------------------------------------------------
+# Batched-benchmark helpers (P3 harness)
+# ---------------------------------------------------------------------------
+def fp16_per_token_bytes(num_kv_heads: int, head_dim: int) -> int:
+    """fp16 KV bytes per token across all KV heads (K + V)."""
+    return 2 * int(num_kv_heads) * int(head_dim) * 2
+
+
+def kv_bytes_per_step(per_token_bytes: int, batch: int, seqlen: int) -> float:
+    """KV bytes the attention kernel reads in one decode step.
+
+    ``per_token_bytes`` already spans all KV heads for one token.
+    """
+    return float(int(per_token_bytes) * int(batch) * int(seqlen))
+
+
+def effective_bw_gbps(nbytes: float, seconds: float) -> float:
+    """Effective bandwidth (GB/s) for ``nbytes`` moved in ``seconds``.
+
+    ``nbytes`` uses 1e9-byte GB so it reads as a fraction of HBM spec numbers.
+    Returns 0.0 for a non-positive interval.
+    """
+    if seconds is None or seconds <= 0:
+        return 0.0
+    return float(nbytes) / float(seconds) / 1e9
+
+
+def kv_bytes_per_token_from_layout(layout) -> int:
+    """Packed KV bytes per token (all KV heads) incl. fp16 norms."""
+    norm_bytes = 2 * torch.tensor([], dtype=layout.scale_dtype).element_size()
+    return int(layout.num_kv_heads * (layout.k_packed_bytes + layout.v_packed_bytes + norm_bytes))
