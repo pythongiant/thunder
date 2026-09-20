@@ -356,12 +356,20 @@ if _HAS_TRITON:
             base = rows * stride_kn + h * stride_kh
             k = tl.load(key_ptr + base[:, None] + d[None, :] * 1, mask=row_mask[:, None], other=0.0)
             v = tl.load(value_ptr + base[:, None] + d[None, :] * 1, mask=row_mask[:, None], other=0.0)
-            k_r = tl.dot(k, rot, out_dtype=tl.float32)
-            v_r = tl.dot(v, rot, out_dtype=tl.float32)
-            k_norm = tl.sqrt(tl.sum(k_r * k_r, axis=1) + 1e-12)
-            v_norm = tl.sqrt(tl.sum(v_r * v_r, axis=1) + 1e-12)
-            k_u = k_r / k_norm[:, None]
-            v_u = v_r / v_norm[:, None]
+            # Match Codebook.quantize exactly: the reference rotates in fp32
+            # (``x_f @ matrix.to(fp32)``) and normalizes with
+            # ``safe = where(norm > 0, norm, 1)`` (no epsilon). An fp16 tl.dot
+            # with an fp16-cast rotation matrix was the divergence source.
+            k32 = k.to(tl.float32)
+            v32 = v.to(tl.float32)
+            k_r = tl.dot(k32, rot, out_dtype=tl.float32, input_precision="ieee")
+            v_r = tl.dot(v32, rot, out_dtype=tl.float32, input_precision="ieee")
+            k_norm = tl.sqrt(tl.sum(k_r * k_r, axis=1))
+            v_norm = tl.sqrt(tl.sum(v_r * v_r, axis=1))
+            k_safe = tl.where(k_norm > 0.0, k_norm, 1.0)
+            v_safe = tl.where(v_norm > 0.0, v_norm, 1.0)
+            k_u = k_r / k_safe[:, None]
+            v_u = v_r / v_safe[:, None]
 
             k_idx = _searchsorted(k_bounds_ptr, k_u, K_LEVELS, head_dim)
             v_idx = _searchsorted(v_bounds_ptr, v_u, V_LEVELS, head_dim)
@@ -481,17 +489,14 @@ if _HAS_TRITON:
         """GPU cache write. Falls back to :func:`reshape_and_cache_ref` for
         bit widths the vectorised packer does not cover.
 
-        NOTE: 3-bit is deliberately NOT enabled here yet. ``_pack3`` reproduces
-        the byte layout exactly (CPU-verified), but the kernel's QUANTIZATION
-        still differs from ``Codebook.quantize``: the reference rotates in fp32
-        (``x_f @ matrix.to(fp32)``) while the kernel does an fp16 ``tl.dot`` with
-        an fp16-cast rotation matrix, so a few codes land one level off at scale
-        (measured: unpack_maxdiff=1 over 2048 rows). Enabling it flips 3-bit from
-        the exact ref store to that approximation and diverges the engine. The
-        same mismatch is why the 4-bit Triton path diverges. Fix the quantization
-        first, then flip this guard.
+        NOTE: the kernel now rotates in fp32 (``input_precision="ieee"``) with an
+        exact normalize, matching ``Codebook.quantize``. Verified bit-exact for the
+        3-bit K / 4-bit V layout at N=2048 with non-contiguous slots
+        (``unpack_maxdiff == 0``, norms identical). The 4-bit *K* layout (16
+        levels) can still differ by one level on a boundary because the norm uses
+        a different fp32 reduction order than torch; not our target config.
         """
-        if layout.k_bits not in (1, 2, 4, 8) or layout.v_bits not in (1, 2, 4, 8):
+        if layout.k_bits not in (1, 2, 3, 4, 8) or layout.v_bits not in (1, 2, 3, 4, 8):
             reshape_and_cache_ref(
                 key, value, slot_mapping, kv_cache, kv_scales, quantizer, layout
             )
@@ -532,7 +537,7 @@ if _HAS_TRITON:
             slot_mapping,
             kv_cache,
             kv_scales,
-            quantizer.rotation.matrix.to(torch.float16),
+            quantizer.rotation.matrix.to(torch.float32),
             quantizer.k_codebook.boundaries.to(torch.float32),
             quantizer.v_codebook.boundaries.to(torch.float32),
             rows.stride(0),
