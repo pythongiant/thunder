@@ -288,11 +288,28 @@ class ThunderAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: Any) -> bool:
-        """SM100 (``cc[0] == 10``) or SM110 (``cc[0] == 11``)."""
+        """SM100 (``cc[0] == 10``) or SM110 (``cc[0] == 11``).
+
+        ``THUNDER_ALLOW_ARCH`` overrides this for a non-Blackwell SANDBOX (e.g.
+        ``THUNDER_ALLOW_ARCH=80`` on an A100, or ``=8,9`` for cc majors) so kernel
+        structure/correctness can be iterated cheaply. Performance numbers from
+        such a run are meaningless for B200; it is a correctness sandbox only.
+        """
         try:
             major = int(capability[0])
         except Exception:  # noqa: BLE001
             major = int(getattr(capability, "major", -1))
+        allow = os.environ.get("THUNDER_ALLOW_ARCH", "").strip().lower()
+        if allow not in ("", "0", "false", "no", "off"):
+            if allow == "all":
+                return True
+            try:
+                # Accept sm numbers (80 -> major 8) and cc majors (8).
+                allowed = {(v // 10 if v >= 10 else v) for v in
+                           (int(x) for x in allow.split(","))}
+                return major in allowed
+            except ValueError:
+                return True
         return major in (10, 11)
 
     @classmethod

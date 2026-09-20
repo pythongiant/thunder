@@ -39,3 +39,19 @@ def test_kernel_key_tracks_flags(monkeypatch):
         key = ThunderCuteConfig.from_env().kernel_key(128, 8, True)
         assert key != base, f"{name} must be part of the compiled-kernel key"
         monkeypatch.delenv(f"THUNDER_{name.upper()}", raising=False)
+
+
+def test_allow_arch_sandbox_override(monkeypatch):
+    """THUNDER_ALLOW_ARCH lets a non-Blackwell sandbox run the backend."""
+    from thunder_vllm.attention.backend import ThunderAttentionBackend
+
+    monkeypatch.delenv("THUNDER_ALLOW_ARCH", raising=False)
+    assert ThunderAttentionBackend.supports_compute_capability((10, 0))
+    assert not ThunderAttentionBackend.supports_compute_capability((8, 0))
+
+    monkeypatch.setenv("THUNDER_ALLOW_ARCH", "80")
+    assert ThunderAttentionBackend.supports_compute_capability((8, 0))
+    assert not ThunderAttentionBackend.supports_compute_capability((7, 0))
+
+    monkeypatch.setenv("THUNDER_ALLOW_ARCH", "all")
+    assert ThunderAttentionBackend.supports_compute_capability((8, 6))
