@@ -35,6 +35,8 @@ logger = get_logger("attention.backend")
 _ENGINE_HOOK = {"done": False}
 _PAGED_CACHE: dict = {}
 _CSR_DEBUG = {"done": False}
+_STORE_AB = {"done": False}
+_VMTX = {"done": False}
 
 # Capture audit: count forward invocations by (capturing?, max_query_len). If the
 # decode step is captured, forward is NOT called per decode step during replay.
@@ -946,15 +948,130 @@ class ThunderAttentionImpl(AttentionImplBase):
 
         quantizer = self._ensure_quantizer(key.device)
         n = int(key.shape[0])
-        reshape_and_cache(
-            key[:n].reshape(n, self.num_kv_heads, self.head_size),
-            value[:n].reshape(n, self.num_kv_heads, self.head_size),
-            slot_mapping[:n],
-            kv_cache,
-            self._scales_for(kv_cache),
-            quantizer,
-            self.layout,
-        )
+        _k = key[:n].reshape(n, self.num_kv_heads, self.head_size)
+        _v = value[:n].reshape(n, self.num_kv_heads, self.head_size)
+        _scales = self._scales_for(kv_cache)
+        reshape_and_cache(_k, _v, slot_mapping[:n], kv_cache, _scales, quantizer,
+                          self.layout)
+        if env_flag("THUNDER_VMATRIX") and not _VMTX["done"]:
+            sl = slot_mapping[:n].to(torch.int64)
+            keep = sl >= 0
+            if bool(keep.any()):
+                try:
+                    from thunder_vllm.attention import cache_layout as _cl
+                    bs = self.layout.block_size
+                    blk = sl[keep] // bs
+                    pos = sl[keep] % bs
+                    qref = quantizer.quantize(_k, _v)
+                    print(f"[VMTX] k_stride={tuple(_k.stride())} v_stride={tuple(_v.stride())} "
+                          f"k_contig={_k.is_contiguous()} v_contig={_v.is_contiguous()} "
+                          f"v_off={_v.storage_offset()}", flush=True)
+                    variants = {
+                        "A_key_strides": (_v, (_k.stride(0), _k.stride(1), 1)),
+                        "B_value_strides": (_v, tuple(_v.stride())),
+                        "C_v_contig_key_strides": (_v.contiguous(),
+                                                   (_k.stride(0), _k.stride(1), 1)),
+                        "D_v_contig_value_strides": (_v.contiguous(),
+                                                     tuple(_v.contiguous().stride())),
+                    }
+                    got_k_ref = None
+                    for name, (vv, vs) in variants.items():
+                        _cl.reshape_and_cache_kernel(
+                            _k, vv, slot_mapping[:n], kv_cache, _scales,
+                            quantizer, self.layout, value_strides=vs,
+                        )
+                        vc = self.layout.v_codes(kv_cache)[blk, pos]
+                        dv = (vc.to(torch.int16) - qref.v_packed[keep].to(torch.int16)).abs().max().item()
+                        kc = self.layout.k_codes(kv_cache)[blk, pos]
+                        dk = (kc.to(torch.int16) - qref.k_packed[keep].to(torch.int16)).abs().max().item()
+                        print(f"[VMTX] {name:26s} v_codes_maxdiff={dv} k_codes_maxdiff={dk} "
+                              f"v_strides_used={vs}", flush=True)
+                    _VMTX["done"] = True
+                except Exception as e:  # noqa: BLE001
+                    print(f"[VMTX] failed: {e}", flush=True)
+                    _VMTX["done"] = True
+        if env_flag("THUNDER_STORE_AB") and not _STORE_AB["done"]:
+            sl = slot_mapping[:n].to(torch.int64)
+            keep = sl >= 0
+            if bool(keep.any()):
+              try:
+                qref = quantizer.quantize(_k, _v)
+                bs = self.layout.block_size
+                blk = sl[keep] // bs
+                pos = sl[keep] % bs
+                kc = self.layout.k_codes(kv_cache)[blk, pos]        # (m,Hk,k_pb)
+                vc = self.layout.v_codes(kv_cache)[blk, pos]
+                dk = (kc.to(torch.int16) - qref.k_packed[keep].to(torch.int16)).abs().max().item()
+                dv = (vc.to(torch.int16) - qref.v_packed[keep].to(torch.int16)).abs().max().item()
+                sn = self.layout.k_norm(_scales)[blk, pos]
+                dn = (sn.float() - qref.k_norm[keep].float()).abs().max().item()
+                print(f"[STORE-AB] n={n} m={int(keep.sum())} bits=({self.cfg.k_bits},{self.cfg.v_bits}) "
+                      f"k_codes_maxdiff={dk} v_codes_maxdiff={dv} k_norm_maxdiff={dn:.3e} "
+                      f"cache_stride={tuple(kv_cache.stride())}", flush=True)
+                if dv > 0:
+                    exp_v = qref.v_packed[keep]            # (m,Hk,v_pb)
+                    row = (vc.to(torch.int16) - exp_v.to(torch.int16)).abs().amax(dim=(1, 2))
+                    i = int(row.argmax().item())
+                    print(f"[STORE-AB] first_bad_row={i} blk={int(blk[i])} pos={int(pos[i])} "
+                          f"h0_exp_v={exp_v[i,0,:12].tolist()}", flush=True)
+                    print(f"[STORE-AB] h0_got_v={vc[i,0,:12].tolist()}", flush=True)
+                    print(f"[STORE-AB] h1_got_v={vc[i,1,:12].tolist()} "
+                          f"h1_exp_v={exp_v[i,1,:12].tolist()}", flush=True)
+                    kc_ = self.layout.k_codes(kv_cache)[blk[i], pos[i]]
+                    exp_k = qref.k_packed[keep][i]
+                    print(f"[STORE-AB] h0_got_k={kc_[0,:12].tolist()} "
+                          f"h0_exp_k={exp_k[0,:12].tolist()}", flush=True)
+                    # where in the 112-byte slot did the expected V (16B) land?
+                    slot = kv_cache[int(blk[i]), 0, int(pos[i])].to(torch.int16)
+                    want = exp_v[i, 0, :16].to(torch.int16)
+                    hits = [o for o in range(slot.numel() - 15)
+                            if bool(torch.equal(slot[o:o+16], want))]
+                    print(f"[STORE-AB] slot_len={slot.numel()} slot[0:8]={slot[0:8].tolist()} "
+                          f"slot[48:56]={slot[48:56].tolist()} v_landed_offsets={hits[:4]}", flush=True)
+                    # finite + index-level diagnosis
+                    print(f"[STORE-AB] finite: k={bool(torch.isfinite(_k).all())} "
+                          f"v={bool(torch.isfinite(_v).all())} "
+                          f"v_nonfinite={int((~torch.isfinite(_v)).sum())}", flush=True)
+                    from thunder_vllm.quant.packing import unpack_indices
+                    vpb = self.layout.v_packed_bytes
+                    got_idx = unpack_indices(vc.reshape(-1, vpb), self.cfg.v_bits,
+                                             self.head_size).reshape(vc.shape[0], self.num_kv_heads, self.head_size)
+                    rot = quantizer.rotation.matrix.float()
+                    u = _v[:vc.shape[0]].float() @ rot
+                    u = u / u.norm(dim=-1, keepdim=True)
+                    ref_idx = quantizer.v_codebook.quantize(u)
+                    dd = (got_idx - ref_idx)
+                    print(f"[STORE-AB] v_idx_maxdiff={int(dd.abs().max())} "
+                          f"v_idx_nmismatch={int((dd.abs() > 0).sum())} "
+                          f"v_idx_gt1={int((dd.abs() > 1).sum())}", flush=True)
+                    nz = (dd.abs() > 0).nonzero()
+                    if nz.numel():
+                        i_, h_, d_ = [int(x) for x in nz[0]]
+                        bnd = quantizer.v_codebook.boundaries.float()
+                        print(f"[STORE-AB] first_v_mismatch row={i_} h={h_} d={d_} "
+                              f"ref_idx={int(ref_idx[i_, h_, d_])} got_idx={int(got_idx[i_, h_, d_])} "
+                              f"u={float(u[i_, h_, d_]):.8f} maxdiff_at={float(dd.abs().max()):.0f}", flush=True)
+                        # how close to a boundary is it?
+                        dist = (bnd - u[i_, h_, d_]).abs().min()
+                        print(f"[STORE-AB] nearest_boundary_dist={float(dist):.3e} "
+                              f"n_boundaries={int(bnd.numel())}", flush=True)
+                    if os.environ.get("THUNDER_VOL_DIR"):
+                        try:
+                            d_vol = os.environ["THUNDER_VOL_DIR"]
+                            torch.save({"k": _k.cpu(), "v": _v.cpu(), "slots": slot_mapping[:n].cpu(),
+                                        "rot": quantizer.rotation.matrix.cpu(),
+                                        "kb": quantizer.k_codebook.boundaries.cpu(),
+                                        "vb": quantizer.v_codebook.boundaries.cpu(),
+                                        "k_packed": qref.k_packed.cpu(), "v_packed": qref.v_packed.cpu(),
+                                        "got_k": self.layout.k_codes(kv_cache)[blk, pos].cpu(),
+                                        "got_v": vc.detach().cpu()},
+                                       os.path.join(d_vol, "store_ab.pt"))
+                            print(f"[STORE-AB] saved to {d_vol}/store_ab.pt", flush=True)
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[STORE-AB] save failed: {e}", flush=True)
+                _STORE_AB["done"] = True
+              except Exception as e:  # noqa: BLE001
+                print(f"[STORE-AB] failed: {e}", flush=True)
         for holder in args:
             if hasattr(holder, "_tq_cache_updated"):
                 holder._tq_cache_updated = True

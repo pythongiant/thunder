@@ -317,6 +317,9 @@ if _HAS_TRITON:
         v_bounds_ptr,
         stride_kn,
         stride_kh,
+        stride_vn,
+        stride_vh,
+        stride_vd,
         n_rows,
         stride_cache_block,
         stride_cache_head,
@@ -353,9 +356,10 @@ if _HAS_TRITON:
         rot = tl.load(rot_ptr + d[:, None] * head_dim + d[None, :])
 
         for h in tl.static_range(num_kv_heads):
-            base = rows * stride_kn + h * stride_kh
-            k = tl.load(key_ptr + base[:, None] + d[None, :] * 1, mask=row_mask[:, None], other=0.0)
-            v = tl.load(value_ptr + base[:, None] + d[None, :] * 1, mask=row_mask[:, None], other=0.0)
+            base_k = rows * stride_kn + h * stride_kh
+            base_v = rows * stride_vn + h * stride_vh
+            k = tl.load(key_ptr + base_k[:, None] + d[None, :] * 1, mask=row_mask[:, None], other=0.0)
+            v = tl.load(value_ptr + base_v[:, None] + d[None, :] * stride_vd, mask=row_mask[:, None], other=0.0)
             # Match Codebook.quantize exactly: the reference rotates in fp32
             # (``x_f @ matrix.to(fp32)``) and normalizes with
             # ``safe = where(norm > 0, norm, 1)`` (no epsilon). An fp16 tl.dot
@@ -485,6 +489,7 @@ if _HAS_TRITON:
         quantizer,
         layout: ThunderCacheLayout,
         block_rows: int = 16,
+        value_strides: "tuple[int, int, int] | None" = None,
     ) -> None:
         """GPU cache write. Falls back to :func:`reshape_and_cache_ref` for
         bit widths the vectorised packer does not cover.
@@ -497,7 +502,10 @@ if _HAS_TRITON:
         engine's tensor contract (see next-experiment note). 4-bit K (16 levels)
         can differ by one level from the norm reduction order.
         """
-        if layout.k_bits not in (1, 2, 4, 8) or layout.v_bits not in (1, 2, 4, 8):
+        _allow3 = _os.environ.get("THUNDER_STORE3", "0").strip().lower() not in (
+            "", "0", "false", "no", "off")
+        _ok_bits = (1, 2, 3, 4, 8) if _allow3 else (1, 2, 4, 8)
+        if layout.k_bits not in _ok_bits or layout.v_bits not in _ok_bits:
             reshape_and_cache_ref(
                 key, value, slot_mapping, kv_cache, kv_scales, quantizer, layout
             )
@@ -543,6 +551,7 @@ if _HAS_TRITON:
             quantizer.v_codebook.boundaries.to(torch.float32),
             rows.stride(0),
             rows.stride(1),
+            *(value_strides if value_strides is not None else vals.stride()),
             n,
             kv_cache.stride(0),
             kv_cache.stride(1),
