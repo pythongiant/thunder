@@ -143,6 +143,9 @@ def main() -> int:
         store_and_gather(3, 4)
     kernel_parity(4, 4, causal=True)
     kernel_parity(4, 4, causal=False)
+    # Target config (3-bit K / 4-bit V).
+    kernel_parity(3, 4, causal=True)
+    kernel_parity(3, 4, causal=False)
 
     print()
     if FAILURES:
