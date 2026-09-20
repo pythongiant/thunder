@@ -490,13 +490,14 @@ if _HAS_TRITON:
         bit widths the vectorised packer does not cover.
 
         NOTE: the kernel now rotates in fp32 (``input_precision="ieee"``) with an
-        exact normalize, matching ``Codebook.quantize``. Verified bit-exact for the
-        3-bit K / 4-bit V layout at N=2048 with non-contiguous slots
-        (``unpack_maxdiff == 0``, norms identical). The 4-bit *K* layout (16
-        levels) can still differ by one level on a boundary because the norm uses
-        a different fp32 reduction order than torch; not our target config.
+        exact normalize, matching ``Codebook.quantize``. 3-bit K/4-bit V is
+        unit-bit-exact (N=2048, non-contiguous, ``unpack_maxdiff == 0``), but
+        enabling it for 3-bit STILL diverges the engine, so the store is left on
+        the exact torch ref path. The unit parity evidently does not cover the
+        engine's tensor contract (see next-experiment note). 4-bit K (16 levels)
+        can differ by one level from the norm reduction order.
         """
-        if layout.k_bits not in (1, 2, 3, 4, 8) or layout.v_bits not in (1, 2, 3, 4, 8):
+        if layout.k_bits not in (1, 2, 4, 8) or layout.v_bits not in (1, 2, 4, 8):
             reshape_and_cache_ref(
                 key, value, slot_mapping, kv_cache, kv_scales, quantizer, layout
             )
