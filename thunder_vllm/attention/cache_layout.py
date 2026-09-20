@@ -479,8 +479,19 @@ if _HAS_TRITON:
         block_rows: int = 16,
     ) -> None:
         """GPU cache write. Falls back to :func:`reshape_and_cache_ref` for
-        bit widths the vectorised packer does not cover."""
-        if layout.k_bits not in (1, 2, 3, 4, 8) or layout.v_bits not in (1, 2, 3, 4, 8):
+        bit widths the vectorised packer does not cover.
+
+        NOTE: 3-bit is deliberately NOT enabled here yet. ``_pack3`` reproduces
+        the byte layout exactly (CPU-verified), but the kernel's QUANTIZATION
+        still differs from ``Codebook.quantize``: the reference rotates in fp32
+        (``x_f @ matrix.to(fp32)``) while the kernel does an fp16 ``tl.dot`` with
+        an fp16-cast rotation matrix, so a few codes land one level off at scale
+        (measured: unpack_maxdiff=1 over 2048 rows). Enabling it flips 3-bit from
+        the exact ref store to that approximation and diverges the engine. The
+        same mismatch is why the 4-bit Triton path diverges. Fix the quantization
+        first, then flip this guard.
+        """
+        if layout.k_bits not in (1, 2, 4, 8) or layout.v_bits not in (1, 2, 4, 8):
             reshape_and_cache_ref(
                 key, value, slot_mapping, kv_cache, kv_scales, quantizer, layout
             )
