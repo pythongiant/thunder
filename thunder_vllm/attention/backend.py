@@ -37,6 +37,32 @@ _PAGED_CACHE: dict = {}
 _CSR_DEBUG = {"done": False}
 _STORE_AB = {"done": False}
 _VMTX = {"done": False}
+_STAGE = {"total": [], "prefix": [], "gather": [], "qrot": [], "launch": [],
+          "inverse": [], "suffix": []}
+
+
+def _dump_stage() -> None:
+    import os as _o
+    if _o.environ.get("THUNDER_STAGE_TIMING", "0").strip().lower() in (
+        "", "0", "false", "no", "off"
+    ):
+        return
+
+    def pct(xs):
+        if not xs:
+            return (0.0, 0.0)
+        s = sorted(xs)
+        return (s[len(s) // 2], s[int(len(s) * 0.9)])
+
+    msg = "  ".join(
+        f"{k}=p50:{pct(v)[0]:.3f}ms p90:{pct(v)[1]:.3f}ms n={len(v)}"
+        for k, v in _STAGE.items()
+    )
+    print(f"[STAGE] {msg}", flush=True)
+
+
+import atexit as _atexit2
+_atexit2.register(_dump_stage)
 
 # Capture audit: count forward invocations by (capturing?, max_query_len). If the
 # decode step is captured, forward is NOT called per decode step during replay.
@@ -575,6 +601,10 @@ class ThunderAttentionImpl(AttentionImplBase):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = query.shape[0]
+        _t_entry = None
+        if env_flag("THUNDER_STAGE_TIMING"):
+            import time as _tm0
+            _t_entry = _tm0.perf_counter()
         if env_flag("THUNDER_COUNT") and attn_metadata is not None:
             _cap = bool(torch.cuda.is_current_stream_capturing())
             _mql = int(getattr(attn_metadata, "max_query_len", 0) or 0)
@@ -671,6 +701,11 @@ class ThunderAttentionImpl(AttentionImplBase):
         # Engine-path profiling/capture: only on the first true single-request
         # decode step (max_query_len == 1, num_reqs == 1), where the oracle is
         # cheap and unambiguous. Times each stage once.
+        _stage_t = []
+        if env_flag("THUNDER_STAGE_TIMING"):
+            import time as _tm
+            _stage_t.append(_tm.perf_counter())
+            _STAGE["prefix"].append((_stage_t[0] - _t_entry) * 1e3)
         _cap = (
             env_flag("THUNDER_ENGINE_HOOK")
             and not _ENGINE_HOOK["done"]
@@ -782,6 +817,8 @@ class ThunderAttentionImpl(AttentionImplBase):
         if _cap:
             _ev1 = torch.cuda.Event(enable_timing=True)
             _ev1.record()
+        if _stage_t:
+            _stage_t.append(__import__("time").perf_counter())
         q = query[:n].reshape(n, self.num_heads, self.head_size)
         o = output[:n].reshape(n, self.num_heads, self.head_size)
 
@@ -801,6 +838,8 @@ class ThunderAttentionImpl(AttentionImplBase):
         if _cap:
             _ev2 = torch.cuda.Event(enable_timing=True)
             _ev2.record()
+        if _stage_t:
+            _stage_t.append(__import__("time").perf_counter())
         launch_thunder_attention(
             kernel,
             q,
@@ -826,8 +865,21 @@ class ThunderAttentionImpl(AttentionImplBase):
         # rotation once, on the flattened head axis. This is the plugin's
         # "final weight-absorbed output projection" GEMM -- a single linear
         # projection over the head dimension, not a second attention pass.
+        if _stage_t:
+            _stage_t.append(__import__("time").perf_counter())
         if not _skip_rot:
             o.copy_(quantizer.rotation.inverse(o.float()).to(o.dtype))
+        if _stage_t:
+            import time as _tm
+            _stage_t.append(_tm.perf_counter())
+            if len(_stage_t) >= 5:
+                _STAGE["gather"].append((_stage_t[1] - _stage_t[0]) * 1e3)
+                _STAGE["qrot"].append((_stage_t[2] - _stage_t[1]) * 1e3)
+                _STAGE["launch"].append((_stage_t[3] - _stage_t[2]) * 1e3)
+                _STAGE["inverse"].append((_stage_t[4] - _stage_t[3]) * 1e3)
+                import time as _tm2
+                _end = _tm2.perf_counter()
+                _STAGE["total"].append((_end - _t_entry) * 1e3)
         if _cap:
             _ev4 = torch.cuda.Event(enable_timing=True)
             _ev4.record()
@@ -862,6 +914,9 @@ class ThunderAttentionImpl(AttentionImplBase):
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("THUNDER_ENGINE_HOOK dump failed")
+        if env_flag("THUNDER_STAGE_TIMING") and _stage_t and len(_stage_t) >= 5:
+            import time as _tm3
+            _STAGE["suffix"].append((_tm3.perf_counter() - _stage_t[4]) * 1e3)
         return output
 
     def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:
