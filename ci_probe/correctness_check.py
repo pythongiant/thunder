@@ -35,6 +35,8 @@ from thunder_vllm.attention.paged_kv import make_paged_kv_manager  # noqa: E402
 from thunder_vllm.quant.quantizer import ThunderQuantizer  # noqa: E402
 
 HD, HK, BS = 128, 8, 16
+MB = int(os.environ.get("THUNDER_M_BLOCK", 64))
+NB = int(os.environ.get("THUNDER_N_BLOCK", 64))
 dev = "cuda"
 FAILURES: list[str] = []
 
@@ -76,10 +78,10 @@ def store_and_gather(k_bits: int, v_bits: int, nt: int = 256) -> None:
     bt = torch.arange(nb, device=dev, dtype=torch.int32).reshape(1, nb)
     sl = torch.tensor([nt], device=dev, dtype=torch.int32)
     g = mgr.gather_packed_tiles(bt, kv_e, sc_e, sl)
-    check("gather K", md(g.k_packed, layout.k_codes(kv_e).reshape(-1, HK,
-          layout.k_packed_bytes)[:nt]), 0.0)
-    check("gather V", md(g.v_packed, layout.v_codes(kv_e).reshape(-1, HK,
-          layout.v_packed_bytes)[:nt]), 0.0)
+    check("gather K", md(g.k_packed.reshape(-1, HK, layout.k_packed_bytes)[:nt],
+          layout.k_codes(kv_e).reshape(-1, HK, layout.k_packed_bytes)[:nt]), 0.0)
+    check("gather V", md(g.v_packed.reshape(-1, HK, layout.v_packed_bytes)[:nt],
+          layout.v_codes(kv_e).reshape(-1, HK, layout.v_packed_bytes)[:nt]), 0.0)
 
 
 def kernel_parity(k_bits: int, v_bits: int, causal: bool, nt: int = 256) -> None:
@@ -111,7 +113,7 @@ def kernel_parity(k_bits: int, v_bits: int, causal: bool, nt: int = 256) -> None
         max_blocks_per_req=nb, max_query_len=nq)
     fwd = ThunderAttentionForward(head_dim=HD, K_BITS=k_bits, V_BITS=v_bits,
                                   qhead_per_kvhead=1, is_causal=causal,
-                                  m_block_size=64, n_block_size=64, num_threads=128)
+                                  m_block_size=MB, n_block_size=NB, num_threads=128)
     launch_thunder_attention(fwd, qr, g, out, meta, HD ** -0.5, quantizer=quant)
     torch.cuda.synchronize()
 
@@ -120,9 +122,9 @@ def kernel_parity(k_bits: int, v_bits: int, causal: bool, nt: int = 256) -> None
     v_hat = quant.dequantize_v_rotated(
         g.v_packed.reshape(-1, HK, layout.v_packed_bytes), g.v_norm.reshape(-1, HK))
     ref = F.scaled_dot_product_attention(
-        qr.transpose(0, 1).unsqueeze(0),
-        k_hat.transpose(0, 1).unsqueeze(0),
-        v_hat.transpose(0, 1).unsqueeze(0),
+        qr.float().transpose(0, 1).unsqueeze(0),
+        k_hat.float().transpose(0, 1).unsqueeze(0),
+        v_hat.float().transpose(0, 1).unsqueeze(0),
         is_causal=causal, scale=HD ** -0.5)[0].transpose(0, 1).float()
     check(f"kernel {tag} vs rotated oracle", md(out, ref), 5e-3)
 
@@ -131,7 +133,7 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("no CUDA device", flush=True)
         return 2
-    print(f"device: {torch.cuda.get_device_name(0)} "
+    print(f"device: {torch.cuda.get_device_name(0)} m_block={MB} n_block={NB} "
           f"cc={torch.cuda.get_device_capability(0)} "
           f"store3={os.environ.get('THUNDER_STORE3', '0')}", flush=True)
 
