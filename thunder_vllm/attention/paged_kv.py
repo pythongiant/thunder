@@ -456,8 +456,11 @@ class PagedKVManager:
         v_pb = self.layout.v_packed_bytes
         if nrows is None:
             nrows = index.nrows
-        if nrows:
-            sel = index.sel
+        if nrows and nrows > 0:
+            # The capture-safe device index keeps the FULL persistent `sel`
+            # buffer; the eager index is already length nrows. Slice so
+            # index_select only visits the live rows.
+            sel = index.sel[:nrows]
             k = torch.index_select(self.layout.k_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, k_pb)
             v = torch.index_select(self.layout.v_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, v_pb)
             ksn = torch.index_select(self.layout.k_norm(kv_scales), 0, sel).reshape(nrows, bs, hk)
