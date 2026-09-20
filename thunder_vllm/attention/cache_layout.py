@@ -366,8 +366,14 @@ if _HAS_TRITON:
             k_idx = _searchsorted(k_bounds_ptr, k_u, K_LEVELS, head_dim)
             v_idx = _searchsorted(v_bounds_ptr, v_u, V_LEVELS, head_dim)
 
-            k_bytes = _pack(k_idx, ROWS, K_BITS, head_dim, k_packed_bytes)
-            v_bytes = _pack(v_idx, ROWS, V_BITS, head_dim, v_packed_bytes)
+            if K_BITS == 3:
+                k_b0, k_b1, k_b2 = _pack3(k_idx, ROWS, head_dim)
+            else:
+                k_bytes = _pack(k_idx, ROWS, K_BITS, head_dim, k_packed_bytes)
+            if V_BITS == 3:
+                v_b0, v_b1, v_b2 = _pack3(v_idx, ROWS, head_dim)
+            else:
+                v_bytes = _pack(v_idx, ROWS, V_BITS, head_dim, v_packed_bytes)
 
             slot = tl.load(slot_ptr + rows, mask=row_mask, other=0)
             pos = slot % BLOCK_SIZE
@@ -378,11 +384,23 @@ if _HAS_TRITON:
             slot_ok = row_mask & (slot >= 0)
             out = cache_ptr + blk[:, None] * stride_cache_block + h * stride_cache_head + pos[:, None] * stride_cache_pos
             # K codes: little-endian column c goes to byte c*K_BITS//8.
-            kc = tl.arange(0, k_packed_bytes)
-            tl.store(out + kc[None, :], k_bytes, mask=slot_ok[:, None])
+            if K_BITS == 3:
+                g3 = (3 * tl.arange(0, head_dim // 8))[None, :]
+                tl.store(out + g3, k_b0, mask=slot_ok[:, None])
+                tl.store(out + g3 + 1, k_b1, mask=slot_ok[:, None])
+                tl.store(out + g3 + 2, k_b2, mask=slot_ok[:, None])
+            else:
+                kc = tl.arange(0, k_packed_bytes)
+                tl.store(out + kc[None, :], k_bytes, mask=slot_ok[:, None])
             vo = cache_ptr + blk[:, None] * stride_cache_block + h * stride_cache_head + pos[:, None] * stride_cache_pos + k_packed_bytes
-            vc = tl.arange(0, v_packed_bytes)
-            tl.store(vo + vc[None, :], v_bytes, mask=slot_ok[:, None])
+            if V_BITS == 3:
+                g3v = (3 * tl.arange(0, head_dim // 8))[None, :]
+                tl.store(vo + g3v, v_b0, mask=slot_ok[:, None])
+                tl.store(vo + g3v + 1, v_b1, mask=slot_ok[:, None])
+                tl.store(vo + g3v + 2, v_b2, mask=slot_ok[:, None])
+            else:
+                vc = tl.arange(0, v_packed_bytes)
+                tl.store(vo + vc[None, :], v_bytes, mask=slot_ok[:, None])
 
             tl.store(
                 scales_ptr + blk * stride_scales_block + h * stride_scales_head + pos * stride_scales_pos + 0,
@@ -410,6 +428,24 @@ if _HAS_TRITON:
         return lo
 
     @triton.jit
+    def _pack3(idx, ROWS: tl.constexpr, head_dim: tl.constexpr):
+        """3-bit pack: 8 columns -> 24-bit little-endian word -> three bytes.
+
+        Fields are disjoint, so a sum of left shifts equals OR-ing; matches
+        ``quant.packing.pack_indices`` for head_dim=128 (48 bytes). Returned as
+        three (ROWS, head_dim//8) byte planes for strided stores (a single
+        (ROWS, 48) reshape is impossible: 48 is not a power of two).
+        """
+        ng: tl.constexpr = head_dim // 8
+        s = tl.reshape(idx, (ROWS, ng, 8)).to(tl.int32)
+        w = 1 << (3 * tl.arange(0, 8))
+        word = tl.sum(s * w[None, None, :], axis=2)
+        b0 = (word & 0xFF).to(tl.uint8)
+        b1 = ((word >> 8) & 0xFF).to(tl.uint8)
+        b2 = ((word >> 16) & 0xFF).to(tl.uint8)
+        return b0, b1, b2
+
+    @triton.jit
     def _pack(
         idx,
         ROWS: tl.constexpr,
@@ -424,18 +460,6 @@ if _HAS_TRITON:
         shifted by ``k * bits``. The shifts are disjoint, so summing the
         weighted indices is the same as OR-ing them.
         """
-        if bits == 3:
-            # 3 bits does not divide 8, but 8 columns pack exactly into 24 bits
-            # (3 bytes). Build the 24-bit little-endian word with LEFT shifts only
-            # (fields are disjoint), then slice bytes -- matching packed_bytes()
-            # for head_dim=128 (48 bytes).
-            ng: tl.constexpr = head_dim // 8
-            s = tl.reshape(idx, (ROWS, ng, 8)).to(tl.int32)
-            w = 1 << (3 * tl.arange(0, 8))
-            word = tl.sum(s * w[None, None, :], axis=2)          # (ROWS, ng)
-            sub = tl.arange(0, 3)                                 # (3,)
-            byte = (word[:, :, None] >> (8 * sub)[None, None, :]) & 0xFF
-            return tl.reshape(byte.to(tl.uint8), (ROWS, n_bytes))
         n_per: tl.constexpr = 8 // bits
         reshaped = tl.reshape(idx, (ROWS, n_bytes, n_per))
         weights = tl.zeros((n_per,), dtype=tl.int32)
