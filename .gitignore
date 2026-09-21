@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+benchmarks/results/*.json
+benchmarks/results/*.csv
+!benchmarks/results/*.md
+.modal/
+
+experiments/
+
+# Local agent/memory files
+AGENTS.md
+CLAUDE.md
+learnings.md
+
+# Local-only Modal CI/probes + Vultr tooling (purged from history; kept on disk)
+ci/modal_*.py
+ci_probe/modal_*.py
+.github/workflows/modal_ci.yml
+scripts/vultr.py
+
+# Large probe artifacts (purged from history; kept on disk)
+ci_probe/results/*.pt
