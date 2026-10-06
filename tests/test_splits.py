@@ -32,6 +32,16 @@ def test_decode_splits_as_fine_as_the_tile_budget_allows():
             choose_split_count(seq)
 
 
+def test_batched_decode_caps_the_split_count():
+    # At batch 16 the grid already carries one CTA per (request, head, split), so
+    # extra splits stop buying parallelism and start costing merge work: at 4k,
+    # 16 splits measure 0.350 ms against 32 splits' 0.366, and at 32k the curve
+    # is flat from 8 to 64 so 16 is free there.
+    assert choose_split_count(32768, num_reqs=1) == 64
+    assert choose_split_count(32768, num_reqs=16) == 16
+    assert choose_split_count(4096, num_reqs=16) == 16
+
+
 def test_short_contexts_are_capped_by_the_tile_budget():
     # Never finer than eight tiles per split: past that the merge cost dominates
     # (measured: 4k prefers 16 splits over 32, and a 512-token context has no

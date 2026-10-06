@@ -1015,6 +1015,7 @@ class ThunderAttentionImpl(AttentionImplBase):
             seq_len,
             is_prefill=is_causal,
             num_kv_groups=self.num_kv_groups,
+            num_reqs=n_reqs,
             tile_n=tile_shape(bool(is_causal), n_reqs)["n_block"],
         )
 

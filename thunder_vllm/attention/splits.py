@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from thunder_vllm.attention.tile_shape import tile_shape
+from thunder_vllm.attention.tile_shape import BATCHED_DECODE_FROM, tile_shape
 
 
 def splits_allowed(is_prefill: bool, num_kv_groups: int) -> bool:
@@ -24,7 +24,9 @@ def choose_split_count(
     seq_len: int,
     *,
     tile_n: int | None = None,
+    num_reqs: int = 1,
     max_splits: int = 64,
+    max_splits_batched: int = 16,
     min_tiles_per_split: int = 8,
 ) -> int:
     """Split-K count for a decode step: as fine as the tile budget allows.
@@ -40,6 +42,12 @@ def choose_split_count(
     ``min_tiles_per_split=8`` is what keeps short contexts from over-splitting:
     at 4k (128 tiles) it yields 16, which measures 0.077 ms against S=8's 0.142,
     and a 512-token context gets 2.
+    Batched decode is capped lower. The grid already carries one CTA per
+    (request, head, split), so past a point the extra splits stop buying
+    parallelism and start costing merge work: at batch 16 and 4k, 16 splits
+    measure 0.350 ms against 32 splits' 0.366, while at 32k the curve is flat
+    from 8 to 64 so either choice is free. The cap reuses the tile policy's batch
+    threshold, so both switches flip at the same measured batch.
     """
     if seq_len <= 0:
         return 1
@@ -48,7 +56,22 @@ def choose_split_count(
         # (it is 32, not the 64 this defaulted to before the tile change).
         tile_n = tile_shape(is_prefill=False)["n_block"]
     n_tiles = math.ceil(seq_len / tile_n)
-    return max(1, min(max_splits, n_tiles // max(min_tiles_per_split, 1)))
+    cap = min(max_splits, n_tiles // max(min_tiles_per_split, 1))
+    if num_reqs >= BATCHED_DECODE_FROM:
+        cap = min(cap, max_splits_batched)
+    return max(1, _pow2_floor(cap))
+
+
+def _pow2_floor(n: int) -> int:
+    """Largest power of two <= n.
+
+    Counts stay powers of two so the number of distinct captured launches stays
+    small, and so an odd tile budget cannot produce an odd split count.
+    """
+    p = 1
+    while p * 2 <= n:
+        p *= 2
+    return p
 
 
 def decode_split_count(
@@ -56,6 +79,7 @@ def decode_split_count(
     *,
     is_prefill: bool,
     num_kv_groups: int,
+    num_reqs: int = 1,
     tile_n: int | None = None,
 ) -> int:
     """Split-K count for a decode step under the engine policy.
@@ -69,4 +93,4 @@ def decode_split_count(
     """
     if not splits_allowed(is_prefill, num_kv_groups):
         return 1
-    return choose_split_count(seq_len, tile_n=tile_n)
+    return choose_split_count(seq_len, tile_n=tile_n, num_reqs=num_reqs)
