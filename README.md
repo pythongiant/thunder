@@ -18,8 +18,11 @@ throughput.
   (decode, batch 16, 4k), 2.73 ms (decode, batch 16, 32k), 0.217 ms (decode,
   batch 1, 32k) and 4.66 ms (prefill, 4k) — against 5.61 ms and 14.92 ms for the
   same cache dequantized to fp16 and run through SDPA at the last two.
-- **Serving**: batch 1 at 4k runs under CUDA graphs end to end at 7.3-7.5
-  output tok/s. 16k and 32k do not yet — see *Known issues*.
+- **Serving**: batch 1 at 4k runs under CUDA graphs end to end at **18-60 output
+  tok/s of decode** (16.6-56.7 ms ITL over four runs; the spread is run-to-run, not
+  a configuration change). That is 2.4-8x off upstream's compressed path. The
+  whole-request rate is 7.4-7.5 tok/s regardless, because a 4k prefill takes 1.9-3.7
+  s against upstream's 74 ms. 16k and 32k do not run yet — see *Known issues*.
 - **Correctness**: the kernel matches a dequantized-fp16 oracle at
   `atol=rtol=1e-2`, and the GPU suite is green except one unwired stub.
 
@@ -27,6 +30,9 @@ throughput.
 
 All numbers: B200, `Qwen/Qwen3-8B` (32 Q heads / 8 KV heads / head_dim 128,
 GQA 4:1), batch 1 unless stated, greedy, 32 generated tokens, fp16 weights.
+Serving rows run with vLLM's default engine multiprocessing (its absence
+serializes host work with the GPU and cost 4.7x of ITL at 4k when the harness
+forced it off).
 
 ### Kernel
 
@@ -55,16 +61,16 @@ Upstream's GQA/MHA KV path is **stock vLLM** since
 `--kv-cache-dtype turboquant_3bit_nc`, no plugin — which is why the two stacks
 are measured on two pins.
 
-| ctx | stack | KV cache | KV size @ ctx | TTFT | ITL | output tok/s |
-|---|---|---|---|---|---|---|
-| 4096 | upstream vLLM 0.25.1 | fp16 | 16.0 MiB | 88.9 ms | 3.10 ms | 172.9 |
-| 4096 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 3.4 MiB | **74.3 ms** | 7.03 ms | 109.5 |
-| 4096 | thunder (pinned vLLM) | fp16, control | 16.0 MiB | 99.0 ms | 3.04 ms | 165.6 |
-| 4096 | thunder (pinned vLLM) | packed k4v4 | 4.1 MiB | 1.67-2.81 s | 50-87 ms | **7.3-7.5** |
-| 32768 | upstream vLLM 0.25.1 | fp16 | 128.0 MiB | 706.3 ms | 3.78 ms | 38.9 |
-| 32768 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 27.0 MiB | 1380.2 ms | 12.23 ms | 18.2 |
-| 32768 | thunder (pinned vLLM) | fp16, control | 128.0 MiB | 724.1 ms | 3.60 ms | 38.3 |
-| 32768 | thunder (pinned vLLM) | packed k4v4 | 33.0 MiB | — | — | *blocked* |
+| ctx | stack | KV cache | KV size @ ctx | TTFT | ITL | decode tok/s | request tok/s |
+|---|---|---|---|---|---|---|---|
+| 4096 | upstream vLLM 0.25.1 | fp16 | 16.0 MiB | 88.9 ms | 3.10 ms | 323 | 172.9 |
+| 4096 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 3.4 MiB | **74.3 ms** | 7.03 ms | 142 | 109.5 |
+| 4096 | thunder (pinned vLLM) | fp16, control | 16.0 MiB | 99.0 ms | 3.04 ms | 329 | 165.6 |
+| 4096 | thunder (pinned vLLM) | packed k4v4 | 4.1 MiB | 1.9-3.7 s | 16.6-56.7 ms | **18-60** | 7.4-7.5 |
+| 32768 | upstream vLLM 0.25.1 | fp16 | 128.0 MiB | 706.3 ms | 3.78 ms | 265 | 38.9 |
+| 32768 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 27.0 MiB | 1380.2 ms | 12.23 ms | 82 | 18.2 |
+| 32768 | thunder (pinned vLLM) | fp16, control | 128.0 MiB | 724.1 ms | 3.60 ms | 278 | 38.3 |
+| 32768 | thunder (pinned vLLM) | packed k4v4 | 33.0 MiB | — | — | — | *blocked* |
 
 Reading the table:
 
@@ -74,11 +80,34 @@ Reading the table:
 - **Upstream's compression buys memory, not speed at batch 1**: 2.3x (4k) and
   3.2x (32k) more inter-token latency than its own fp16 KV. TTFT improves at 4k
   (74.3 vs 88.9 ms) and degrades 2x at 32k.
-- **Thunder is behind on serving time, and the kernel is not why.** At 4k the
-  served step is 50-87 ms while 36 attention launches at that shape measure
-  ~2.8 ms per token, so the per-token cost is the host path (launcher, gather,
-  merge), not the GPU. That gap, not the kernel table, is what the serving work
-  is for — which is also why the two tables are quoted separately.
+- **Three levels of the same 4k/batch-1 workload, which are easy to confuse:**
+
+  | what is measured | number | rate |
+  |---|---|---|
+  | attention only (36 x 0.078 ms launch) | 2.80 ms/token | **~357 tok/s** |
+  | decode, served (`1 / ITL`) | 16.6-56.7 ms | **18-60 tok/s** |
+  | whole request (32 tokens / wall time) | 4.3-4.4 s | **7.4-7.5 tok/s** |
+
+  The first row is the kernel and it is the fast part — 0.078 ms per launch,
+  measured on the engine's own shapes. The second is the served decode rate; the
+  ~14 ms/token between them is per-layer host work (the CuTeDSL launch costs about
+  0.35 ms of host time per layer, plus the gather and the merge). The third is what
+  a client sees for a 32-token request, and the gap to the second is a 4k prefill
+  that currently takes 1.9-3.7 s. Earlier revisions of this file quoted a
+  *derived* 151 tok/s (0.184 ms per launch x 36 layers); the same derivation on the
+  current kernel gives ~357, so the kernel has moved the right way while the
+  serving path — newly measurable now that capture works — is the open problem.
+- **Two throughput columns, because one number was misleading.** `request tok/s`
+  is `generated tokens / total wall time` — the same definition upstream's rows
+  use, kept so the tables stay comparable — and at 32 generated tokens it is
+  dominated by TTFT rather than by decode. `decode tok/s` is `1 / ITL`, the
+  number to compare against another stack's ITL.
+- **The kernel is not the serving gap; per-layer host work is.** 36 attention
+  launches at 4k measure 0.077 ms each — 2.8 ms per token, and 168 ms for the whole
+  4k prefill — against a measured 16.6-56.7 ms ITL and a 1.9-3.7 s TTFT. The rest
+  is host work per layer: launcher plumbing, the gather, the merge. That, not the
+  kernel, is what the serving work has to attack, and a stable serving number needs
+  a quiet GPU before it can be quoted tighter than the range above.
 - 32k has no serving row: it cannot be served under CUDA graphs yet
   (*Known issues*), and the eager path is host-bound.
 
