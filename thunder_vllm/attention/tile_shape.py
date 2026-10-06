@@ -41,9 +41,14 @@ PREFILL_TILE = {"m_block": 64, "n_block": 16, "num_threads": 128}
 # so the switch is gated on the batch rather than applied globally.
 DECODE_TILE_BATCHED = {"m_block": 16, "n_block": 16, "num_threads": 32}
 BATCHED_DECODE_FROM = 16
+# A prefill with at most this many query rows per request is a chunk of a longer
+# prompt (vLLM's chunked prefill), not a whole prompt.
+CHUNKED_PREFILL_MAX_Q = 32
+PREFILL_TILE_CHUNKED = {"m_block": 32, "n_block": 16, "num_threads": 64}
 
 
-def tile_shape(is_prefill: bool, num_reqs: int = 1) -> dict[str, int]:
+def tile_shape(is_prefill: bool, num_reqs: int = 1,
+               max_query_len: int | None = None) -> dict[str, int]:
     """Tile shape for a step: prefill, batched decode, or plain decode.
 
     ``is_prefill`` is the engine's "this step is prefill-like" flag
@@ -54,6 +59,16 @@ def tile_shape(is_prefill: bool, num_reqs: int = 1) -> dict[str, int]:
     for the batch that was actually measured).
     """
     if is_prefill:
+        # vLLM chunks long prompts, so an engine prefill is usually a
+        # many-request step with only a few query rows per request. At the
+        # engine's 4k geometry (256 requests x 16 rows) the full-height tile
+        # measures 34.07 ms per layer against 23.86 ms for the 32-row one --
+        # -30% -- because 16 live rows inside a 64-row tile waste three quarters
+        # of the QK/PV and staging work. A genuinely long prefill keeps the
+        # full-height tile (it has thousands of live rows and pays for the extra
+        # q-blocks otherwise).
+        if max_query_len is not None and max_query_len <= CHUNKED_PREFILL_MAX_Q:
+            return PREFILL_TILE_CHUNKED
         return PREFILL_TILE
     if num_reqs >= BATCHED_DECODE_FROM:
         return DECODE_TILE_BATCHED
