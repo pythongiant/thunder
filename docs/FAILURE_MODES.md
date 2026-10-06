@@ -196,8 +196,13 @@ batch 1 at 4k, and the 4k path is fine.
   **but not every time**: a four-cell batch sweep (2/64/256/1024) passed all four,
   while the same cell alone failed twice. Treat a single grid cell at this geometry
   as flaky, and prefer repeated runs before believing a pass.
-- Tile shape is not the trigger: n=16/32/64 and m=128/t=256 all fault alike, so the
-  prefill KV-tile change this session is not the cause.
+- Tile shape is not the trigger: n=16/32/64 and m=128/t=256 all fault alike in the
+  grid, and in the engine the pre-session prefill tile (`PREFILL_TILE` n=64) fails
+  identically. The prefill KV-tile change this session is therefore not the cause --
+  this is a pre-existing bug in the many-request prefill path, not a regression.
+  (The `THUNDER_M_BLOCK`/`THUNDER_N_BLOCK`/`THUNDER_NUM_THREADS` env knobs cannot be
+  used to bisect it: the kernel is built from the tile policy, not from those
+  config fields, so setting them changes nothing.)
 
 - Next: bisect inside the kernel for the many-request prefill (the row base
   `req * kv_row_stride` with `num_reqs` = 1024 and a 16-row query block is the prime
