@@ -1,0 +1,1 @@
+tests/test_cuda_graph.py::test_cuda_graph_replay_parity

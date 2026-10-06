@@ -136,7 +136,7 @@ def test_kernel_matches_dequant_reference(causal, k_bits, v_bits):
 
 
 def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale, causal,
-                num_splits: int = 1):
+                num_splits: int = 1, gqa_pack: bool = False):
     """Mirror the plugin contract: rotate Q in, un-rotate O out.
 
     The kernel scores in the rotated basis (exact, since the rotation is
@@ -178,14 +178,15 @@ def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale
     out = torch.zeros_like(q)
     launcher(
         kernel, q_rot, gathered, out, metadata, scale,
-        quantizer=quant, num_splits=num_splits,
+        quantizer=quant, num_splits=num_splits, gqa_pack=gqa_pack,
     )
     return rot.inverse(out.float()).to(q.dtype)
 
 
+@pytest.mark.parametrize("gqa_pack", [False, True])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("num_splits", [2, 4])
-def test_split_k_decode_matches_dequant_reference(causal, num_splits):
+def test_split_k_decode_matches_dequant_reference(causal, num_splits, gqa_pack):
     """Split-K decode parity against the dequant oracle.
 
     Splitting is a distinct reduction -- per-split max/sum rescale in the
@@ -205,6 +206,7 @@ def test_split_k_decode_matches_dequant_reference(causal, num_splits):
         out = _run_kernel(
             q, kv, scales, layout, launch_thunder_attention, quant,
             nq, nk, hq, hk, d, scale, causal, num_splits=num_splits,
+            gqa_pack=gqa_pack,
         )
     except KernelNotReadyError:
         pytest.skip("kernel not ready")
