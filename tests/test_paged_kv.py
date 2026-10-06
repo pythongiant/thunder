@@ -28,14 +28,15 @@ def _fill_cache(layout, q, kv, scales, n_tokens, seed=0):
     return key, value, slots
 
 
-def test_manager_accepts_engine_padded_block_table():
-    """The engine pads its block table past ceil(max_model_len / block_size).
+def test_manager_reserves_past_the_engine_padding():
+    """The reservation rounds up to vLLM's block-table padding granularity.
 
-    For a 4160-token limit at block_size 16 that is 260 blocks of content in a
-    264-column table (vLLM pads to a multiple of 8). A manager sized only from
-    the token limit rejects the table it is handed, which is what broke
-    ``LLM(max_model_len=4160)`` end to end; sizing it from the table width (what
-    ``ThunderAttentionImpl.forward`` now passes) accepts it.
+    vLLM hands over a table padded to a multiple of 8 blocks (260 blocks of
+    content in 264 columns for a 4160-token limit at block_size 16), and a
+    manager sized only from the token limit rejects it. Sizing generously is
+    also what keeps the manager's cache key independent of the observed width:
+    a manager created during CUDA-graph capture would allocate mid-capture and
+    invalidate the graph.
     """
     layout = ThunderCacheLayout(
         num_kv_heads=4, head_dim=128, k_bits=4, v_bits=4, block_size=16
@@ -45,27 +46,20 @@ def test_manager_accepts_engine_padded_block_table():
     kv, scales = allocate_kv_cache(nb, 16, 4, 128, 4, 4, device="cpu")
     _fill_cache(layout, q, kv, scales, nb * 16)
 
-    padded = 264
-    block_table = torch.zeros((1, padded), dtype=torch.long)
-    block_table[0, :4] = torch.arange(4)          # 4 live blocks == 64 tokens
+    mgr = make_paged_kv_manager(layout, max_num_reqs=1, max_model_len=4160, device="cpu")
+    assert mgr.max_blocks_per_req == 264, "260 blocks rounded up to the padding granularity"
+
+    padded = torch.zeros((1, 264), dtype=torch.long)
+    padded[0, :4] = torch.arange(4)          # 4 live blocks == 64 tokens
     seq_lens = torch.tensor([64])
-
-    narrow = make_paged_kv_manager(
-        layout, max_num_reqs=1, max_model_len=4160, device="cpu"
-    )
-    assert narrow.max_blocks_per_req == 260
-    with pytest.raises(ValueError, match="exceeds reserved"):
-        narrow.gather_packed_tiles(block_table, kv, scales, seq_lens=seq_lens)
-
-    wide = make_paged_kv_manager(
-        layout, max_num_reqs=1, max_model_len=4160, max_blocks_per_req=padded,
-        device="cpu",
-    )
-    out = wide.gather_packed_tiles(block_table, kv, scales, seq_lens=seq_lens)
-    assert wide.max_blocks_per_req == padded
-    # The four live blocks are gathered in order, same as the narrow manager.
-    ref = narrow.gather_packed_tiles(block_table[:, :4], kv, scales, seq_lens=seq_lens)
+    out = mgr.gather_packed_tiles(padded, kv, scales, seq_lens=seq_lens)
+    ref = mgr.gather_packed_tiles(padded[:, :4], kv, scales, seq_lens=seq_lens)
     assert torch.equal(out.k_packed[:4], ref.k_packed[:4])
+
+    # A table wider than the reservation is still refused.
+    with pytest.raises(ValueError, match="exceeds reserved"):
+        mgr.gather_packed_tiles(torch.zeros((1, 272), dtype=torch.long), kv, scales,
+                                seq_lens=seq_lens)
 
 
 def test_gather_matches_block_table_walk():
@@ -136,8 +130,9 @@ def test_make_manager_block_count():
         num_kv_heads=1, head_dim=64, k_bits=4, v_bits=4, block_size=32
     )
     mgr = make_paged_kv_manager(layout, max_num_reqs=4, max_model_len=100, device="cpu")
-    assert mgr.max_blocks_per_req == 4  # ceil(100 / 32)
-    assert mgr.max_page_rows == 16
+    # ceil(100 / 32) = 4, rounded up to vLLM's padding granularity of 8 blocks.
+    assert mgr.max_blocks_per_req == 8
+    assert mgr.max_page_rows == 32
 
 
 def test_seq_row_counts():

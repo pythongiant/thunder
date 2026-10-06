@@ -597,11 +597,15 @@ def make_paged_kv_manager(
     that table (e.g. 260 -> 264 blocks for a 4160-token limit), and a manager
     sized only from ``max_model_len`` then rejects the table it is handed.
     """
-    blocks = (
-        int(max_blocks_per_req)
-        if max_blocks_per_req is not None
-        else (int(max_model_len) + layout.block_size - 1) // layout.block_size
-    )
+    if max_blocks_per_req is not None:
+        blocks = int(max_blocks_per_req)
+    else:
+        # vLLM pads its block table to a multiple of 8 (260 blocks -> 264 columns
+        # for a 4160-token limit), so round the reservation up to that
+        # granularity: sizing it from the token limit alone makes the manager
+        # reject the table the engine hands over.
+        blocks = (int(max_model_len) + layout.block_size - 1) // layout.block_size
+        blocks = -(-blocks // 8) * 8
     return PagedKVManager(
         layout,
         max_num_reqs=max_num_reqs,

@@ -563,8 +563,7 @@ class ThunderAttentionImpl(AttentionImplBase):
     ) -> PagedKVManager:
         dev = torch.device(device)
         key = (dev.type, dev.index, self.layout.block_size, self.layout.num_kv_heads,
-               self.cfg.k_bits, self.cfg.v_bits, int(max_num_reqs), int(max_model_len),
-               int(max_blocks_per_req) if max_blocks_per_req is not None else -1)
+               self.cfg.k_bits, self.cfg.v_bits, int(max_num_reqs), int(max_model_len))
         mgr = _PAGED_CACHE.get(key)
         if mgr is None:
             mgr = make_paged_kv_manager(
@@ -757,16 +756,16 @@ class ThunderAttentionImpl(AttentionImplBase):
         if _cap:
             _ev0 = torch.cuda.Event(enable_timing=True)
             _ev0.record()
-        # Size the gather reservation from the engine's own block table: vLLM
-        # pads that table past ceil(max_model_len / block_size) (4160 tokens ->
-        # 264 blocks at block_size 16), and a manager sized only from the token
-        # limit rejects the table it is handed.
-        _bt = getattr(attn_metadata, "block_table", None)
+        # Size the gather reservation generously (rounded up to vLLM's padding
+        # granularity) rather than from the table we happen to be handed: keying
+        # the manager on the observed width means a manager can be created during
+        # CUDA-graph capture, and allocating mid-capture invalidates the graph
+        # (cudaErrorStreamCaptureInvalidated). The buffers are capped by the
+        # physical block count anyway, so the extra reservation costs nothing.
         paged = self._ensure_paged(
             query.device,
-            max_num_reqs=max(_cap_reqs, 1, int(_bt.shape[0]) if _bt is not None else 0),
+            max_num_reqs=max(_cap_reqs, 1),
             max_model_len=_cap_len,
-            max_blocks_per_req=int(_bt.shape[1]) if _bt is not None else None,
         )
         # Live-block count for the gather must be known on the HOST: under
         # CUDA-graph capture a `.item()` on the device seq_lens is a D2H sync and
