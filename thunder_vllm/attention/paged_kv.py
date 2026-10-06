@@ -460,15 +460,23 @@ class PagedKVManager:
             # The capture-safe device index keeps the FULL persistent `sel`
             # buffer; the eager index is already length nrows. Slice so
             # index_select only visits the live rows.
+            #
+            # Select straight INTO the reservation: the destination rows are
+            # already (nrows, bs, hk, pb), so the intermediate tensor and the
+            # second copy both go away. That matters beyond the saved copy -- an
+            # allocation inside a captured region has to come from the graph pool,
+            # and at 32k the large-batch capture graphs want 3 GiB per layer,
+            # which invalidated the capture (cudaErrorStreamCaptureInvalidated)
+            # when this path built temporaries per layer.
             sel = index.sel[:nrows]
-            k = torch.index_select(self.layout.k_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, k_pb)
-            v = torch.index_select(self.layout.v_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, v_pb)
-            ksn = torch.index_select(self.layout.k_norm(kv_scales), 0, sel).reshape(nrows, bs, hk)
-            vsn = torch.index_select(self.layout.v_norm(kv_scales), 0, sel).reshape(nrows, bs, hk)
-            out.k_packed.view(-1, bs, hk, k_pb)[:nrows].copy_(k)
-            out.v_packed.view(-1, bs, hk, v_pb)[:nrows].copy_(v)
-            out.k_norm.view(-1, bs, hk)[:nrows].copy_(ksn)
-            out.v_norm.view(-1, bs, hk)[:nrows].copy_(vsn)
+            torch.index_select(self.layout.k_codes(kv_cache), 0, sel,
+                               out=out.k_packed.view(-1, bs, hk, k_pb)[:nrows])
+            torch.index_select(self.layout.v_codes(kv_cache), 0, sel,
+                               out=out.v_packed.view(-1, bs, hk, v_pb)[:nrows])
+            torch.index_select(self.layout.k_norm(kv_scales), 0, sel,
+                               out=out.k_norm.view(-1, bs, hk)[:nrows])
+            torch.index_select(self.layout.v_norm(kv_scales), 0, sel,
+                               out=out.v_norm.view(-1, bs, hk)[:nrows])
         if env_flag("THUNDER_DEBUG_GATHER"):
             print(f"[TQ-CSR] nrows={nrows} capacity={self.page_rows}", flush=True)
         return out
