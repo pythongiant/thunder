@@ -23,13 +23,14 @@ and flags-on, plus `+gqa` decode rows. Never report speed on a failing run.
 |---|---|---|---|
 | Dequant-to-FP16 ref | sanity lower bound only | `bench_common.attention_ref` | exists |
 | Fused kernel, current defaults | reference point for all deltas | `kernel_bench.py` | measured (B200) |
-| FA4 vs ours matrix | apples-to-apples gate: where we lose to FA4 | `benchmarks/fa4_matrix.py` (`--quick` first) | **frozen, GPU-gated** |
+| FA4 vs ours matrix | apples-to-apples gate: where we lose to FA4 | `benchmarks/fa4_matrix.py` (`--quick` first) | **frozen, GPU-gated** (result: `benchmarks/results/fa4_matrix_b200_full.md`) |
 | Q×K isolation (fork) | dequantize-then-MMA vs native score path | `docs/QK_ISOLATION.md` spec; build variant A on GPU day | **spec only, GPU-gated** |
 | −onepass / −reg_rescale / −causal_bound | per-flag wins | `kernel_stage_probe.py` rows | measured (B200: onepass x1.63 prefill, reg_rescale x1.28) |
-| +GQA reuse | remove 4× redundant KV reconstruction (M1) | `THUNDER_BENCH_HQ=32 THUNDER_GQA_PACK=1 kernel_bench.py` vs off; `gqa_pack` stage-probe row | wired, **GPU-gated** |
-| +split-K on GQA | occupancy gain, attributed separately | `THUNDER_SPLITS=N` on top of GQA row | wired, **GPU-gated** |
+| +GQA reuse | remove 4× redundant KV reconstruction (M1) | `THUNDER_GQA_PACK=0/1` (now the default); `--mode grid` cell | **measured, shipped**: -76.6% at batch 16/32k and -31% at batch 1, at the tile that was current then |
+| +split-K on GQA | occupancy gain, attributed separately | `THUNDER_SPLITS=N` on top of GQA row | **measured, shipped**: the knee moved 16 -> 64 once packing took the head axis (8 KV heads, not 32); batch-1 32k decode 0.537 -> 0.215 ms |
 | 4/4 vs 3/4 packing | compression tradeoff | `THUNDER_K_BITS/V_BITS`, `THUNDER_STORE3=1` | measured (store parity) |
-| Indirect vs request-major gather | gather-path cost | `THUNDER_8B_INDIRECT=0/1` | wired, **GPU-gated** |
+| Indirect vs request-major gather | gather-path cost | `THUNDER_8B_INDIRECT=0/1` | measured; request-major is the default |
+| Tile shape per schedule | decode vs prefill tiling | `--mode grid` (`shape\|splits\|gqa\|m\|t\|n`) | **measured, shipped**: decode 32x64x32 (batch 1) and 16x32x16 (batch 16), prefill 64x128x16 - `tile_shape.py` carries the table |
 | HQ=8 vs HQ=32 bench shape | microbench vs engine-like | `THUNDER_BENCH_HQ=8/32` | wired, **GPU-gated** |
 
 ## Required run order (jointly optimized scheduling)
@@ -45,9 +46,12 @@ correctness gate
 The combined cell is interpretable only alongside its single-variable
 parents — never from baseline in one jump.
 
-## E2E column (blocked, tracked for later)
+## E2E column
 
-Upstream `TURBOQUANT` vs ours per `bench_vs_thunder_vllm.py` sweep.
-Baseline unselectable at pinned vLLM `0.29.1rc1` — needs a separate
-vLLM 0.19–0.25 image. Ours column needs a clean GPU (see
-`docs/RUNBOOK.md` hygiene) and M1 landed first.
+Upstream `TURBOQUANT` cannot be selected in-process at pinned vLLM
+`0.29.1rc1` (see `docs/BENCHMARKS.md`), so the comparison runs as two
+stacks on two pins: `ci_probe/modal_upstream_baseline.py` (vLLM 0.25.1,
+stock `turboquant_3bit_nc`) against `ci/modal_app.py --mode e2e` (pinned
+vLLM, `CUSTOM` backend). `benchmarks/results/upstream_vs_ours.md` holds
+both tables plus the fp16 cross-stack control that makes them readable
+side by side; read its provenance notes before quoting a ratio.

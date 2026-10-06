@@ -34,15 +34,22 @@ the TurboQuant data path — not the old schedule incrementally patched.
 
 ## Milestone order
 
-### M1. Eliminate redundant KV work — NOW
+### M1. Eliminate redundant KV work — DONE (shipped)
 
-Decode in a 4:1 GQA group currently reconstructs each KV tile 4× (once per
-Q-head CTA). The QK/PV math legitimately differs per head; the KV
-reconstruction does not.
+Decode in a 4:1 GQA group reconstructed each KV tile 4× (once per Q-head
+CTA). The QK/PV math legitimately differs per head; the KV
+reconstruction did not.
 
-- Validate `THUNDER_GQA_PACK=1`: correctness parity first, then A/B.
-- Do **not** claim 4×: only the KV load/unpack/LUT fraction shrinks
-  (e.g. 40% KV work → ~1.4× total). Measure the redundant fraction.
+- `THUNDER_GQA_PACK` is now the decode default (opt out with `0`), with
+  parity cases in `tests/test_correctness.py` and the GPU gate.
+- Measured: -76.6% at batch 16/32k (11.62 → 2.72 ms) and -31% at batch 1
+  at the tile current then. The prediction held: the win is the KV
+  load/unpack fraction, not 4×, and it grew once split-K was retuned for
+  the narrower grid (-60% more at batch 1, 0.537 → 0.215 ms).
+- The "8 KV-head CTAs trade redundancy for head-axis parallelism" caveat
+  was real and is handled by the split policy, not by the packing shape:
+  the grid lost 4× of its head-axis CTAs, so the split count had to
+  follow.
 - Do not assume the current packed shape is optimal: 8 KV-head CTAs trade
   redundancy for head-axis parallelism. Follow-ups, in order:
   - A: keep Q0..Q3 live together (current shape).
@@ -50,16 +57,26 @@ reconstruction does not.
   Optimize for **KV reuse**, not for an implementation shape.
 - "GQA K reuse" and "V multi-head GEMM" are one item: **GQA KV reuse**.
 
-### M2. GQA × SplitKV, jointly optimized
+### M2. GQA × SplitKV, jointly optimized — DONE (shipped)
 
-GQA attacks wasted work; SplitKV attacks insufficient parallelism. Choose
-the best scheduler/layout per workload from the full 2×2:
+GQA attacks wasted work; SplitKV attacks insufficient parallelism. The
+order held: packing first, splits after.
 
 ```text
 baseline | GQA-only | SplitKV-only | GQA + SplitKV
 ```
 
-Tune split counts only after the architecture is chosen — never before.
+- The split knee moved with the grid: 8 at the old 64-row tile, 16 at the
+  32-row tile, 64 once packing took the head axis (S=16 0.537 ms, S=32
+  0.318, S=64 0.215, S=128 0.218 flat at batch 1/32k).
+- Batched decode caps lower (16 from batch 16 up): at batch 16/4k the grid
+  already has its CTAs, so extra splits only add merge work (0.350 vs
+  0.366 ms). Both switches now live in `thunder_vllm/attention/splits.py`
+  with the measurements beside them.
+- **SMEM constraint:** the decode tile's smem is ~89 KB, which fits two
+  CTAs/SM so three need ≤75 KB (drop `sOf` via a register-direct epilogue,
+  `sS` to fp16). That is what bounds the tile, and therefore the split
+  count, more than the arithmetic does.
 
 ### M3. Eliminate KV intermediate movement
 
