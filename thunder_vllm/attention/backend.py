@@ -27,6 +27,7 @@ from thunder_vllm.attention.metadata import (
     ThunderMetadataBuilder,
 )
 from thunder_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
+from thunder_vllm.attention.tile_shape import tile_shape
 from thunder_vllm.utils.logging import env_flag, get_logger, log_once
 
 logger = get_logger("attention.backend")
@@ -202,17 +203,20 @@ class ThunderCuteConfig:
         )
 
     def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool) -> tuple:
+        # The tile comes from the schedule (decode vs prefill), not from the
+        # env defaults, so the key has to carry the tile actually compiled.
+        tile = tile_shape(bool(is_causal))
         return (
             head_dim,
             self.k_bits,
             self.v_bits,
             num_kv_heads,
             is_causal,
-            self.m_block_size,
-            self.n_block_size,
+            tile["m_block"],
+            tile["n_block"],
             self.num_stages,
             self.num_dequant_stages,
-            self.num_threads,
+            tile["num_threads"],
             self.use_2cta_instrs,
             self.q_stage,
             self.cache_block_size,
@@ -576,6 +580,7 @@ class ThunderAttentionImpl(AttentionImplBase):
 
     def get_kernel(self, head_dim: int, is_causal: bool) -> Any:
         """Compile (once) and cache the kernel for this shape."""
+        tile = tile_shape(bool(is_causal))
         key = self.cfg.kernel_key(head_dim, self.num_kv_heads, is_causal)
         kernel = self._kernels.get(key)
         if kernel is None:
@@ -586,11 +591,11 @@ class ThunderAttentionImpl(AttentionImplBase):
                 V_BITS=self.cfg.v_bits,
                 qhead_per_kvhead=self.num_kv_groups,
                 is_causal=is_causal,
-                m_block_size=self.cfg.m_block_size,
-                n_block_size=self.cfg.n_block_size,
+                m_block_size=tile["m_block"],
+                n_block_size=tile["n_block"],
                 num_stages=self.cfg.num_stages,
                 num_dequant_stages=self.cfg.num_dequant_stages,
-                num_threads=self.cfg.num_threads,
+                num_threads=tile["num_threads"],
                 use_2cta_instrs=self.cfg.use_2cta_instrs,
                 q_stage=self.cfg.q_stage,
             )
@@ -1002,7 +1007,7 @@ class ThunderAttentionImpl(AttentionImplBase):
             seq_len,
             is_prefill=is_causal,
             num_kv_groups=self.num_kv_groups,
-            tile_n=self.cfg.n_block_size,
+            tile_n=tile_shape(bool(is_causal))["n_block"],
         )
 
     def do_kv_cache_update(self, *args: Any, **kwargs: Any) -> None:
