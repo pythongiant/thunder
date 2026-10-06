@@ -128,6 +128,17 @@ class PagedKVManager:
         scale with ``max_model_len``. The request-major path calls this with no
         cap and is unchanged.
         """
+        if self._buffers is not None and cap_rows is not None and self._rows is not None:
+            # The two gather paths share one reservation, and whoever reserves
+            # first fixes its size. Growing later would write past the allocated
+            # rows (a silent OOB), so refuse loudly instead: the path choice must
+            # be stable for the life of the manager.
+            if int(cap_rows) > self._rows:
+                raise ValueError(
+                    f"gather reservation is {self._rows} block-rows but this call "
+                    f"needs {int(cap_rows)}; the gather path must not change size "
+                    f"after the first reserve"
+                )
         if self._buffers is None:
             CSR_COUNTS["reserve_calls"] += 1
             if cap_rows is not None:
@@ -225,7 +236,7 @@ class PagedKVManager:
         and capture falls back to the full table (correct for any replay length,
         just not trimmed).
         """
-        out = self.reserve()
+        out = self.reserve(self.max_page_rows)
         bt = block_table.to(torch.int64)
         if bt.shape[0] > self.max_num_reqs or bt.shape[1] > self.max_blocks_per_req:
             raise ValueError(

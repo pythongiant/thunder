@@ -35,12 +35,18 @@ logger = get_logger("attention.backend")
 # Request-major gather budget. That path keeps request identity in the row stride
 # (row = req * max_blocks_per_req + block), so its reservation is the WORST case
 # max_num_reqs * max_blocks_per_req block-rows and cannot be trimmed without
-# breaking the layout. At 32k on Qwen3-8B that is 952 * 2052 block-rows =
-# 33 GiB of packed KV, which does not fit beside a 98.9 GiB KV cache on a
-# 178 GiB device -- the 32k e2e died in ``reserve`` with CUDA OOM. The CSR path
-# packs the live blocks densely and reserves by the physical block count
-# (32k: 180k block-rows = 3.0 GiB), so it takes over past this budget.
-REQUEST_MAJOR_GATHER_BUDGET_BYTES = 8 << 30
+# breaking the layout. On Qwen3-8B that reservation is 4.2 GiB at 4k, 8.2 GiB at
+# 8k and 33 GiB at 32k, against a 178 GiB device that already holds a 98.9 GiB KV
+# cache -- the 32k e2e died in ``reserve`` with CUDA OOM. The CSR path packs the
+# live blocks densely and reserves by the physical block count (32k: 180k
+# block-rows = 3.0 GiB), so it takes over past this budget.
+#
+# The budget is a CONSTANT, not a fraction of free memory: the two paths share one
+# reservation and whichever reserves first fixes its size, so a path that flips
+# with memory pressure would make the other path write past the buffer. 16 GiB
+# keeps 4k and 8k (the shapes that fit comfortably) on the cheaper path and
+# switches where the reservation stops being reasonable.
+REQUEST_MAJOR_GATHER_BUDGET_BYTES = 16 << 30
 
 
 def _request_major_gather_bytes(paged, layout, num_kv_heads: int) -> int:

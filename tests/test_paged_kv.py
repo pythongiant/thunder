@@ -358,12 +358,33 @@ def test_gather_path_follows_the_reservation_size():
 
     layout = SimpleNamespace(block_size=16, k_packed_bytes=64, v_packed_bytes=64)
     req4k = SimpleNamespace(max_num_reqs=952, max_blocks_per_req=260)
+    req8k = SimpleNamespace(max_num_reqs=952, max_blocks_per_req=516)
     req32k = SimpleNamespace(max_num_reqs=952, max_blocks_per_req=2052)
 
     assert _request_major_gather_bytes(req4k, layout, 8) < REQUEST_MAJOR_GATHER_BUDGET_BYTES
+    assert _request_major_gather_bytes(req8k, layout, 8) < REQUEST_MAJOR_GATHER_BUDGET_BYTES
     assert _request_major_gather_bytes(req32k, layout, 8) > REQUEST_MAJOR_GATHER_BUDGET_BYTES
     assert not _use_indirect_gather(req4k, layout, 8, "")
+    assert not _use_indirect_gather(req8k, layout, 8, "")
     assert _use_indirect_gather(req32k, layout, 8, "")
     # An explicit setting still wins, so the OOM stays reproducible on demand.
     assert not _use_indirect_gather(req32k, layout, 8, "0")
     assert _use_indirect_gather(req4k, layout, 8, "1")
+
+
+def test_reservation_refuses_to_grow_after_allocation():
+    """Both gather paths share one reservation and whichever reserves first fixes
+    its size, so a later call that needs more rows must fail loudly rather than
+    write past the buffer. The path choice is a constant for exactly this reason
+    (see REQUEST_MAJOR_GATHER_BUDGET_BYTES).
+    """
+    layout = ThunderCacheLayout(
+        num_kv_heads=8, head_dim=128, k_bits=4, v_bits=4, block_size=16
+    )
+    mgr = PagedKVManager(layout, max_num_reqs=8, max_blocks_per_req=16, device="cpu")
+
+    mgr.reserve(32)
+    assert mgr.page_rows == 32
+    mgr.reserve(32)  # same size is fine (every replay asks for the same cap)
+    with pytest.raises(ValueError, match="must not change size"):
+        mgr.reserve(64)
