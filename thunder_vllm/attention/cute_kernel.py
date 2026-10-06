@@ -266,7 +266,7 @@ class ThunderAttentionForward:
             sK_code: cute.struct.Align[cute.struct.MemRange[dt, tn * hd], 1024]
             sV_code: cute.struct.Align[cute.struct.MemRange[dt, hd * tn], 1024]
             sP: cute.struct.Align[cute.struct.MemRange[dt, tm * tn], 1024]
-            sOf: cute.struct.Align[cute.struct.MemRange[f32, tm * hd], 1024]
+            sOf: cute.struct.Align[cute.struct.MemRange[dt, tm * hd], 1024]
             sS: cute.struct.Align[cute.struct.MemRange[f32, tm * tn], 1024]
             sKLut: cute.struct.Align[cute.struct.MemRange[dt, (1 << self.K_BITS) * hd], 128]
             sVLut: cute.struct.Align[cute.struct.MemRange[dt, (1 << self.V_BITS) * hd], 128]
@@ -570,13 +570,9 @@ class ThunderAttentionForward:
         rV = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sV_code))
 
         smem_copy_atom_S = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32)
-        smem_copy_atom_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32)
         smem_thr_copy_S = cute.make_tiled_copy_C(smem_copy_atom_S, tiled_mma_qk).get_slice(tidx)
-        smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma_pv).get_slice(tidx)
         taccSrS = smem_thr_copy_S.retile(acc_S)
-        taccOrO = smem_thr_copy_O.retile(acc_O)
         tSsS = smem_thr_copy_S.partition_D(sS)
-        tOsOf = smem_thr_copy_O.partition_D(sOf)
 
         # Load Q once, upstream of both passes.
         cute.copy(thr_copy_q, thr_copy_q.partition_S(sQ), thr_copy_q.retile(rQ))
@@ -730,14 +726,17 @@ class ThunderAttentionForward:
                     # Rescale the running PV accumulator by alpha (per row) before
                     # adding this tile. Done through the existing fp32 sOf staging
                     # buffer: no fragment-coordinate arithmetic.
-                    cute.copy(smem_copy_atom_O, taccOrO, tOsOf)
+                    for e in cutlass.range_constexpr(cute.size(acc_O)):
+                        sOf[cute.get(cO[e], 0), cute.get(cO[e], 1)] = acc_O[e].to(
+                            cutlass.Float16)
                     cute.arch.barrier()
                     if tidx < self.tile_m:
                         a = sAlpha[tidx]
                         for c in cutlass.range_constexpr(self.tile_hdim):
                             sOf[tidx, c] = sOf[tidx, c] * a
                     cute.arch.barrier()
-                    cute.copy(smem_copy_atom_O, tOsOf, taccOrO)
+                    for e in cutlass.range_constexpr(cute.size(acc_O)):
+                        acc_O[e] = sOf[cute.get(cO[e], 0), cute.get(cO[e], 1)].to(Float32)
                     cute.arch.barrier()
             # P and V are produced in this iteration; re-read them for the PV MMA.
             cute.copy(thr_copy_v, thr_copy_v.partition_S(sV_code), thr_copy_v.retile(rV))
@@ -747,7 +746,8 @@ class ThunderAttentionForward:
             cute.arch.barrier()
 
         # ============================ Epilogue ==========================
-        cute.copy(smem_copy_atom_O, taccOrO, tOsOf)
+        for e in cutlass.range_constexpr(cute.size(acc_O)):
+            sOf[cute.get(cO[e], 0), cute.get(cO[e], 1)] = acc_O[e].to(cutlass.Float16)
         cute.arch.barrier()
         if const_expr(gqa_pack):
             # M row r is the query head kv_head*G + r; all rows share the same
@@ -818,7 +818,38 @@ def _valid(
 
 
 @cute.jit
-def _load_kv_packed(
+def _load_norms(
+    mKN: cute.Tensor,
+    mVN: cute.Tensor,
+    sKNorm: cute.Tensor,
+    sVNorm: cute.Tensor,
+    kv_head: Int32,
+    req_base: Int32,
+    nt: Int32,
+    kv_len: Int32,
+    tidx: Int32,
+    self: cutlass.Constexpr,
+    want_v: cutlass.Constexpr[bool] = True,
+):
+    """Load one tile's per-row fp16 norms (one element per thread).
+
+    Rows past ``kv_len`` are zeroed: the softmax mask drops them, but the PV GEMM
+    multiplies p (= 0) against the dequantized V and 0 * NaN = NaN, so a stale
+    norm there would poison the output.
+    """
+    if tidx < self.tile_n:
+        if nt * self.tile_n + tidx < kv_len:
+            sKNorm[tidx] = mKN[req_base + nt * self.tile_n + tidx, kv_head]
+            if const_expr(want_v):
+                sVNorm[tidx] = mVN[req_base + nt * self.tile_n + tidx, kv_head]
+        else:
+            sKNorm[tidx] = cutlass.Float16(0.0)
+            if const_expr(want_v):
+                sVNorm[tidx] = cutlass.Float16(0.0)
+
+
+@cute.jit
+def _load_kv_packed_guarded(
     mK: cute.Tensor,
     mV: cute.Tensor,
     mKN: cute.Tensor,
@@ -835,7 +866,7 @@ def _load_kv_packed(
     self: cutlass.Constexpr,
     want_v: cutlass.Constexpr[bool] = True,
 ):
-    """Cooperative load of one packed K/V tile plus its norms.
+    """Guarded element-wise load of one packed K/V tile plus its norms.
 
     Rows past ``kv_len`` are left untouched: the softmax mask zeroes them, and
     skipping the global load keeps the last partial tile in bounds.
@@ -878,15 +909,99 @@ def _load_kv_packed(
                     ]
                 else:
                     sV_packed[row, i % self.v_packed_bytes] = cutlass.Uint8(0)
-    if tidx < self.tile_n:
-        if nt * self.tile_n + tidx < kv_len:
-            sKNorm[tidx] = mKN[base + nt * self.tile_n + tidx, kv_head]
-            if const_expr(want_v):
-                sVNorm[tidx] = mVN[base + nt * self.tile_n + tidx, kv_head]
+    _load_norms(mKN, mVN, sKNorm, sVNorm, kv_head, base, nt, kv_len, tidx, self,
+                want_v=want_v)
+
+
+@cute.jit
+def _load_kv_packed_full(
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    sK_packed: cute.Tensor,
+    sV_packed: cute.Tensor,
+    kv_head: Int32,
+    req_base: Int32,
+    nt: Int32,
+    tidx: Int32,
+    self: cutlass.Constexpr,
+    want_v: cutlass.Constexpr[bool] = True,
+):
+    """Two-phase load of a *fully live* packed K/V tile: every global load is
+    issued before any store, so the latencies overlap instead of forming one
+    dependent chain per byte (ablating the load entirely measured 22% of decode).
+
+    Requires ``tile_n * packed_bytes`` to divide ``num_threads``; the caller
+    falls back to the guarded loop otherwise. No bounds check is needed because
+    every row is live.
+    """
+    mKh = mK[None, None, kv_head]
+    k_tot: cutlass.Constexpr[int] = self.tile_n * self.k_packed_bytes
+    k_iters: cutlass.Constexpr[int] = k_tot // self.num_threads
+    k_vals = []
+    for e in cutlass.range_constexpr(k_iters):
+        i = tidx + e * self.num_threads
+        k_vals.append(mKh[req_base + nt * self.tile_n + i // self.k_packed_bytes,
+                          i % self.k_packed_bytes])
+    for e in cutlass.range_constexpr(k_iters):
+        i = tidx + e * self.num_threads
+        sK_packed[i // self.k_packed_bytes, i % self.k_packed_bytes] = k_vals[e]
+    if const_expr(want_v):
+        mVh = mV[None, None, kv_head]
+        v_tot: cutlass.Constexpr[int] = self.tile_n * self.v_packed_bytes
+        v_iters: cutlass.Constexpr[int] = v_tot // self.num_threads
+        v_vals = []
+        for e in cutlass.range_constexpr(v_iters):
+            i = tidx + e * self.num_threads
+            v_vals.append(mVh[req_base + nt * self.tile_n + i // self.v_packed_bytes,
+                              i % self.v_packed_bytes])
+        for e in cutlass.range_constexpr(v_iters):
+            i = tidx + e * self.num_threads
+            sV_packed[i // self.v_packed_bytes, i % self.v_packed_bytes] = v_vals[e]
+
+
+@cute.jit
+def _load_kv_packed(
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    mKN: cute.Tensor,
+    mVN: cute.Tensor,
+    sK_packed: cute.Tensor,
+    sV_packed: cute.Tensor,
+    sKNorm: cute.Tensor,
+    sVNorm: cute.Tensor,
+    kv_head: Int32,
+    req_base: Int32,
+    nt: Int32,
+    kv_len: Int32,
+    tidx: Int32,
+    self: cutlass.Constexpr,
+    want_v: cutlass.Constexpr[bool] = True,
+):
+    """Load one packed K/V tile plus its norms.
+
+    Fully live tiles take the two-phase path; a partial tail tile falls back to
+    the guarded element-wise loop, which zero-fills the dead rows.
+    """
+    k_tot: cutlass.Constexpr[int] = self.tile_n * self.k_packed_bytes
+    v_tot: cutlass.Constexpr[int] = self.tile_n * self.v_packed_bytes
+    divisible: cutlass.Constexpr[bool] = (
+        k_tot % self.num_threads == 0
+        and (not want_v or v_tot % self.num_threads == 0)
+    )
+    if const_expr(divisible):
+        if (nt + 1) * self.tile_n <= kv_len:
+            _load_kv_packed_full(mK, mV, sK_packed, sV_packed, kv_head, req_base,
+                                 nt, tidx, self, want_v=want_v)
+            _load_norms(mKN, mVN, sKNorm, sVNorm, kv_head, req_base, nt, kv_len,
+                        tidx, self, want_v=want_v)
         else:
-            sKNorm[tidx] = cutlass.Float16(0.0)
-            if const_expr(want_v):
-                sVNorm[tidx] = cutlass.Float16(0.0)
+            _load_kv_packed_guarded(mK, mV, mKN, mVN, sK_packed, sV_packed, sKNorm,
+                                    sVNorm, kv_head, req_base, nt, kv_len, tidx,
+                                    self, want_v=want_v)
+    else:
+        _load_kv_packed_guarded(mK, mV, mKN, mVN, sK_packed, sV_packed, sKNorm,
+                                sVNorm, kv_head, req_base, nt, kv_len, tidx,
+                                self, want_v=want_v)
 
 
 @cute.jit
@@ -1049,15 +1164,71 @@ def _split_buffers(num_reqs: int, num_splits: int, hq: int, hd: int, device, dty
     return bufs
 
 
+try:  # pragma: no cover - exercised on GPU
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _merge_splits_kernel(
+        po_ptr, pm_ptr, pl_ptr, o_ptr, qstart_ptr, n_splits,
+        HQ: tl.constexpr, HD: tl.constexpr,
+    ):
+        """Reduce one (request, head) row's split-K partials into the output row.
+
+        Same online-softmax algebra the kernel uses across tiles: with running
+        max ``m``, each split contributes ``exp(m_s - m)`` and the accumulator is
+        rescaled by ``exp(m_old - m)``. Decode has exactly one query row per
+        request, so ``q_start[req]`` is the output row index.
+        """
+        row = tl.program_id(0)
+        req = row // HQ
+        head = row % HQ
+        offs = tl.arange(0, HD)
+        m = float("-inf")
+        l = 0.0
+        acc = tl.zeros((HD,), tl.float32)
+        for split in range(0, n_splits):
+            base = (req * n_splits + split) * HQ + head
+            pm = tl.load(pm_ptr + base)
+            pl = tl.load(pl_ptr + base)
+            po = tl.load(po_ptr + base * HD + offs)
+            m_new = tl.maximum(m, pm)
+            # A split with no live tile carries -inf: clamp so the exponentials
+            # stay finite (the torch reference guards the same way).
+            m_safe = tl.where(m_new > float("-inf"), m_new, 0.0)
+            w = tl.exp(pm - m_safe)
+            acc = acc * tl.exp(m - m_safe) + po * w
+            l = l * tl.exp(m - m_safe) + pl * w
+            m = m_new
+        res = tl.where(l > 0.0, acc / tl.maximum(l, 1e-20), 0.0)
+        out_row = tl.load(qstart_ptr + req)
+        tl.store(o_ptr + out_row * HQ * HD + head * HD + offs,
+                 res.to(o_ptr.dtype.element_ty))
+
+    _HAS_MERGE_KERNEL = True
+except Exception:  # pragma: no cover - triton is present in the pinned image
+    _HAS_MERGE_KERNEL = False
+
+
 def _merge_splits(part_o, part_m, part_l, num_reqs, num_splits, hq, hd, o3, q_start):
     """Rescale and reduce split-K partials, then scatter into the output rows.
 
-    Same online-softmax algebra the kernel uses across tiles: with global
-    ``M = max_s m_s``, each split contributes ``exp(m_s - M)``.
+    One fused kernel, not a torch chain: the chain is ten launches over tiny
+    tensors (a decode merge is 32 rows of 128 floats) and measured 13% of 4k
+    decode at S=8, 1.9% at 32k. Falls back to the equivalent torch expression if
+    Triton is unavailable.
     """
     import torch
 
     S = int(num_splits)
+    if S <= 1 or num_reqs <= 0:
+        return
+    if _HAS_MERGE_KERNEL:
+        _merge_splits_kernel[(num_reqs * hq,)](
+            part_o, part_m, part_l, o3, q_start, S, HQ=hq, HD=hd,
+        )
+        return
+
     po = part_o[: num_reqs * S].view(num_reqs, S, hq, hd)
     pm = part_m[: num_reqs * S].view(num_reqs, S, hq)
     pl = part_l[: num_reqs * S].view(num_reqs, S, hq)

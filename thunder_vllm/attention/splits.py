@@ -47,17 +47,22 @@ def choose_split_count(
     num_q_heads: int,
     *,
     tile_n: int = 64,
-    target_ctas: int = 128,
-    max_splits: int = 4,
+    target_ctas: int = 256,
+    max_splits: int = 8,
     min_tiles_per_split: int = 2,
 ) -> int:
     """Smallest split-K count that reaches roughly ``target_ctas`` CTAs.
 
-    Measured on B200/Qwen3-8B: the split-K knee is ~128 CTAs (S=4 at 32 q-heads,
-    batch 1); S=8/16 add nothing and S=32 only ~10-15% at the longest contexts,
-    so decode is FROZEN at ``max_splits=4``. Counts stay powers of two so the
-    number of distinct captured launches stays small, and a split is never
-    finer than ``min_tiles_per_split`` tiles (an empty split is pure merge cost).
+    Measured on B200/Qwen3-8B, batch 1: the knee is ~256 CTAs (S=8 at 32
+    q-heads), not the ~128 it used to be. The kernel's shared-memory footprint
+    now fits two CTAs per SM (89 KB, after the output staging buffer went fp16),
+    so the extra CTAs actually get resident instead of queueing; before that
+    change S=8 measured identical to S=4. S=16 is flat again (3+ CTAs/SM does
+    not fit), and S stays capped at 8.
+
+    Counts stay powers of two so the number of distinct captured launches stays
+    small, and a split is never finer than ``min_tiles_per_split`` tiles (an
+    empty split is pure merge cost).
     """
     if seq_len <= 0 or batch <= 0 or num_q_heads <= 0:
         return 1

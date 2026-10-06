@@ -20,8 +20,8 @@ def test_prefill_and_mha_never_split():
 
 
 def test_decode_gqa_splits_like_choose_split_count():
-    assert decode_split_count(32768, 1, 32, is_prefill=False, num_kv_groups=4) == 4
-    assert decode_split_count(4096, 1, 32, is_prefill=False, num_kv_groups=4) == 4
+    assert decode_split_count(32768, 1, 32, is_prefill=False, num_kv_groups=4) == 8
+    assert decode_split_count(4096, 1, 32, is_prefill=False, num_kv_groups=4) == 8
     assert decode_split_count(64, 1, 32, is_prefill=False, num_kv_groups=4) == 1
 
 
@@ -32,11 +32,12 @@ def test_defaults_are_conservative():
     assert choose_split_count(4096, 0, 32) == 1
 
 
-def test_qwen3_8b_batch1_knee_is_four():
-    # 32 q-heads, batch 1: the measured knee is 128 CTAs == S=4, and S is
-    # frozen at 4 regardless of how long the context gets.
+def test_qwen3_8b_batch1_knee_is_eight():
+    # 32 q-heads, batch 1: the measured knee is 256 CTAs == S=8, and S is frozen
+    # at 8 regardless of how long the context gets. (It was 4 while the kernel
+    # only fit one CTA per SM; at two CTAs per SM the extra splits get resident.)
     for seq in (4096, 8192, 16384, 32768):
-        assert choose_split_count(seq, 1, 32) == 4
+        assert choose_split_count(seq, 1, 32) == 8
 
 
 def test_more_heads_needs_less_splitting():
@@ -57,4 +58,4 @@ def test_powers_of_two_and_bounded():
         for batch in (1, 2, 8):
             for heads in (8, 16, 32):
                 s = choose_split_count(seq, batch, heads)
-                assert s in (1, 2, 4), s
+                assert s in (1, 2, 4, 8), s
