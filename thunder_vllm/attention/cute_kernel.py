@@ -47,6 +47,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cute.runtime import from_dlpack
 
 from thunder_vllm.utils.logging import get_logger
 
@@ -1262,6 +1263,30 @@ def _fast_key(kernel_cfg, shapes, num_reqs, max_query_len, num_splits,
     )
 
 
+# The CuTe tensors a launch needs are stable for a given set of buffers: the gather
+# buffers, the split partials and the metadata tensors are all persistent, so the
+# from_dlpack wrappers can be reused instead of rebuilt on every one of the 36
+# launches per token. Measured: the plumbing bucket is 0.25 ms per launch, which is
+# ~54% of a decode ITL at 4k. The cache holds a reference to each tensor so a
+# recycled id() cannot alias a dead buffer, and it is tiny -- a process sees a
+# handful of distinct buffer sets.
+_ARGS_CACHE: dict = {}
+_ARGS_CACHE_MAX = 16
+
+
+def _dlpack_cached(tensors):
+    """``[from_dlpack(t) for t in tensors]``, memoized on the buffer identities."""
+    key = tuple(id(t) for t in tensors)
+    hit = _ARGS_CACHE.get(key)
+    if hit is not None:
+        return hit[0]
+    wrapped = [from_dlpack(t) for t in tensors]
+    if len(_ARGS_CACHE) >= _ARGS_CACHE_MAX:
+        _ARGS_CACHE.clear()
+    _ARGS_CACHE[key] = (wrapped, list(tensors))
+    return wrapped
+
+
 def launch_thunder_attention(
     kernel: ThunderAttentionForward,
     q,
@@ -1298,7 +1323,6 @@ def launch_thunder_attention(
     decode-only (``max_query_len == 1``) and requires ``qhead_per_kvhead > 1``.
     """
     import torch
-    from cutlass.cute.runtime import from_dlpack
 
     if quantizer is None:
         raise ValueError("quantizer is required to source the K/V LUTs")
@@ -1339,7 +1363,7 @@ def launch_thunder_attention(
     o3 = out.reshape(q.shape[0], q.shape[1], q.shape[2]).contiguous()
 
     _torch_args = [q.contiguous(), k, v, kn, vn, k_lut, v_lut, o3, seq_lens, q_start]
-    args = [from_dlpack(t) for t in _torch_args]
+    args = _dlpack_cached(_torch_args)
     stream = torch.cuda.current_stream().cuda_stream
     import cuda.bindings.driver as cuda
 
@@ -1404,15 +1428,10 @@ def launch_thunder_attention(
     part_o_t, part_m_t, part_l_t = _split_buffers(
         num_reqs, S, hq, hd, q.device, q.dtype
     )
-    args = args + [
-        from_dlpack(part_o_t),
-        from_dlpack(part_m_t),
-        from_dlpack(part_l_t),
-    ]
     if indptr is None:
         indptr = seq_lens
-    args = args + [from_dlpack(indptr)]
     _torch_args += [part_o_t, part_m_t, part_l_t, indptr]
+    args = _dlpack_cached(_torch_args)
 
     _COUNTS["launch_indirect" if indirect else "launch_reqmajor"] += 1
     if _TIME:
