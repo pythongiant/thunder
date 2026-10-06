@@ -207,3 +207,18 @@ batch 1 at 4k, and the 4k path is fine.
 - Next: bisect inside the kernel for the many-request prefill (the row base
   `req * kv_row_stride` with `num_reqs` = 1024 and a 16-row query block is the prime
   suspect, e.g. an index or a grid bound that assumes one query row per request).
+
+## 16. Host timing buckets that average over capture — LIVED
+
+`THUNDER_TIME_LAUNCH=1` accumulates process-wide sums and dumps means at exit, so
+the numbers include the CUDA-graph capture and the engine warmup. `_FASTLAUNCH` is
+deliberately disabled while capturing (`if _FASTLAUNCH and not capturing`), so
+those calls re-trace MLIR (~0.4 s each) and swamp the mean: a 4k run reported
+`kernel=141.99ms` over `n=540`, which would be 77 s of host time inside a 4.3 s
+generation. The `plumbing` bucket is small and believable in the same dump
+(0.25 ms), which is how the pollution is visible.
+
+- Detection: bucket mean x call count far exceeding the wall time of the run.
+- Mitigation: read `plumbing` only, or reset the counters after warmup before
+  attributing a decode step. `docs/FAILURE_MODES.md` 3 already warns that these
+  buckets measure dispatch, not execution.
