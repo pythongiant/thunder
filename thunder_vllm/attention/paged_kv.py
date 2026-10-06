@@ -587,10 +587,21 @@ def make_paged_kv_manager(
     *,
     max_num_reqs: int,
     max_model_len: int,
+    max_blocks_per_req: int | None = None,
     device: torch.device | str = "cuda",
 ) -> PagedKVManager:
-    """Convenience constructor deriving the worst-case block count."""
-    blocks = (int(max_model_len) + layout.block_size - 1) // layout.block_size
+    """Convenience constructor deriving the worst-case block count.
+
+    ``max_blocks_per_req`` overrides the derived ``ceil(max_model_len /
+    block_size)``. Pass it from the engine's own block-table width: vLLM pads
+    that table (e.g. 260 -> 264 blocks for a 4160-token limit), and a manager
+    sized only from ``max_model_len`` then rejects the table it is handed.
+    """
+    blocks = (
+        int(max_blocks_per_req)
+        if max_blocks_per_req is not None
+        else (int(max_model_len) + layout.block_size - 1) // layout.block_size
+    )
     return PagedKVManager(
         layout,
         max_num_reqs=max_num_reqs,

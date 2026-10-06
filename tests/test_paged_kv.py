@@ -28,6 +28,46 @@ def _fill_cache(layout, q, kv, scales, n_tokens, seed=0):
     return key, value, slots
 
 
+def test_manager_accepts_engine_padded_block_table():
+    """The engine pads its block table past ceil(max_model_len / block_size).
+
+    For a 4160-token limit at block_size 16 that is 260 blocks of content in a
+    264-column table (vLLM pads to a multiple of 8). A manager sized only from
+    the token limit rejects the table it is handed, which is what broke
+    ``LLM(max_model_len=4160)`` end to end; sizing it from the table width (what
+    ``ThunderAttentionImpl.forward`` now passes) accepts it.
+    """
+    layout = ThunderCacheLayout(
+        num_kv_heads=4, head_dim=128, k_bits=4, v_bits=4, block_size=16
+    )
+    q = ThunderQuantizer(128, 4, 4)
+    nb = 64
+    kv, scales = allocate_kv_cache(nb, 16, 4, 128, 4, 4, device="cpu")
+    _fill_cache(layout, q, kv, scales, nb * 16)
+
+    padded = 264
+    block_table = torch.zeros((1, padded), dtype=torch.long)
+    block_table[0, :4] = torch.arange(4)          # 4 live blocks == 64 tokens
+    seq_lens = torch.tensor([64])
+
+    narrow = make_paged_kv_manager(
+        layout, max_num_reqs=1, max_model_len=4160, device="cpu"
+    )
+    assert narrow.max_blocks_per_req == 260
+    with pytest.raises(ValueError, match="exceeds reserved"):
+        narrow.gather_packed_tiles(block_table, kv, scales, seq_lens=seq_lens)
+
+    wide = make_paged_kv_manager(
+        layout, max_num_reqs=1, max_model_len=4160, max_blocks_per_req=padded,
+        device="cpu",
+    )
+    out = wide.gather_packed_tiles(block_table, kv, scales, seq_lens=seq_lens)
+    assert wide.max_blocks_per_req == padded
+    # The four live blocks are gathered in order, same as the narrow manager.
+    ref = narrow.gather_packed_tiles(block_table[:, :4], kv, scales, seq_lens=seq_lens)
+    assert torch.equal(out.k_packed[:4], ref.k_packed[:4])
+
+
 def test_gather_matches_block_table_walk():
     layout = ThunderCacheLayout(
         num_kv_heads=4, head_dim=128, k_bits=4, v_bits=4, block_size=16

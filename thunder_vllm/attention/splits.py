@@ -5,6 +5,42 @@ from __future__ import annotations
 import math
 
 
+def splits_allowed(is_prefill: bool, num_kv_groups: int) -> bool:
+    """Whether split-K decode can pay for its merge at all.
+
+    Prefill (a multi-token query block) and MHA (``num_kv_groups <= 1``) never
+    split in the engine: prefill keeps the baseline schedule, and with one CTA
+    per head there is no occupancy to buy. Kept separate from
+    :func:`choose_split_count` because the caller needs this answer *before*
+    resolving ``seq_len`` (which can require a device sync, illegal under CUDA
+    graph capture).
+    """
+    return not is_prefill and num_kv_groups > 1
+
+
+def decode_split_count(
+    seq_len: int,
+    num_reqs: int,
+    num_q_heads: int,
+    *,
+    is_prefill: bool,
+    num_kv_groups: int,
+    tile_n: int = 64,
+) -> int:
+    """Split-K count for a decode step under the engine policy.
+
+    Single source of truth for the engine and for the benchmark harness, so a
+    measured run is the shipped configuration. Note the engine only reaches
+    this with ``is_prefill`` False: a one-token decode step is not causal in the
+    kernel's sense (``backend.py`` derives ``is_causal = is_prefill or
+    max_query_len > 1``), so a causal *attention* shape still splits when it is
+    a one-row decode.
+    """
+    if not splits_allowed(is_prefill, num_kv_groups):
+        return 1
+    return choose_split_count(seq_len, num_reqs, num_q_heads, tile_n=tile_n)
+
+
 def choose_split_count(
     seq_len: int,
     batch: int,

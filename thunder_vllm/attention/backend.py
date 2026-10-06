@@ -554,15 +554,18 @@ class ThunderAttentionImpl(AttentionImplBase):
         *,
         max_num_reqs: int,
         max_model_len: int,
+        max_blocks_per_req: int | None = None,
     ) -> PagedKVManager:
         dev = torch.device(device)
         key = (dev.type, dev.index, self.layout.block_size, self.layout.num_kv_heads,
-               self.cfg.k_bits, self.cfg.v_bits, int(max_num_reqs), int(max_model_len))
+               self.cfg.k_bits, self.cfg.v_bits, int(max_num_reqs), int(max_model_len),
+               int(max_blocks_per_req) if max_blocks_per_req is not None else -1)
         mgr = _PAGED_CACHE.get(key)
         if mgr is None:
             mgr = make_paged_kv_manager(
                 self.layout, max_num_reqs=max_num_reqs,
-                max_model_len=max_model_len, device=device,
+                max_model_len=max_model_len,
+                max_blocks_per_req=max_blocks_per_req, device=device,
             )
             # Allocation deferred to the first gather so the indirect path can
             # cap it by the physical block count.
@@ -746,10 +749,16 @@ class ThunderAttentionImpl(AttentionImplBase):
         if _cap:
             _ev0 = torch.cuda.Event(enable_timing=True)
             _ev0.record()
+        # Size the gather reservation from the engine's own block table: vLLM
+        # pads that table past ceil(max_model_len / block_size) (4160 tokens ->
+        # 264 blocks at block_size 16), and a manager sized only from the token
+        # limit rejects the table it is handed.
+        _bt = getattr(attn_metadata, "block_table", None)
         paged = self._ensure_paged(
             query.device,
-            max_num_reqs=max(_cap_reqs, 1),
+            max_num_reqs=max(_cap_reqs, 1, int(_bt.shape[0]) if _bt is not None else 0),
             max_model_len=_cap_len,
+            max_blocks_per_req=int(_bt.shape[1]) if _bt is not None else None,
         )
         # Live-block count for the gather must be known on the HOST: under
         # CUDA-graph capture a `.item()` on the device seq_lens is a D2H sync and
@@ -975,7 +984,10 @@ class ThunderAttentionImpl(AttentionImplBase):
         forced = os.environ.get("THUNDER_SPLITS")
         if forced:
             return max(1, int(forced))
-        if is_causal or self.num_kv_groups <= 1:
+        from thunder_vllm.attention.splits import decode_split_count, splits_allowed
+
+        # ``is_causal`` here is the engine's "this step is prefill-like" flag.
+        if not splits_allowed(is_causal, self.num_kv_groups):
             return 1
         n_reqs = max(int(attn_metadata.num_reqs), 1)
         sl_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
@@ -985,10 +997,14 @@ class ThunderAttentionImpl(AttentionImplBase):
             seq_len = int(attn_metadata.seq_lens[:n_reqs].max().item())
         else:
             return 1
-        from thunder_vllm.attention.splits import choose_split_count
 
-        return choose_split_count(
-            seq_len, n_reqs, self.num_heads, tile_n=self.cfg.n_block_size
+        return decode_split_count(
+            seq_len,
+            n_reqs,
+            self.num_heads,
+            is_prefill=is_causal,
+            num_kv_groups=self.num_kv_groups,
+            tile_n=self.cfg.n_block_size,
         )
 
     def do_kv_cache_update(self, *args: Any, **kwargs: Any) -> None:

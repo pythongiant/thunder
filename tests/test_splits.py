@@ -2,7 +2,27 @@
 
 from __future__ import annotations
 
-from thunder_vllm.attention.splits import choose_split_count
+from thunder_vllm.attention.splits import (
+    choose_split_count,
+    decode_split_count,
+    splits_allowed,
+)
+
+
+def test_prefill_and_mha_never_split():
+    # The engine refuses split-K for prefill-style steps and for MHA: prefill
+    # keeps the baseline schedule and MHA has no occupancy to buy. Pin it.
+    assert decode_split_count(32768, 1, 32, is_prefill=True, num_kv_groups=4) == 1
+    assert decode_split_count(32768, 1, 32, is_prefill=False, num_kv_groups=1) == 1
+    assert splits_allowed(True, 4) is False
+    assert splits_allowed(False, 1) is False
+    assert splits_allowed(False, 4) is True
+
+
+def test_decode_gqa_splits_like_choose_split_count():
+    assert decode_split_count(32768, 1, 32, is_prefill=False, num_kv_groups=4) == 4
+    assert decode_split_count(4096, 1, 32, is_prefill=False, num_kv_groups=4) == 4
+    assert decode_split_count(64, 1, 32, is_prefill=False, num_kv_groups=4) == 1
 
 
 def test_defaults_are_conservative():

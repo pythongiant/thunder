@@ -40,7 +40,16 @@ SHAPES = [
 
 
 def _reference(q, k_hat, v_hat, causal, scale):
-    """fp32 SDPA on the *dequantized* K/V (GQA expanded)."""
+    """fp32 SDPA on the *dequantized* K/V (GQA expanded).
+
+    The causal mask is bottom-right aligned (query row ``i`` sees every key up to
+    ``(S - L) + i``). That is the kernel's ``_valid`` rule -- ``kv <= (kv_len -
+    q_len) + q_off + row`` -- and it is what a continuation prefill means. Passing
+    ``is_causal=True`` to ``F.scaled_dot_product_attention`` instead applies an
+    upper-left mask whenever ``L != S``, which for a 128-query/2048-key prefill
+    exposes only the first 128 keys and for a one-row decode exposes a single
+    key, i.e. it stops describing the operator under test.
+    """
     q_t = q.transpose(0, 1)  # (Hq, Nq, D)
     hq, nq, d = q_t.shape
     hk = k_hat.shape[1]
@@ -49,14 +58,55 @@ def _reference(q, k_hat, v_hat, causal, scale):
     v_t = v_hat.transpose(0, 1)
     k_t = k_t.repeat_interleave(group, dim=0)
     v_t = v_t.repeat_interleave(group, dim=0)
+    mask = None
+    if causal:
+        sk = k_t.shape[1]
+        q_pos = torch.arange(nq, device=q.device).view(nq, 1) + (sk - nq)
+        kv_pos = torch.arange(sk, device=q.device).view(1, sk)
+        mask = kv_pos <= q_pos
     out = F.scaled_dot_product_attention(
         q_t.float().unsqueeze(0),
         k_t.float().unsqueeze(0),
         v_t.float().unsqueeze(0),
-        is_causal=causal,
+        attn_mask=mask,
         scale=scale,
     )[0]
     return out.transpose(0, 1)
+
+
+def _build_case(nq, nk, hq, hk, d, k_bits=4, v_bits=4, causal=True, block_size=16,
+                device="cuda"):
+    """Random K/V -> quantized paged cache -> ``(q, kv, scales, layout, quant, oracle)``.
+
+    ``block_size`` must stay 16: :func:`_run_kernel` derives its block table from
+    that literal. The cache is handed over in the layout's 4-D canonical form
+    ``(blocks, Hk, block_size, slot)``; ``k_codes``/``k_norm`` are the only
+    transpose boundary, so never reshape it into a "flat" 3-D view by hand.
+    """
+    torch.manual_seed(0)
+    q = torch.randn(nq, hq, d, device=device, dtype=torch.float16)
+    k = torch.randn(nk, hk, d, device=device, dtype=torch.float16)
+    v = torch.randn(nk, hk, d, device=device, dtype=torch.float16)
+
+    quant = ThunderQuantizer(d, k_bits, v_bits, device=device)
+    layout = ThunderCacheLayout(
+        num_kv_heads=hk, head_dim=d, k_bits=k_bits, v_bits=v_bits, block_size=block_size
+    )
+    nb = (nk + block_size - 1) // block_size
+    kv, scales = allocate_kv_cache(nb, block_size, hk, d, k_bits, v_bits, device=device)
+    slots = torch.arange(nk, device=device, dtype=torch.long)
+    reshape_and_cache_ref(k, v, slots, kv, scales, quant, layout)
+
+    rows = nb * block_size
+    k_hat = quant.dequantize_k(
+        layout.k_codes(kv).reshape(rows, hk, layout.k_packed_bytes)[:nk],
+        layout.k_norm(scales).reshape(rows, hk)[:nk],
+    )
+    v_hat = quant.dequantize_v(
+        layout.v_codes(kv).reshape(rows, hk, layout.v_packed_bytes)[:nk],
+        layout.v_norm(scales).reshape(rows, hk)[:nk],
+    )
+    return q, kv, scales, layout, quant, _reference(q, k_hat, v_hat, causal, d**-0.5)
 
 
 @pytest.mark.parametrize("causal", [True, False])
@@ -67,43 +117,11 @@ def test_kernel_matches_dequant_reference(causal, k_bits, v_bits):
         launch_thunder_attention,
     )
 
-    torch.manual_seed(0)
-    device = "cuda"
-    nq, nk, batch, hq, hk, d = 128, 2048, 1, 32, 8, 128
+    nq, nk, hq, hk, d = 128, 2048, 32, 8, 128
     scale = d**-0.5
-
-    q = torch.randn(nq, hq, d, device=device, dtype=torch.float16)
-    k = torch.randn(nk, hk, d, device=device, dtype=torch.float16)
-    v = torch.randn(nk, hk, d, device=device, dtype=torch.float16)
-
-    quant = ThunderQuantizer(d, k_bits, v_bits, device=device)
-    layout = ThunderCacheLayout(
-        num_kv_heads=hk, head_dim=d, k_bits=k_bits, v_bits=v_bits, block_size=16
+    q, kv, scales, layout, quant, ref = _build_case(
+        nq, nk, hq, hk, d, k_bits, v_bits, causal
     )
-    nb = (nk + 15) // 16
-    kv, scales = allocate_kv_cache(nb, 16, hk, d, k_bits, v_bits, device=device)
-    slots = torch.arange(nk, device=device, dtype=torch.long)
-
-    kv_flat = kv.reshape(-1, layout.kv_slot_bytes)
-    scales_flat = scales.reshape(-1, hk, 2)
-    reshape_and_cache_ref(
-        k, v, slots,
-        kv_flat.reshape(nb, 16, layout.kv_slot_bytes),
-        scales_flat.reshape(nb, 16, hk, 2),
-        quant,
-        layout,
-    )
-
-    k_hat = quant.dequantize_k(
-        layout.k_codes(kv).reshape(nb * 16, hk, layout.k_packed_bytes)[:nk],
-        scales_flat.reshape(nb * 16, hk, 2)[:nk, :, 0],
-    )
-    v_hat = quant.dequantize_v(
-        layout.v_codes(kv).reshape(nb * 16, hk, layout.v_packed_bytes)[:nk],
-        scales_flat.reshape(nb * 16, hk, 2)[:nk, :, 1],
-    )
-
-    ref = _reference(q, k_hat, v_hat, causal, scale)
     out = torch.zeros_like(q)
 
     try:
@@ -117,7 +135,8 @@ def test_kernel_matches_dequant_reference(causal, k_bits, v_bits):
     torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
 
 
-def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale, causal):
+def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale, causal,
+                num_splits: int = 1):
     """Mirror the plugin contract: rotate Q in, un-rotate O out.
 
     The kernel scores in the rotated basis (exact, since the rotation is
@@ -143,6 +162,7 @@ def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale
             "max_blocks_per_req": block_table.shape[1],
             "block_table": block_table,
             "seq_lens": torch.tensor([nk], device=q.device, dtype=torch.int32),
+            "query_start_loc": torch.tensor([0, nq], device=q.device, dtype=torch.int32),
             "slot_mapping": torch.arange(nq, device=q.device, dtype=torch.long),
         },
     )()
@@ -156,5 +176,37 @@ def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale
     rot = quant.rotation
     q_rot = rot.rotate(q.float()).to(q.dtype)
     out = torch.zeros_like(q)
-    launcher(kernel, q_rot, gathered, out, metadata, scale, quantizer=quant)
+    launcher(
+        kernel, q_rot, gathered, out, metadata, scale,
+        quantizer=quant, num_splits=num_splits,
+    )
     return rot.inverse(out.float()).to(q.dtype)
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("num_splits", [2, 4])
+def test_split_k_decode_matches_dequant_reference(causal, num_splits):
+    """Split-K decode parity against the dequant oracle.
+
+    Splitting is a distinct reduction -- per-split max/sum rescale in the
+    kernel plus a host-side merge and scatter -- and causal decode is exactly
+    where the shipped policy declines to split, so no other test covers it.
+    """
+    from thunder_vllm.attention.cute_kernel import (
+        KernelNotReadyError,
+        launch_thunder_attention,
+    )
+
+    nq, nk, hq, hk, d = 1, 8192, 32, 8, 128
+    scale = d**-0.5
+    q, kv, scales, layout, quant, ref = _build_case(nq, nk, hq, hk, d, 4, 4, causal)
+
+    try:
+        out = _run_kernel(
+            q, kv, scales, layout, launch_thunder_attention, quant,
+            nq, nk, hq, hk, d, scale, causal, num_splits=num_splits,
+        )
+    except KernelNotReadyError:
+        pytest.skip("kernel not ready")
+
+    torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
