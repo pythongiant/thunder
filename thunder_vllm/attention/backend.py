@@ -260,10 +260,10 @@ class ThunderCuteConfig:
         )
 
     def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool,
-                   num_reqs: int = 1) -> tuple:
+                   num_reqs: int = 1, max_query_len: int | None = None) -> tuple:
         # The tile comes from the schedule and the batch, not from the env
         # defaults, so the key has to carry the tile actually compiled.
-        tile = tile_shape(bool(is_causal), num_reqs)
+        tile = tile_shape(bool(is_causal), num_reqs, max_query_len)
         return (
             head_dim,
             self.k_bits,
@@ -634,10 +634,12 @@ class ThunderAttentionImpl(AttentionImplBase):
         self._paged = mgr
         return self._paged
 
-    def get_kernel(self, head_dim: int, is_causal: bool, num_reqs: int = 1) -> Any:
+    def get_kernel(self, head_dim: int, is_causal: bool, num_reqs: int = 1,
+                   max_query_len: int | None = None) -> Any:
         """Compile (once) and cache the kernel for this shape and schedule."""
-        tile = tile_shape(bool(is_causal), num_reqs)
-        key = self.cfg.kernel_key(head_dim, self.num_kv_heads, is_causal, num_reqs)
+        tile = tile_shape(bool(is_causal), num_reqs, max_query_len)
+        key = self.cfg.kernel_key(head_dim, self.num_kv_heads, is_causal, num_reqs,
+                                  max_query_len)
         kernel = _KERNEL_CACHE.get(key)
         if kernel is None:
             mod = _kernel_module()
@@ -768,7 +770,9 @@ class ThunderAttentionImpl(AttentionImplBase):
 
         is_causal = attn_metadata.is_prefill or attn_metadata.max_query_len > 1
         kernel = self.get_kernel(
-            self.head_size, is_causal, int(getattr(attn_metadata, "num_reqs", 0) or 1)
+            self.head_size, is_causal,
+            int(getattr(attn_metadata, "num_reqs", 0) or 1),
+            int(getattr(attn_metadata, "max_query_len", 0) or 0) or None,
         )
 
         # The KV-cache write is a separate op in vLLM main; if the runner has
