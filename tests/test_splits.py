@@ -20,12 +20,16 @@ def test_prefill_and_mha_never_split():
 
 
 def test_decode_splits_as_fine_as_the_tile_budget_allows():
-    # The knee tracks the tile shape: 16 at the current decode tile (32 rows,
-    # 32-wide KV tiles), where S=16 measures 0.776 ms against S=8's 1.225 at
-    # batch 1/32k, while S=32/64 are flat at 32k and worse at 4k.
+    # The knee tracks the grid: GQA packing puts KV heads on the head axis, so
+    # the CTA count needs 4x the splits -- 64 at 32k, where S=64 measures
+    # 0.215 ms against S=16's 0.537 at batch 1, and 128 is flat.
+    assert choose_split_count(4096) == 16        # 128 tiles / 8
+    assert choose_split_count(8192) == 32        # 256 tiles / 8
+    assert choose_split_count(16384) == 64       # 512 tiles / 8
+    assert choose_split_count(32768) == 64       # capped at max_splits
     for seq in (4096, 8192, 16384, 32768):
-        assert decode_split_count(seq, is_prefill=False, num_kv_groups=4) == 16
-        assert choose_split_count(seq) == 16
+        assert decode_split_count(seq, is_prefill=False, num_kv_groups=4) == \
+            choose_split_count(seq)
 
 
 def test_short_contexts_are_capped_by_the_tile_budget():
@@ -42,4 +46,4 @@ def test_short_contexts_are_capped_by_the_tile_budget():
 def test_counts_are_powers_of_two_and_bounded():
     for seq in (64, 128, 256, 1024, 4096, 20000, 32768):
         s = choose_split_count(seq)
-        assert s in (1, 2, 4, 8, 16), s
+        assert s in (1, 2, 4, 8, 16, 32, 64), s

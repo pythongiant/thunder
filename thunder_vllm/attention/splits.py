@@ -24,19 +24,22 @@ def choose_split_count(
     seq_len: int,
     *,
     tile_n: int | None = None,
-    max_splits: int = 16,
+    max_splits: int = 64,
     min_tiles_per_split: int = 8,
 ) -> int:
     """Split-K count for a decode step: as fine as the tile budget allows.
 
-    The knee tracks the tile: at the old 64-row/64-wide shape it was 8, and at
-    the current decode tile (32 rows, 32-wide KV tiles) it is 16 -- measured at
-    batch 1, 32k, S=16 is 0.776 ms against S=8's 1.225 (-37%), with S=32/64 flat
-    at 32k and *worse* at 4k, where the merge cost starts to dominate. At batch
-    16 the curve is flat from 8 to 16, so 16 is safe there too.
+    The knee tracks the *grid*, and the grid changed twice. It was 8 at the old
+    64-row/64-wide tile, 16 at the current decode tile (32 rows, 32-wide KV
+    tiles), and 64 once GQA packing took over the head axis -- that schedule puts
+    KV heads (8) on the grid instead of query heads (32), so the same CTA count
+    needs 4x the splits. Measured at batch 1/32k: S=16 0.537 ms, S=32 0.318,
+    S=64 0.215, S=128 0.218 (flat). At batch 16 the curve is flat from 8 to 32, so
+    64 costs nothing there.
 
     ``min_tiles_per_split=8`` is what keeps short contexts from over-splitting:
-    at 4k (128 tiles) it yields 16, and a 512-token context gets 2.
+    at 4k (128 tiles) it yields 16, which measures 0.077 ms against S=8's 0.142,
+    and a 512-token context gets 2.
     """
     if seq_len <= 0:
         return 1
