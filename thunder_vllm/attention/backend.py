@@ -27,9 +27,56 @@ from thunder_vllm.attention.metadata import (
     ThunderMetadataBuilder,
 )
 from thunder_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
+from thunder_vllm.attention.tile_shape import tile_shape
 from thunder_vllm.utils.logging import env_flag, get_logger, log_once
 
 logger = get_logger("attention.backend")
+
+# Request-major gather budget. That path keeps request identity in the row stride
+# (row = req * max_blocks_per_req + block), so its reservation is the WORST case
+# max_num_reqs * max_blocks_per_req block-rows and cannot be trimmed without
+# breaking the layout. On Qwen3-8B that reservation is 4.2 GiB at 4k, 8.2 GiB at
+# 8k and 33 GiB at 32k, against a 178 GiB device that already holds a 98.9 GiB KV
+# cache -- the 32k e2e died in ``reserve`` with CUDA OOM. The CSR path packs the
+# live blocks densely and reserves by the physical block count (32k: 180k
+# block-rows = 3.0 GiB), so it takes over past this budget.
+#
+# The budget is a CONSTANT, not a fraction of free memory: the two paths share one
+# reservation and whichever reserves first fixes its size, so a path that flips
+# with memory pressure would make the other path write past the buffer.
+#
+# It sits between what 16k needs (15.5 GiB) and what 32k needs (30.7 GiB) on
+# purpose: the CSR path is NOT
+# capturable in this stack (deterministic cudaErrorStreamCaptureUnsupported, see
+# docs/FAILURE_MODES.md 14), so switching to it anywhere the request-major
+# reservation still fits would turn a working context length into a startup
+# failure. 16k needs 16.4 GiB and stays on request-major; only 32k, which cannot
+# fit at all, attempts the dense path.
+REQUEST_MAJOR_GATHER_BUDGET_BYTES = 24 << 30
+
+
+def _request_major_gather_bytes(paged, layout, num_kv_heads: int) -> int:
+    """Bytes the request-major gather reservation would need (worst case)."""
+    per_block_row = (
+        int(layout.block_size) * int(num_kv_heads)
+        * (int(layout.k_packed_bytes) + int(layout.v_packed_bytes) + 4)
+    )
+    return int(paged.max_num_reqs) * int(paged.max_blocks_per_req) * per_block_row
+
+
+def _use_indirect_gather(paged, layout, num_kv_heads: int, setting: str) -> bool:
+    """CSR gather when asked for, or when the request-major table would not fit.
+
+    ``THUNDER_8B_INDIRECT`` still wins when set (``0`` forces request-major, even
+    past the budget, for reproducing the OOM).
+    """
+    val = (setting or "").strip().lower()
+    if val:
+        return val not in ("0", "false", "no", "off")
+    return (
+        _request_major_gather_bytes(paged, layout, num_kv_heads)
+        > REQUEST_MAJOR_GATHER_BUDGET_BYTES
+    )
 
 _ENGINE_HOOK = {"done": False}
 _PAGED_CACHE: dict = {}
@@ -165,10 +212,14 @@ class ThunderCuteConfig:
     onepass: bool = False
     reg_rescale: bool = False
     causal_bound: bool = False
-    # GQA-packed decode (plan steps 6+8: one CTA per KV head scores the whole
-    # query group against each KV tile once). Decode-only, GQA-only, and
-    # default OFF until the capture path and correctness suite validate it.
-    gqa_pack: bool = False
+    # GQA-packed decode: one CTA per KV head scores the whole query group against
+    # each KV tile once, so the KV load and dequant happen once instead of once
+    # per query head. Decode-only and GQA-only. Default ON: at the current decode
+    # tile it measures 2.72 vs 11.62 ms at batch 16/32k (4.3x) and 0.536 vs 0.778
+    # at batch 1 (1.45x) -- the 4x redundant dequant it removes is the dominant
+    # cost now. It measured neutral at the old 64-row/64-wide tile, which is why
+    # it sat off. Set THUNDER_GQA_PACK=0 to opt out.
+    gqa_pack: bool = True
 
     @classmethod
     def from_env(cls, kv_cache_dtype: str | None = None) -> ThunderCuteConfig:
@@ -198,21 +249,25 @@ class ThunderCuteConfig:
             onepass=_flag("THUNDER_ONEPASS", default=True),
             reg_rescale=_flag("THUNDER_REG_RESCALE", default=True),
             causal_bound=_flag("THUNDER_CAUSAL_BOUND", default=True),
-            gqa_pack=_flag("THUNDER_GQA_PACK"),
+            gqa_pack=_flag("THUNDER_GQA_PACK", default=True),
         )
 
-    def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool) -> tuple:
+    def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool,
+                   num_reqs: int = 1) -> tuple:
+        # The tile comes from the schedule and the batch, not from the env
+        # defaults, so the key has to carry the tile actually compiled.
+        tile = tile_shape(bool(is_causal), num_reqs)
         return (
             head_dim,
             self.k_bits,
             self.v_bits,
             num_kv_heads,
             is_causal,
-            self.m_block_size,
-            self.n_block_size,
+            tile["m_block"],
+            tile["n_block"],
             self.num_stages,
             self.num_dequant_stages,
-            self.num_threads,
+            tile["num_threads"],
             self.use_2cta_instrs,
             self.q_stage,
             self.cache_block_size,
@@ -558,8 +613,7 @@ class ThunderAttentionImpl(AttentionImplBase):
     ) -> PagedKVManager:
         dev = torch.device(device)
         key = (dev.type, dev.index, self.layout.block_size, self.layout.num_kv_heads,
-               self.cfg.k_bits, self.cfg.v_bits, int(max_num_reqs), int(max_model_len),
-               int(max_blocks_per_req) if max_blocks_per_req is not None else -1)
+               self.cfg.k_bits, self.cfg.v_bits, int(max_num_reqs), int(max_model_len))
         mgr = _PAGED_CACHE.get(key)
         if mgr is None:
             mgr = make_paged_kv_manager(
@@ -574,9 +628,10 @@ class ThunderAttentionImpl(AttentionImplBase):
         self._paged = mgr
         return self._paged
 
-    def get_kernel(self, head_dim: int, is_causal: bool) -> Any:
-        """Compile (once) and cache the kernel for this shape."""
-        key = self.cfg.kernel_key(head_dim, self.num_kv_heads, is_causal)
+    def get_kernel(self, head_dim: int, is_causal: bool, num_reqs: int = 1) -> Any:
+        """Compile (once) and cache the kernel for this shape and schedule."""
+        tile = tile_shape(bool(is_causal), num_reqs)
+        key = self.cfg.kernel_key(head_dim, self.num_kv_heads, is_causal, num_reqs)
         kernel = self._kernels.get(key)
         if kernel is None:
             mod = _kernel_module()
@@ -586,11 +641,11 @@ class ThunderAttentionImpl(AttentionImplBase):
                 V_BITS=self.cfg.v_bits,
                 qhead_per_kvhead=self.num_kv_groups,
                 is_causal=is_causal,
-                m_block_size=self.cfg.m_block_size,
-                n_block_size=self.cfg.n_block_size,
+                m_block_size=tile["m_block"],
+                n_block_size=tile["n_block"],
                 num_stages=self.cfg.num_stages,
                 num_dequant_stages=self.cfg.num_dequant_stages,
-                num_threads=self.cfg.num_threads,
+                num_threads=tile["num_threads"],
                 use_2cta_instrs=self.cfg.use_2cta_instrs,
                 q_stage=self.cfg.q_stage,
             )
@@ -706,7 +761,9 @@ class ThunderAttentionImpl(AttentionImplBase):
             )
 
         is_causal = attn_metadata.is_prefill or attn_metadata.max_query_len > 1
-        kernel = self.get_kernel(self.head_size, is_causal)
+        kernel = self.get_kernel(
+            self.head_size, is_causal, int(getattr(attn_metadata, "num_reqs", 0) or 1)
+        )
 
         # The KV-cache write is a separate op in vLLM main; if the runner has
         # not done it yet, do it here.
@@ -749,16 +806,16 @@ class ThunderAttentionImpl(AttentionImplBase):
         if _cap:
             _ev0 = torch.cuda.Event(enable_timing=True)
             _ev0.record()
-        # Size the gather reservation from the engine's own block table: vLLM
-        # pads that table past ceil(max_model_len / block_size) (4160 tokens ->
-        # 264 blocks at block_size 16), and a manager sized only from the token
-        # limit rejects the table it is handed.
-        _bt = getattr(attn_metadata, "block_table", None)
+        # Size the gather reservation generously (rounded up to vLLM's padding
+        # granularity) rather than from the table we happen to be handed: keying
+        # the manager on the observed width means a manager can be created during
+        # CUDA-graph capture, and allocating mid-capture invalidates the graph
+        # (cudaErrorStreamCaptureInvalidated). The buffers are capped by the
+        # physical block count anyway, so the extra reservation costs nothing.
         paged = self._ensure_paged(
             query.device,
-            max_num_reqs=max(_cap_reqs, 1, int(_bt.shape[0]) if _bt is not None else 0),
+            max_num_reqs=max(_cap_reqs, 1),
             max_model_len=_cap_len,
-            max_blocks_per_req=int(_bt.shape[1]) if _bt is not None else None,
         )
         # Live-block count for the gather must be known on the HOST: under
         # CUDA-graph capture a `.item()` on the device seq_lens is a D2H sync and
@@ -775,9 +832,9 @@ class ThunderAttentionImpl(AttentionImplBase):
                 1,
                 int(((_sl_cpu[:_r].to(torch.int64) + _bs - 1) // _bs).max().item()),
             )
-        _indirect = (
-            os.environ.get("THUNDER_8B_INDIRECT", "0").strip().lower()
-            not in ("", "0", "false", "no", "off")
+        _indirect = _use_indirect_gather(
+            paged, self.layout, self.num_kv_heads,
+            os.environ.get("THUNDER_8B_INDIRECT", ""),
         )
         _capturing = torch.cuda.is_current_stream_capturing()
         _indptr = None
@@ -883,11 +940,13 @@ class ThunderAttentionImpl(AttentionImplBase):
         # GQA-packed decode: decode-only (max_query_len == 1), GQA-only, and
         # eager-only until validated under capture. The launcher itself rejects
         # max_query_len > 1 for this schedule.
+        # No capture gate: it would silently hold captured decode -- the path
+        # vLLM actually serves with -- on the slow schedule. (It was there because
+        # gqa_pack was unvalidated; it is now the measured default.)
         _use_gqa = (
             bool(self.cfg.gqa_pack)
             and int(getattr(attn_metadata, "max_query_len", 0) or 0) == 1
             and self.num_kv_groups > 1
-            and not torch.cuda.is_current_stream_capturing()
         )
         launch_thunder_attention(
             kernel,
@@ -1000,11 +1059,10 @@ class ThunderAttentionImpl(AttentionImplBase):
 
         return decode_split_count(
             seq_len,
-            n_reqs,
-            self.num_heads,
             is_prefill=is_causal,
             num_kv_groups=self.num_kv_groups,
-            tile_n=self.cfg.n_block_size,
+            num_reqs=n_reqs,
+            tile_n=tile_shape(bool(is_causal), n_reqs)["n_block"],
         )
 
     def do_kv_cache_update(self, *args: Any, **kwargs: Any) -> None:

@@ -1,0 +1,60 @@
+"""Tile-shape policy by schedule (measured on B200, not guessed).
+
+Decode runs one query row per request, so an M tile of 64 rows is almost
+entirely padding: the QK and PV MMAs, the score/probability staging and the row
+loops all scale with it. Prefill has thousands of live query rows and pays for
+the opposite: a small M tile means more q-blocks, and a wide KV tile means more
+masked-out work per tile.
+
+| tile (m, threads, n) | decode b=1, 32k | decode b=16, 32k | prefill 4k |
+|---|---|---|---|
+| 64, 128, 16 | — | — | **4.53 ms** |
+| 64, 128, 32 | — | — | 5.08 ms |
+| 64, 128, 64 | — | — | 5.69 ms |
+| 64, 128, 128 | — | — | 8.85 ms |
+| 128, 256, 64 | — | — | 5.60 ms |
+| 32, 64, 32 | **0.215 ms** | — | — |
+| 16, 32, 16 | 0.924 ms | **2.72 ms** | — |
+
+So the schedules want different tiles in every dimension: decode takes the
+smallest M tile that holds its live rows, prefill takes a full-height M tile with
+the narrowest KV tile that builds (8 does not; the MMA floor is 16). ``t`` is not
+free: the kernel requires ``m_block == num_threads // 32 * 16``, so 64 rows go
+with 128 threads and 128 rows with 256. The two are separate schedules in the
+engine already (``is_causal``), so the shape is chosen from that rather than from
+a global config knob.
+
+The decode column is with GQA packing and split-K at the knee; the same decode
+tiles measured 1.229 ms (batch 1) and 12.153 ms (batch 16) before those two
+changes, which is why the batch-1 choice reversed -- see ``splits.py``.
+"""
+
+from __future__ import annotations
+
+# (m_block, n_block, num_threads). The kernel requires m_block == num_warps * 16,
+# so 32 rows go with 64 threads and 64 rows with 128.
+DECODE_TILE = {"m_block": 32, "n_block": 32, "num_threads": 64}
+PREFILL_TILE = {"m_block": 64, "n_block": 16, "num_threads": 128}
+# Batched decode fills the M tile with one live row per request: at batch 16 the
+# 32-row tile is half live and the 16-row tile is exactly live, which measures
+# 4.3% faster (11.63 vs 12.15 ms at 32k). At batch 1 the same tile is 34% slower,
+# so the switch is gated on the batch rather than applied globally.
+DECODE_TILE_BATCHED = {"m_block": 16, "n_block": 16, "num_threads": 32}
+BATCHED_DECODE_FROM = 16
+
+
+def tile_shape(is_prefill: bool, num_reqs: int = 1) -> dict[str, int]:
+    """Tile shape for a step: prefill, batched decode, or plain decode.
+
+    ``is_prefill`` is the engine's "this step is prefill-like" flag
+    (``is_causal = is_prefill or max_query_len > 1``); a one-token decode step
+    takes a decode shape even when the attention itself is causal.
+    ``num_reqs`` only matters for decode, and only above the measured threshold
+    (batch 1 and 16 were measured; nothing in between was, so the switch waits
+    for the batch that was actually measured).
+    """
+    if is_prefill:
+        return PREFILL_TILE
+    if num_reqs >= BATCHED_DECODE_FROM:
+        return DECODE_TILE_BATCHED
+    return DECODE_TILE

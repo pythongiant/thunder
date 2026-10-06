@@ -128,6 +128,17 @@ class PagedKVManager:
         scale with ``max_model_len``. The request-major path calls this with no
         cap and is unchanged.
         """
+        if self._buffers is not None and cap_rows is not None and self._rows is not None:
+            # The two gather paths share one reservation, and whoever reserves
+            # first fixes its size. Growing later would write past the allocated
+            # rows (a silent OOB), so refuse loudly instead: the path choice must
+            # be stable for the life of the manager.
+            if int(cap_rows) > self._rows:
+                raise ValueError(
+                    f"gather reservation is {self._rows} block-rows but this call "
+                    f"needs {int(cap_rows)}; the gather path must not change size "
+                    f"after the first reserve"
+                )
         if self._buffers is None:
             CSR_COUNTS["reserve_calls"] += 1
             if cap_rows is not None:
@@ -141,7 +152,20 @@ class PagedKVManager:
                 "bpr": torch.zeros(self.max_num_reqs, dtype=torch.int64,
                                    device=self.device),
                 "sel": torch.zeros(cap, dtype=torch.int64, device=self.device),
-                "padded": torch.zeros(cap + 1, dtype=torch.int64, device=self.device),
+                # int32 to match the block table: scatter_ requires equal dtypes,
+                # and a cast would allocate inside the captured region.
+                "padded": torch.zeros(cap + 1, dtype=torch.int32, device=self.device),
+                # Build scratch. The device-side CSR build runs inside the captured
+                # region, and an allocation there has to come from the graph pool:
+                # it was building ~65 MB of temporaries per layer, which made the
+                # pool grow mid-capture and invalidated the 32k capture. These are
+                # persistent and reused, so the build allocates nothing.
+                "ar": torch.arange(self.max_blocks_per_req, dtype=torch.int64,
+                                   device=self.device),
+                "dest": torch.zeros(cap, dtype=torch.int64, device=self.device),
+                "valid": torch.zeros(cap, dtype=torch.bool, device=self.device),
+                "off": torch.zeros(self.max_num_reqs, dtype=torch.int64,
+                                   device=self.device),
             }
             self._csr = None
             self._csr_md = None
@@ -225,7 +249,7 @@ class PagedKVManager:
         and capture falls back to the full table (correct for any replay length,
         just not trimmed).
         """
-        out = self.reserve()
+        out = self.reserve(self.max_page_rows)
         bt = block_table.to(torch.int64)
         if bt.shape[0] > self.max_num_reqs or bt.shape[1] > self.max_blocks_per_req:
             raise ValueError(
@@ -405,22 +429,38 @@ class PagedKVManager:
         indptr.zero_()
         if r > 0:
             bpr.zero_()
-            bpr[:r].copy_(
-                ((metadata.seq_lens[:r].to(torch.int64) + bs - 1) // bs)
-                .clamp_(0, b)
-            )
-            ar = torch.arange(b, device=dev, dtype=torch.int64).unsqueeze(0)
-            valid = ar < bpr[:r].unsqueeze(1)
-            off = bpr[:r].cumsum(0) - bpr[:r]
-            dest = (off.unsqueeze(1) + ar).clamp_(0, cap - 1)
-            dest = torch.where(valid, dest, torch.full_like(dest, cap))
+            ar = bufs["ar"][:b].unsqueeze(0)
+            n = r * b
+            dead = bufs["valid"][:n].view(r, b)
+            dest = bufs["dest"][:n].view(r, b)
+            off = bufs["off"][:r]
+            # Every step writes only into persistent buffers: an allocation inside
+            # a captured region has to come from the graph pool, and this build
+            # runs inside the capture.
+            off.copy_(metadata.seq_lens[:r])
+            off.add_(bs - 1)
+            off.floor_divide_(bs)
+            off.clamp_(0, b)
+            bpr[:r].copy_(off)
+            torch.ge(ar, bpr[:r].unsqueeze(1), out=dead)
+            torch.cumsum(bpr[:r], 0, out=off)
+            off.sub_(bpr[:r])
+            torch.add(off.unsqueeze(1), ar, out=dest)
+            dest.clamp_(0, cap - 1)
+            # Dead slots point at the sentinel slot of `padded` (one longer than
+            # cap), so the scatter writes them somewhere harmless.
+            dest.masked_fill_(dead, cap)
             padded.zero_()
             padded.scatter_(
-                0, dest.reshape(-1), metadata.block_table[:r].reshape(-1).to(torch.int64)
+                0, dest.reshape(-1), metadata.block_table[:r].reshape(-1)
             )
             sel.copy_(padded[:cap])
             sel.clamp_(0, max(int(num_blocks) - 1, 0))
-            indptr[1:r + 1].copy_((bpr[:r].cumsum(0) * bs).to(torch.int32))
+            # indptr[i] is request i's token base, i.e. the EXCLUSIVE prefix sum --
+            # which is the inclusive sum shifted one slot, since indptr[0] = 0.
+            off.add_(bpr[:r])
+            indptr[1:r + 1].copy_(off)
+            indptr[1:r + 1].mul_(bs)
         nrows = int(bpr[:r].sum().item()) if (compute_nrows and r > 0) else -1
         self._indptr = indptr
         CSR_COUNTS["uploads"] += 1
@@ -460,15 +500,30 @@ class PagedKVManager:
             # The capture-safe device index keeps the FULL persistent `sel`
             # buffer; the eager index is already length nrows. Slice so
             # index_select only visits the live rows.
+            #
+            # Select straight INTO the reservation: the destination rows are
+            # already (nrows, bs, hk, pb), so the intermediate tensor and the
+            # second copy both go away. That matters beyond the saved copy -- an
+            # allocation inside a captured region has to come from the graph pool,
+            # and at 32k the large-batch capture graphs want 3 GiB per layer,
+            # which invalidated the capture (cudaErrorStreamCaptureInvalidated)
+            # when this path built temporaries per layer.
+            # Select straight into the reservation's rows: at long context the
+            # intermediate is ~1.4 GB per tensor, and a capture cannot grow the
+            # pool (cudaErrorStreamCaptureUnsupported), so this path must not
+            # allocate at all.
+            # Select straight into the reservation's rows: at long context the
+            # intermediate is ~1.4 GB per tensor, and a capture cannot grow the
+            # pool, so this path must not allocate at all.
             sel = index.sel[:nrows]
-            k = torch.index_select(self.layout.k_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, k_pb)
-            v = torch.index_select(self.layout.v_codes(kv_cache), 0, sel).reshape(nrows, bs, hk, v_pb)
-            ksn = torch.index_select(self.layout.k_norm(kv_scales), 0, sel).reshape(nrows, bs, hk)
-            vsn = torch.index_select(self.layout.v_norm(kv_scales), 0, sel).reshape(nrows, bs, hk)
-            out.k_packed.view(-1, bs, hk, k_pb)[:nrows].copy_(k)
-            out.v_packed.view(-1, bs, hk, v_pb)[:nrows].copy_(v)
-            out.k_norm.view(-1, bs, hk)[:nrows].copy_(ksn)
-            out.v_norm.view(-1, bs, hk)[:nrows].copy_(vsn)
+            torch.index_select(self.layout.k_codes(kv_cache), 0, sel,
+                               out=out.k_packed.view(-1, bs, hk, k_pb)[:nrows])
+            torch.index_select(self.layout.v_codes(kv_cache), 0, sel,
+                               out=out.v_packed.view(-1, bs, hk, v_pb)[:nrows])
+            torch.index_select(self.layout.k_norm(kv_scales), 0, sel,
+                               out=out.k_norm.view(-1, bs, hk)[:nrows])
+            torch.index_select(self.layout.v_norm(kv_scales), 0, sel,
+                               out=out.v_norm.view(-1, bs, hk)[:nrows])
         if env_flag("THUNDER_DEBUG_GATHER"):
             print(f"[TQ-CSR] nrows={nrows} capacity={self.page_rows}", flush=True)
         return out
@@ -597,11 +652,15 @@ def make_paged_kv_manager(
     that table (e.g. 260 -> 264 blocks for a 4160-token limit), and a manager
     sized only from ``max_model_len`` then rejects the table it is handed.
     """
-    blocks = (
-        int(max_blocks_per_req)
-        if max_blocks_per_req is not None
-        else (int(max_model_len) + layout.block_size - 1) // layout.block_size
-    )
+    if max_blocks_per_req is not None:
+        blocks = int(max_blocks_per_req)
+    else:
+        # vLLM pads its block table to a multiple of 8 (260 blocks -> 264 columns
+        # for a 4160-token limit), so round the reservation up to that
+        # granularity: sizing it from the token limit alone makes the manager
+        # reject the table the engine hands over.
+        blocks = (int(max_model_len) + layout.block_size - 1) // layout.block_size
+        blocks = -(-blocks // 8) * 8
     return PagedKVManager(
         layout,
         max_num_reqs=max_num_reqs,

@@ -37,53 +37,65 @@ of upstream's fp16 rows, so the two stacks are comparable and the rows above are
 not an artifact of one environment. (fp16 control spread across three runs:
 3.04-3.87 ms ITL at 4k, 3.60-4.41 ms at 32k.)
 
-## Ours: kernel-level, and why there is no e2e row
+## Ours: e2e, kernel-level, and what still blocks the comparison
 
-The plugin currently has **no meaningful end-to-end number** on this workload:
+**The capture fault is gone.** At 4k the CUSTOM backend runs under CUDA graphs
+(`enforce_eager=False`) and completes a generation. Measured three times on
+Qwen3-8B, batch 1, greedy, 32 tokens:
 
-- **CUDA-graph capture of the CUSTOM backend faults**:
-  `torch.AcceleratorError: CUDA error: operation failed due to a previous error
-  during capture` (`cudaErrorStreamCaptureInvalidated`), reproduced at ctx 4096
-  and 32768. This is the capture fault the repo's own notes track; it blocks the
-  path vLLM actually serves with.
-- **Eager is host-bound**: 4724 ms TTFT / **515.6 ms ITL** / 1.5 tok/s at 4k —
-  the CuTeDSL launcher dominates, matching `ci_probe/results/tracka_notes.md`
-  ("eager decode is ~1 s/forward; only graph-captured numbers are meaningful").
+| ctx | cfg | TTFT | ITL | output tok/s | peak |
+|---|---|---|---|---|---|
+| 4096 | ours (graphs) | 1667-2806 ms | 50.0-87.4 ms | 7.3-7.4 | 155.6 GiB |
+| 4096 | ours-eager | 1996 ms | 133.7 ms | 5.2 | 161.7 GiB |
 
-What is measurable is the attention launch itself, from `./.auto/measure.sh`
-(engine config: `onepass`/`reg_rescale` on, engine split-K policy = 4, B=1,
-32 Q heads / 8 KV heads / head_dim 128):
+Graphs are worth 1.5-2.7x here, and the ITL spread (50 to 87 ms across runs) is
+large enough that only the tok/s column should be read as stable. Against
+upstream's 4k rows (109.5 tok/s for `turboquant_3bit_nc`, 172.9 for fp16) ours is
+15-24x slower end to end.
+
+That gap is **host path, not kernel**: the same attention launch measures 0.077 ms
+at this shape, so 36 layers are ~2.8 ms per token against the ~50 ms observed. The
+CuTeDSL launch plumbing, the gather's ~10 torch ops per layer and the Triton merge
+are the suspects; `THUNDER_TIME_LAUNCH=1` reports the host buckets.
+
+At 32k the run died before that:
+
+- **CUDA OOM inside `paged_kv.reserve`** (16.06 GiB request, 9 GiB free): the
+  request-major gather reserves `max_num_reqs * max_blocks_per_req` block-rows
+  (952 x 2052 = 33 GiB at 32k) because its row layout cannot be trimmed. Under
+  capture it surfaced as `CUDA_ERROR_ILLEGAL_ADDRESS` instead.
+- Fixed by selecting the CSR gather past a 16 GiB reservation budget (it packs
+  live blocks and reserves by the physical block count: 3.0 GiB at 32k). The CSR
+  path then invalidated the capture, which was its per-layer temporaries (3 GiB
+  each) being allocated inside the captured region; it now selects straight into
+  the reservation with no temporary and no second copy.
+- **32k under graphs is still blocked, for a different reason**: with the OOM gone
+  the dense (CSR) gather is selected and the capture then dies with
+  `cudaErrorStreamCaptureUnsupported`, deterministically, at 4k as well as 32k.
+  The request-major layout cannot substitute there (30.7 GiB reservation), so
+  long-context serving needs `enforce_eager=True` until the dense gather is
+  capturable. See `docs/FAILURE_MODES.md` 14 for the evidence chain. Eager at 32k
+  is correct: vLLM's own warmup run completes and generates.
+
+What *is* measurable is the attention launch itself, from `./autoresearch.sh`
+(engine config: `onepass`/`reg_rescale`/`causal_bound` on, the tile and split
+policies from `thunder_vllm/attention/`, GQA packing on):
 
 | shape | ours (launch) | dequant-fp16 ref |
 |---|---|---|
-| decode 4k | 0.1843 ms | 2.4984 ms |
-| decode 32k | 1.3887 ms | 5.6024 ms |
-| prefill 4k | 5.6884 ms | 14.7688 ms |
+| decode 4k, batch 16 | 0.351 ms | — |
+| decode 32k, batch 16 | 2.72 ms | — |
+| decode 32k, batch 1 | 0.215 ms | 5.61 ms |
+| prefill 4k | 4.66 ms | 14.73 ms |
 
-Deriving e2e from that (36 layers, attention as the only cost — an upper bound on
-our throughput, not a measurement):
-
-| ctx | ours (derived) | upstream tq3 | upstream fp16 |
-|---|---|---|---|
-| 4096 | ~6.6 ms ITL, ~151 tok/s | 7.03 ms, 109.5 tok/s | 3.10 ms, 172.9 tok/s |
-| 32768 | ~50.0 ms ITL, ~20 tok/s | 12.23 ms, 18.2 tok/s | 3.78 ms, 38.9 tok/s |
-
-Read the columns with their provenance in mind: ours counts attention only, while
-upstream's is a whole decode step (weights, MLP, sampling and engine overhead
-included), so ours is a **lower bound on our step time** and its throughput is an
-upper bound. On that footing the 4k row is a tie: our attention alone (6.6 ms)
-now costs less than their entire step (7.03 ms), so parity is plausible — but our
-step also carries non-attention work, so parity is not demonstrated. The 32k row
-is a clear loss: 50.0 ms of attention against their 12.23 ms whole step. Prefill
-is worse still, 205 ms vs 74.3 ms TTFT at 4k.
-
-Do not read the tok/s columns against each other without this: 151 tok/s is
-attention-only, 109.5 tok/s is a served step. The only like-for-like comparison
-here is milliseconds of attention, and even that favours upstream at 32k.
+Those are 8.9x, 6.5x and 1.2x below the same shapes at the start of this session
+(24.11 / 1.389 / 5.668 ms), from three changes: GQA packing on by default, the
+split-K knee following the grid (16 -> 64 once packing took the head axis), and the
+prefill KV tile narrowed to 16 (the MMA floor).
 
 The remaining distance is the schedule, not the compressed format: FA4 does the
-16k decode shape in 0.196 ms per layer — 7.0 ms per 36-layer step, reading *dense
-fp16* — about 4x faster than this kernel while moving 3.9x more bytes
+16k decode shape in 0.196 ms per layer -- 7.0 ms per 36-layer step, reading *dense
+fp16* -- about 4x faster than this kernel while moving 3.9x more bytes
 (`benchmarks/results/fa4_matrix_b200_full.md`).
 
 ## KV cache size
@@ -111,9 +123,14 @@ bit-for-bit comparable.
    was handed. Fixed: `make_paged_kv_manager(..., max_blocks_per_req=...)`, with
    `ThunderAttentionImpl.forward` passing the engine's own table width and row
    count. Regression test in `tests/test_paged_kv.py`.
-2. **Graph-capture fault** (above) — reproduced, not fixed. Until it is, this
-   plugin cannot produce an e2e number under `enforce_eager=False`, and every
-   e2e comparison against upstream is blocked.
+2. **Reservation proportional to `max_model_len`** — the request-major gather
+   reserves `max_num_reqs * max_blocks_per_req` block-rows, which is 33 GiB at 32k
+   against a 178 GiB device already holding a 98.9 GiB KV cache, and it cannot be
+   trimmed without breaking its row layout. Fixed by choosing the gather path from
+   the reservation size; `docs/FAILURE_MODES.md` entry 13.
+3. **CSR gather allocated per layer inside capture** — four 3 GiB temporaries per
+   layer, which is what invalidated the 32k capture. Fixed by selecting into the
+   reservation.
 
 ## Caveats
 

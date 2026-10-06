@@ -35,12 +35,18 @@ def test_flag_parsing(monkeypatch, name):
         assert getattr(ThunderCuteConfig.from_env(), name) is expected
 
 
-def test_gqa_pack_off_by_default(monkeypatch):
-    """GQA-packed decode stays off until validated; THUNDER_GQA_PACK=1 opts in."""
+def test_gqa_pack_on_by_default_with_opt_out(monkeypatch):
+    """GQA-packed decode is the shipped decode schedule; THUNDER_GQA_PACK=0 opts out.
+
+    Measured at the current decode tile: 2.72 vs 11.62 ms at batch 16/32k (4.3x)
+    and 0.536 vs 0.778 at batch 1, because it removes the 4x redundant KV load
+    and dequant (one CTA per KV head serves the whole query group). It measured
+    neutral at the old 64-row tile, which is why it used to be off.
+    """
     monkeypatch.delenv("THUNDER_GQA_PACK", raising=False)
-    assert ThunderCuteConfig.from_env().gqa_pack is False
-    monkeypatch.setenv("THUNDER_GQA_PACK", "1")
     assert ThunderCuteConfig.from_env().gqa_pack is True
+    monkeypatch.setenv("THUNDER_GQA_PACK", "0")
+    assert ThunderCuteConfig.from_env().gqa_pack is False
 
 
 def test_kernel_key_tracks_flags(monkeypatch):
