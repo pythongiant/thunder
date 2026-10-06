@@ -41,6 +41,21 @@ Known contamination trap: a killed `_pb_worker` can leave `VLLM::EngineCore` ali
 
 ## Current access reality
 
-- Modal workspace may be disabled by spend limit.
+- Modal workspace `ac-ZQYQhQS5mttvydxpGCqaVb` is **spend-limit disabled** (every
+  `modal run` fails with `Workspace ... has exceeded its spend limit`, before any
+  GPU is allocated). CPU-safe work only until it is raised.
 - Some GPU SKUs may exceed account limits; only use provisioned/entitled machines.
 - If a B200 start fails with insufficient balance, stop the studio and do CPU-safe work instead.
+
+### Resuming after a spend-limit block
+
+Nothing in the loop is lost: `./autoresearch.sh` is the entrypoint, the session
+ledger is under `~/.omp/autoresearch/.../runs/`, and the last kept commit is the
+baseline. In order:
+
+1. `python -m pytest tests/ -q` — CPU policies and gather invariants.
+2. `bash autoresearch.sh` — re-confirms the primary metric (expect ~2.72 ms).
+3. `modal run ci/modal_app.py --mode test` — the GPU parity gate.
+4. `modal run ci/modal_app.py --mode e2e --e2e "4096,32768|ours|4|4"` — the
+   outstanding validation: 4k should reproduce ~7.3 tok/s, and 32k now selects the
+   CSR gather (it OOM'd in `reserve` before) and has not been re-measured since.
