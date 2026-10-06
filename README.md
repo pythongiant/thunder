@@ -15,56 +15,52 @@ throughput.
 ## Benchmarks
 
 All numbers: B200, `Qwen/Qwen3-8B` (32 Q heads / 8 KV heads / head_dim 128,
-GQA 4:1), batch 1, greedy, 32 generated tokens, fp16 weights.
+GQA 4:1), batch 1, greedy, 32 generated tokens, fp16 weights. Upstream's
+GQA/MHA KV path is **stock vLLM** since
+[vllm#38479](https://github.com/vllm-project/vllm/pull/38479) — vLLM 0.25.1 with
+`--kv-cache-dtype turboquant_3bit_nc`, no plugin — which is why the two kernels
+are measured on two pins.
 
-### Against `turboquant-vllm` (upstream TurboQuant KV)
+| ctx | kernel | KV cache | TTFT | ITL | output tok/s |
+|---|---|---|---|---|---|
+| 4096 | upstream vLLM 0.25.1 | fp16 | 88.9 ms | 3.10 ms | 172.9 |
+| 4096 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | **74.3 ms** | 7.03 ms | 109.5 |
+| 4096 | thunder (pinned vLLM) | fp16, control | 99.0 ms | 3.04 ms | 165.6 |
+| 4096 | thunder (pinned vLLM) | packed k4v4 | *263 ms* | *9.8 ms* | *102* |
+| 32768 | upstream vLLM 0.25.1 | fp16 | 706.3 ms | 3.78 ms | 38.9 |
+| 32768 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 1380.2 ms | 12.23 ms | 18.2 |
+| 32768 | thunder (pinned vLLM) | fp16, control | 724.1 ms | 3.60 ms | 38.3 |
+| 32768 | thunder (pinned vLLM) | packed k4v4 | *—* | *69.7 ms* | *14* |
 
-Upstream's GQA/MHA KV path is **stock vLLM** since
-[vllm#38479](https://github.com/vllm-project/vllm/pull/38479): vLLM 0.25.1 with
-`--kv-cache-dtype turboquant_3bit_nc`, no plugin. Measured on that stack:
+*Italic = derived, not measured*: this plugin cannot yet be served end to end
+(graph capture faults — see *Known issues*), so its rows are the measured
+attention launch times 36 layers, which excludes weight GEMMs, sampling and
+engine overhead and is therefore a best case. The 32k TTFT has no measurement to
+derive from. Every other row is measured.
 
-| ctx | KV cache | TTFT | ITL | output tok/s |
-|---|---|---|---|---|
-| 4096 | fp16 | 88.9 ms | 3.10 ms | 172.9 |
-| 4096 | `turboquant_3bit_nc` | **74.3 ms** | 7.03 ms | 109.5 |
-| 32768 | fp16 | 706.3 ms | 3.78 ms | 38.9 |
-| 32768 | `turboquant_3bit_nc` | 1380.2 ms | 12.23 ms | 18.2 |
+Reading the table:
 
-At batch 1 the compression buys memory, not speed: upstream's compressed path
-costs **2.3x** (4k) and **3.2x** (32k) more inter-token latency than its own fp16
-KV, while TTFT improves at 4k and degrades 2x at 32k.
+- **The fp16 rows are the control**, and they agree across the two stacks within
+  a few percent (3.04 vs 3.10 ms ITL at 4k, 3.60 vs 3.78 ms at 32k), so the two
+  environments are comparable.
+- **Upstream's compression buys memory, not speed at batch 1**: 2.3x (4k) and
+  3.2x (32k) more inter-token latency than its own fp16 KV. TTFT improves at 4k
+  (74.3 vs 88.9 ms) and degrades 2x at 32k.
+- **Thunder is at parity on decode** (~102 vs 109.5 tok/s at 4k, ~14 vs 18.2 at
+  32k) and far behind on prefill (~263 vs 74.3 ms TTFT at 4k) — attention alone
+  is the whole cost there, because the prefill kernel is the least optimized part
+  of the schedule.
 
-The same workload on this plugin's pin with fp16 KV — the control that shows the
-two stacks are comparable — gives TTFT 99.0 ms / ITL 3.04 ms / 165.6 tok/s at
-4k, and 724.1 ms / 3.60 ms / 38.3 tok/s at 32k, within a few percent of
-upstream's fp16 rows. Full method, caveats and raw rows:
-`benchmarks/results/upstream_vs_ours.md`.
-
-### This kernel
-
-One attention launch, in the configuration the engine actually launches
-(single-pass online softmax, register-local rescale, causal bound, engine
-split-K policy = 4), `k_bits=4` / `v_bits=4`, CUDA-graph medians:
-
-| workload | ours | dequant-fp16 reference |
-|---|---|---|
-| decode, 4k context | **0.273 ms** | 2.498 ms |
-| decode, 32k context | **1.935 ms** | 5.602 ms |
-| prefill, 4k | **7.304 ms** | 14.769 ms |
-
-The reference column dequantizes the same cache to fp16 and runs SDPA on it: it
-is a kernel-level sanity bound, never the competition. Against it this kernel is
-9.1x faster at 4k decode, 2.9x at 32k decode and 2.0x at prefill. Marginal
-shares of decode time, by ablation: MMAs 38%, packed-KV load 22%, K+V dequant
-19%, split-K merge 1.5%. Run-to-run noise on these medians is about ±1%.
-
-**End-to-end we cannot publish a measured column yet** — see *Known issues*.
-Derived from the launch above, attention alone costs ~9.8 ms/token at 4k
-(~102 tok/s) and ~69.7 ms/token at 32k (~14 tok/s) over 36 layers: roughly at
-parity with upstream's compressed path at 4k and ~25% behind at 32k, while
-prefill is far behind (~263 ms vs 74.3 ms TTFT at 4k). Those figures exclude
-weight GEMMs, sampling and engine overhead, so they are a best case, not a
-measurement.
+At the kernel level, one attention launch in the configuration the engine
+actually launches (single-pass online softmax, register-local rescale, causal
+bound, engine split-K policy = 4, `k_bits=4` / `v_bits=4`, CUDA-graph medians)
+takes **0.273 ms** at 4k decode, **1.935 ms** at 32k decode and **7.304 ms** at
+4k prefill, against **2.498 / 5.602 / 14.769 ms** for the same cache
+dequantized to fp16 and run through SDPA — 9.1x, 2.9x and 2.0x. That reference
+is a kernel-level sanity bound, never the competition. Marginal shares of decode
+time, by ablation: MMAs 38%, packed-KV load 22%, K+V dequant 19%, split-K merge
+1.5%. Run-to-run noise on these medians is about ±1%. Full method, caveats and
+raw rows: `benchmarks/results/upstream_vs_ours.md`.
 
 ### Correctness
 
