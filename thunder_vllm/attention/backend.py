@@ -1000,8 +1000,6 @@ class ThunderAttentionImpl(AttentionImplBase):
 
         return decode_split_count(
             seq_len,
-            n_reqs,
-            self.num_heads,
             is_prefill=is_causal,
             num_kv_groups=self.num_kv_groups,
             tile_n=self.cfg.n_block_size,
