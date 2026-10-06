@@ -80,6 +80,13 @@ def _use_indirect_gather(paged, layout, num_kv_heads: int, setting: str) -> bool
 
 _ENGINE_HOOK = {"done": False}
 _PAGED_CACHE: dict = {}
+# Compiled kernels, shared across the 36 layer impls. The kernel object carries
+# only compile-time configuration (tile, bit widths, head geometry) and takes every
+# buffer per call, so one instance serves every layer -- and because the
+# fast-launch cache keys on the kernel's CONFIG rather than its object identity, a
+# per-layer instance used to arm the fast path once per layer instead of once per
+# shape.
+_KERNEL_CACHE: dict = {}
 _CSR_DEBUG = {"done": False}
 _STORE_AB = {"done": False}
 _VMTX = {"done": False}
@@ -583,7 +590,6 @@ class ThunderAttentionImpl(AttentionImplBase):
             block_size=cfg.cache_block_size,
         )
 
-        self._kernels: dict[tuple, Any] = {}
         self._quantizer: Any = None
         self._paged: PagedKVManager | None = None
 
@@ -632,7 +638,7 @@ class ThunderAttentionImpl(AttentionImplBase):
         """Compile (once) and cache the kernel for this shape and schedule."""
         tile = tile_shape(bool(is_causal), num_reqs)
         key = self.cfg.kernel_key(head_dim, self.num_kv_heads, is_causal, num_reqs)
-        kernel = self._kernels.get(key)
+        kernel = _KERNEL_CACHE.get(key)
         if kernel is None:
             mod = _kernel_module()
             kernel = mod.ThunderAttentionForward(
@@ -649,7 +655,7 @@ class ThunderAttentionImpl(AttentionImplBase):
                 use_2cta_instrs=self.cfg.use_2cta_instrs,
                 q_stage=self.cfg.q_stage,
             )
-            self._kernels[key] = kernel
+            _KERNEL_CACHE[key] = kernel
         return kernel
 
     def warmup(
