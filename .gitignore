@@ -26,3 +26,5 @@ scripts/vultr.py
 
 # Large probe artifacts (purged from history; kept on disk)
 ci_probe/results/*.pt
+# macOS Finder metadata
+.DS_Store
