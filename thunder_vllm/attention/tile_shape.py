@@ -2,26 +2,31 @@
 
 Decode runs one query row per request, so an M tile of 64 rows is almost
 entirely padding: the QK and PV MMAs, the score/probability staging and the row
-loops all scale with it. Measured at 32k context with split-K at 8:
+loops all scale with it. Prefill has thousands of live query rows and pays for
+the opposite: a small M tile means more q-blocks, and a wide KV tile means more
+masked-out work per tile.
 
-| tile (m, threads, n) | decode batch 1 | decode batch 16 | prefill 4k |
+| tile (m, threads, n) | decode b=1, 32k | decode b=16, 32k | prefill 4k |
 |---|---|---|---|
-| 64, 128, 64 | 1.392 ms | 20.977 ms | 5.674 ms |
-| 64, 128, 32 | — | 19.061 ms | — |
-| 32, 64, 64 | 1.263 ms | 18.719 ms | 9.275 ms |
-| **32, 64, 32** | **1.229 ms** | **12.153 ms** | — |
-| 16, 32, 32 | — | 14.624 ms | — |
-| 64, 128, 128 | — | 32.215 ms | — |
+| 64, 128, 16 | — | — | **4.53 ms** |
+| 64, 128, 32 | — | — | 5.08 ms |
+| 64, 128, 64 | — | — | 5.69 ms |
+| 64, 128, 128 | — | — | 8.85 ms |
+| 128, 256, 64 | — | — | 5.60 ms |
+| 32, 64, 32 | **0.215 ms** | — | — |
+| 16, 32, 16 | 0.924 ms | **2.72 ms** | — |
 
-So decode wants a quarter-sized tile and prefill wants the full one: a small
-tile costs prefill 64% (it has thousands of live query rows and pays for the
-extra q-blocks), while it saves decode 12% at batch 1 and 42% at batch 16. The
-two are separate schedules in the engine already (``is_causal``), so the shape
-is chosen from that rather than from a global config knob.
+So the schedules want different tiles in every dimension: decode takes the
+smallest M tile that holds its live rows, prefill takes a full-height M tile with
+the narrowest KV tile that builds (8 does not; the MMA floor is 16). ``t`` is not
+free: the kernel requires ``m_block == num_threads // 32 * 16``, so 64 rows go
+with 128 threads and 128 rows with 256. The two are separate schedules in the
+engine already (``is_causal``), so the shape is chosen from that rather than from
+a global config knob.
 
-Note this reverses the earlier finding that a small tile loses at batch 1: that
-was measured before split-K went to 8 and before the load/staging work, when
-fewer CTAs meant fewer warps to hide the smaller tile's shorter thread count.
+The decode column is with GQA packing and split-K at the knee; the same decode
+tiles measured 1.229 ms (batch 1) and 12.153 ms (batch 16) before those two
+changes, which is why the batch-1 choice reversed -- see ``splits.py``.
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from __future__ import annotations
 # (m_block, n_block, num_threads). The kernel requires m_block == num_warps * 16,
 # so 32 rows go with 64 threads and 64 rows with 128.
 DECODE_TILE = {"m_block": 32, "n_block": 32, "num_threads": 64}
-PREFILL_TILE = {"m_block": 64, "n_block": 64, "num_threads": 128}
+PREFILL_TILE = {"m_block": 64, "n_block": 16, "num_threads": 128}
 # Batched decode fills the M tile with one live row per request: at batch 16 the
 # 32-row tile is half live and the 16-row tile is exactly live, which measures
 # 4.3% faster (11.63 vs 12.15 ms at 32k). At batch 1 the same tile is 34% slower,
