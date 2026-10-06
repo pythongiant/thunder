@@ -21,22 +21,33 @@ GQA/MHA KV path is **stock vLLM** since
 `--kv-cache-dtype turboquant_3bit_nc`, no plugin — which is why the two kernels
 are measured on two pins.
 
-| ctx | kernel | KV cache | TTFT | ITL | output tok/s |
-|---|---|---|---|---|---|
-| 4096 | upstream vLLM 0.25.1 | fp16 | 88.9 ms | 3.10 ms | 172.9 |
-| 4096 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | **74.3 ms** | 7.03 ms | 109.5 |
-| 4096 | thunder (pinned vLLM) | fp16, control | 99.0 ms | 3.04 ms | 165.6 |
-| 4096 | thunder (pinned vLLM) | packed k4v4 | *205 ms* | *6.6 ms* | ***151*** |
-| 32768 | upstream vLLM 0.25.1 | fp16 | 706.3 ms | 3.78 ms | 38.9 |
-| 32768 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 1380.2 ms | 12.23 ms | 18.2 |
-| 32768 | thunder (pinned vLLM) | fp16, control | 724.1 ms | 3.60 ms | 38.3 |
-| 32768 | thunder (pinned vLLM) | packed k4v4 | *—* | *50.0 ms* | ***20*** |
+| ctx | kernel | KV cache | KV size @ ctx | TTFT | ITL | output tok/s |
+|---|---|---|---|---|---|---|
+| 4096 | upstream vLLM 0.25.1 | fp16 | 16.0 MiB | 88.9 ms | 3.10 ms | 172.9 |
+| 4096 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 3.4 MiB | **74.3 ms** | 7.03 ms | 109.5 |
+| 4096 | thunder (pinned vLLM) | fp16, control | 16.0 MiB | 99.0 ms | 3.04 ms | 165.6 |
+| 4096 | thunder (pinned vLLM) | packed k4v4 | 4.1 MiB | *205 ms* | *6.6 ms* | ***151*** |
+| 32768 | upstream vLLM 0.25.1 | fp16 | 128.0 MiB | 706.3 ms | 3.78 ms | 38.9 |
+| 32768 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 27.0 MiB | 1380.2 ms | 12.23 ms | 18.2 |
+| 32768 | thunder (pinned vLLM) | fp16, control | 128.0 MiB | 724.1 ms | 3.60 ms | 38.3 |
+| 32768 | thunder (pinned vLLM) | packed k4v4 | 33.0 MiB | *—* | *50.0 ms* | ***20*** |
 
 *Italic = derived, not measured*: this plugin cannot yet be served end to end
 (graph capture faults — see *Known issues*), so its rows are the measured
 attention launch times 36 layers, which excludes weight GEMMs, sampling and
 engine overhead and is therefore a best case. The 32k TTFT has no measurement to
 derive from. Every other row is measured.
+
+**KV size** is one request's cache at that context, from the format rather than
+from a running engine: bytes per token (all 8 KV heads) x context. Per
+token-head, fp16 is 512 B; this plugin's 4-bit slot is 64 B K + 64 B V + 2 B
+norms = 132 B, i.e. **1056 B/token, 3.9x smaller than fp16** (3-bit K gives
+928 B/token); upstream's `turboquant_3bit_nc` is 108 B per token-head = 864
+B/token, per their published per-vector table. Ours is computed by
+`benchmarks/bench_common.py::kv_bytes_per_token_from_layout`, so it tracks the
+layout code rather than a hand-written constant. Note the two compressed formats
+are not the same size: ours is ~22% larger than upstream's at equal context,
+which the throughput comparison should be read against.
 
 Reading the table:
 

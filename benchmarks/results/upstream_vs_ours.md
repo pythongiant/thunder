@@ -86,6 +86,23 @@ The remaining distance is the schedule, not the compressed format: FA4 does the
 fp16* — about 4x faster than this kernel while moving 3.9x more bytes
 (`benchmarks/results/fa4_matrix_b200_full.md`).
 
+## KV cache size
+
+One request's cache at each context, from the format (bytes per token x
+context), not from a running engine:
+
+| KV cache | per token-head | per token (8 heads) | 4k | 32k |
+|---|---|---|---|---|
+| fp16 | 512 B | 4096 B | 16.0 MiB | 128.0 MiB |
+| upstream `turboquant_3bit_nc` | 108 B | 864 B | 3.4 MiB | 27.0 MiB |
+| this plugin, packed k4v4 | 132 B | 1056 B | 4.1 MiB | 33.0 MiB |
+
+Ours comes from `benchmarks/bench_common.py::kv_bytes_per_token_from_layout`
+(64 B K codes + 64 B V codes + 2 B norms per token-head); upstream's from the
+per-vector table in its README. The two compressed formats are close but not
+equal: ours is ~22% larger at the same context, so throughput rows are not
+bit-for-bit comparable.
+
 ## Bugs found while building this
 
 1. **Gather reservation sized from the token limit** — vLLM pads its block table
