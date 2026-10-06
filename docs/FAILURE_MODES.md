@@ -119,3 +119,22 @@ on a decode story — numbers that persuade without informing.
 - Detection: any table missing absolutes, ITL, or variance.
 - Mitigation: mandated table format (absolutes + ITL-led + p20/p80);
   capacity/batch-scaling reported alongside B=1.
+
+## 13. A path whose reservation scales with the model length — LIVED
+
+The gather had two paths and the default one reserved by `max_num_reqs *
+max_blocks_per_req` block-rows because it keeps request identity in the row stride
+(`row = req * max_blocks_per_req + block`) and therefore cannot be trimmed without
+changing the layout. That is a worst case proportional to the context: 4.2 GiB at
+4k, 33 GiB at 32k, against a 178 GiB device already holding a 98.9 GiB KV cache.
+The 32k e2e died inside `reserve()` with CUDA OOM, and under CUDA-graph capture it
+surfaced as `CUDA_ERROR_ILLEGAL_ADDRESS` instead — which made it look like a graph
+bug and cost a session's worth of bisecting the wrong thing.
+
+- Detection: read the *allocation* traceback, not the error class. `OutOfMemoryError`
+  and `ILLEGAL_ADDRESS` at the same frame mean the fault is the allocator, not the
+  kernel. Also: any buffer sized from `max_model_len` is a suspect at long context.
+- Mitigation: the CSR path packs live blocks densely and reserves by the physical
+  block count, so the path is now chosen from the reservation size
+  (`_use_indirect_gather`, 8 GiB budget) rather than from a flag default; the
+  explicit `THUNDER_8B_INDIRECT` override still wins, so the OOM stays reproducible.
