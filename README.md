@@ -3,7 +3,8 @@
 A quantized-attention architecture for Blackwell GPUs. A TurboQuant-compressed
 KV cache — 3/4-bit codes plus per-head norms — flows through a fused CuTeDSL
 attention kernel straight into the tensor cores. No fp16 KV is ever
-materialized.
+materialized: the cache is 3.9x smaller than fp16 and attention reads it in
+place.
 
 The vLLM integration is the serving vehicle and the end-to-end harness, not the
 product: it exists so kernel throughput can be checked against serving
@@ -11,7 +12,7 @@ throughput.
 
 **Author:** Srihari Unnikrishnan · [@pythongiant](https://github.com/pythongiant) · srihari.unnikrishnan@gmail.com
 
-## Results
+## Benchmarks
 
 All numbers: B200, `Qwen/Qwen3-8B` (32 Q heads / 8 KV heads / head_dim 128,
 GQA 4:1), batch 1, greedy, 32 generated tokens, fp16 weights.
@@ -33,10 +34,11 @@ At batch 1 the compression buys memory, not speed: upstream's compressed path
 costs **2.3x** (4k) and **3.2x** (32k) more inter-token latency than its own fp16
 KV, while TTFT improves at 4k and degrades 2x at 32k.
 
-The same workload on this plugin's pin, with fp16 KV (the control that shows the
-two stacks are comparable): TTFT 99.0 ms / ITL 3.04 ms / 165.6 tok/s at 4k, and
-724.1 ms / 3.60 ms / 38.3 tok/s at 32k — within a few percent of upstream's fp16
-rows. Full method, caveats and raw rows: `benchmarks/results/upstream_vs_ours.md`.
+The same workload on this plugin's pin with fp16 KV — the control that shows the
+two stacks are comparable — gives TTFT 99.0 ms / ITL 3.04 ms / 165.6 tok/s at
+4k, and 724.1 ms / 3.60 ms / 38.3 tok/s at 32k, within a few percent of
+upstream's fp16 rows. Full method, caveats and raw rows:
+`benchmarks/results/upstream_vs_ours.md`.
 
 ### This kernel
 
@@ -50,11 +52,13 @@ split-K policy = 4), `k_bits=4` / `v_bits=4`, CUDA-graph medians:
 | decode, 32k context | **1.935 ms** | 5.602 ms |
 | prefill, 4k | **7.304 ms** | 14.769 ms |
 
-The reference column is a kernel-level sanity bound, never the competition.
-Decode time splits, by ablation: MMAs 38%, packed-KV load 22%, K+V dequant 19%,
-split-K merge 1.5%. Run-to-run noise on these medians is about ±1%.
+The reference column dequantizes the same cache to fp16 and runs SDPA on it: it
+is a kernel-level sanity bound, never the competition. Against it this kernel is
+9.1x faster at 4k decode, 2.9x at 32k decode and 2.0x at prefill. Marginal
+shares of decode time, by ablation: MMAs 38%, packed-KV load 22%, K+V dequant
+19%, split-K merge 1.5%. Run-to-run noise on these medians is about ±1%.
 
-**End-to-end, we cannot publish a measured column yet** — see *Known issues*.
+**End-to-end we cannot publish a measured column yet** — see *Known issues*.
 Derived from the launch above, attention alone costs ~9.8 ms/token at 4k
 (~102 tok/s) and ~69.7 ms/token at 32k (~14 tok/s) over 36 layers: roughly at
 parity with upstream's compressed path at 4k and ~25% behind at 32k, while
@@ -70,49 +74,17 @@ widths, and split-K decode at S=2/4. On B200 the suite is green except
 `test_cuda_graph_replay_parity`, which is an unwired stub. The CPU suite is
 `python -m pytest tests/`.
 
-Against FA4 on the same shapes we are 3.3x off at 4k decode and about 6x at 16k
-(`benchmarks/results/fa4_matrix_b200_full.md`, the frozen acceptance gate). That
-gap is what the v2 pipeline is for.
-
-## How it works
-
-A KV token is stored as a rotation, a handful of Lloyd-Max code indices and a
-per-head norm. Attention consumes those codes directly: each tile is unpacked,
-looked up through the codebook, and fed to the QK and PV MMAs, with the rotation
-folded into the output projection. A 4:1 GQA group therefore reads one compressed
-KV tile instead of four fp16 ones.
-
-- **Representation** (`thunder_vllm/quant/`) — rotation, Lloyd-Max codebooks,
-  bit packing, per-head norms. This is the differentiating data path and it is
-  fixed; the work is in how it is executed, not how it is encoded.
-- **Attention kernel** (`thunder_vllm/attention/cute_kernel.py`) — the fused
-  CuTeDSL forward. Per KV tile: packed codes are loaded, unpacked and
-  dequantized through a per-layer LUT into an SMEM code tile, then consumed by
-  the QK and PV MMAs with online softmax. Fast paths default on: single-pass
-  online softmax, register-local accumulator rescale, causal tile skipping.
-  Decode uses split-K to fill the machine at batch 1.
-- **KV store** (`thunder_vllm/attention/cache_layout.py`) — a Triton kernel that
-  performs rotation, fp32 quantization and bit packing inside the cache write,
-  including the non-contiguous value views the engine hands out.
-- **Paged addressing** (`thunder_vllm/attention/paged_kv.py`) — a request-major
-  gather and a CSR/indirect gather whose per-step metadata is built once and
-  shared across layers, with a capture-safe device build for CUDA graphs.
-- **Serving integration** (`thunder_vllm/attention/backend.py`) — registers as a
-  `CUSTOM` attention backend. The engine's native cache-write path conflicts
-  with the packed byte cache, so a separate KV-cache-update hook owns the write,
-  and a config-keyed fast-launch cache keeps per-launch host overhead flat.
-
-## Install
-
-```sh
-pip install -e .
-```
+## Installation
 
 Requirements: a Blackwell GPU (sm_100/sm_110), CUDA 12.8+, PyTorch 2.8+,
 `nvidia-cutlass-dsl`, Triton. The end-to-end harness additionally needs a vLLM
 build with the pinned commit (see `docs/RUNBOOK.md`).
 
-## Usage
+```sh
+pip install -e .
+```
+
+Register the backend before constructing the engine:
 
 ```python
 from thunder_vllm.model import registry
@@ -120,7 +92,7 @@ from thunder_vllm.model import registry
 registry.configure(k_bits=4, v_bits=4)
 registry.register()
 
-# then select the backend at engine construction:
+# then select it at engine construction:
 #   attention_config={"backend": "CUSTOM"}
 ```
 
@@ -151,6 +123,58 @@ End-to-end, on a vLLM build that can select the backend:
 python -m benchmarks.bench_vs_thunder_vllm --model Qwen/Qwen3-8B
 ```
 
+## Why it is fast
+
+**The cache is 3.9x smaller and attention reads it as-is.** A token's KV slot is
+64 B of packed K codes + 64 B of packed V codes + two fp16 norms = 132 B at
+4-bit, against 512 B for fp16 (`k_bits=3` gives 116 B, 4.4x). Nothing is expanded
+into HBM: the codes travel from the cache to SMEM to the tensor cores, so a
+decode step streams a quarter of the bytes.
+
+**Dequantization is fused into the tile pipeline, and it is cheap.** Per KV tile
+the kernel loads packed bytes, unpacks nibbles and gathers through a per-layer
+LUT into an SMEM fp16 tile, then feeds the QK and PV MMAs. That stage measures
+14-19% of decode time (K and V together, 4k to 32k) — less than the 3.9x traffic
+it saves.
+
+**The MMAs never see quantized operands.** Dequantized fp16 tiles feed `mma.sync`
+with fp32 accumulators, so the arithmetic is an ordinary fp16 attention kernel;
+the compression changes the traffic, not the math. That is why the kernel can
+match a dequantized-fp16 oracle to 1e-2 while reading 3.9x fewer bytes.
+
+**Batch-1 decode fills the machine with split-K.** A 32-head decode grid is only
+32 CTAs on 148 SMs, so the KV range is split: 4 ways gives 128 CTAs and measures
+**3.5x** (4k) and **3.9x** (32k) over the unsplit schedule. The split partials
+are reduced by an online-softmax rescale, so the extra CTAs cost one small merge
+(1.5% of decode at 32k, 10% at 4k).
+
+**The KV is traversed once.** Single-pass online softmax removes the separate
+row-max pass — otherwise every tile loads and dequantizes K twice — and
+register-local accumulator rescale removes two SMEM round-trips per tile.
+Causal tile skipping drops fully-masked tiles in prefill. All three are on by
+default.
+
+**A GQA group shares one reconstruction.** With 32 Q heads over 8 KV heads the
+QK and PV math differ per head but the KV reconstruction does not, so the
+GQA-packed schedule reconstructs each tile once for the four heads that consume
+it.
+
+**Host overhead is flat.** The fast-launch cache keys the compiled CuTeDSL
+function by kernel config instead of re-tracing MLIR per call: a launch costs
+~0.35 ms of host work rather than ~407 ms, which is what makes eager usable and
+graph capture cheap.
+
+Where this is *not* fast yet: against FlashAttention-4 on the same shapes we are
+3.3x off at 4k decode and about 6x at 16k
+(`benchmarks/results/fa4_matrix_b200_full.md`). The remaining gap is
+schedule-level, not parameter-level — the MMA M tile is bound to the warp count
+(`m_block == num_warps * 16`), so a one-row decode pays for a 64-row tile, and
+the operand copies are universal 16-bit SMEM copies rather than `ldmatrix`, which
+this CuTeDSL build does not expose. Closing it means deriving the pipeline from
+FA4 (async/TMA movement, UMMA/TMEM accumulators, device-side reduction) rather
+than tuning this schedule further; the frozen FA4 tree to build on is vendored at
+`thunder_vllm/attention/v2/fa4/`.
+
 ## Known issues
 
 - **CUDA-graph capture of the `CUSTOM` backend faults** with
@@ -163,29 +187,6 @@ python -m benchmarks.bench_vs_thunder_vllm --model Qwen/Qwen3-8B
   follows the table the engine hands over
   (`make_paged_kv_manager(..., max_blocks_per_req=...)`), so serving at arbitrary
   `max_model_len` no longer raises `block_table ... exceeds reserved`.
-
-## Roadmap
-
-The `mma.sync` schedule is the measurement baseline and the end-to-end vehicle.
-Its tuning space is closed by measurement: with MMAs at 38% of decode and every
-reachable knob A/B'd — split count (S=4 is the knee), GQA packing,
-`tile_m`/`n_block`/thread shapes, live-row pruning, byte-pair dequant — none beat
-the shipped configuration by more than noise. Two limits are schedule-level, not
-parameter-level: the MMA M tile is bound to the warp count
-(`m_block == num_warps * 16`), so a one-row decode pays for a 64-row tile, and
-the operand copies are universal 16-bit SMEM copies rather than `ldmatrix`
-(which this CuTeDSL build does not expose).
-
-v2 is therefore derived from FlashAttention-4 rather than patched into v1: the
-same Blackwell pipeline shape — KV-head/GQA tile ownership, async/TMA movement,
-UMMA/TMEM accumulators, overlapped softmax, SplitKV scheduling, device-side
-reduction, direct paged-KV consumption — with the TurboQuant packed data path as
-the one new producer stage. The frozen FA4 tree lives at
-`thunder_vllm/attention/v2/fa4/` (vendor of flash-attn-4, import-rewritten and
-pinned). The plan is to prove the vendored pipeline reproduces dense FA4 first,
-then swap its KV load for the packed load/dequant producer, so the only new code
-is the data path and everything downstream — descriptors, MMA, softmax,
-scheduler — is known-good.
 
 ## Repository layout
 
