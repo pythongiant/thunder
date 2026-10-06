@@ -18,11 +18,11 @@ throughput.
   (decode, batch 16, 4k), 2.73 ms (decode, batch 16, 32k), 0.217 ms (decode,
   batch 1, 32k) and 4.66 ms (prefill, 4k) — against 5.61 ms and 14.92 ms for the
   same cache dequantized to fp16 and run through SDPA at the last two.
-- **Serving**: batch 1 at 4k runs under CUDA graphs end to end at **18-60 output
-  tok/s of decode** (16.6-56.7 ms ITL over four runs; the spread is run-to-run, not
-  a configuration change). That is 2.4-8x off upstream's compressed path. The
-  whole-request rate is 7.4-7.5 tok/s regardless, because a 4k prefill takes 1.9-3.7
-  s against upstream's 74 ms. 16k and 32k do not run yet — see *Known issues*.
+- **Serving**: batch 1 at 4k runs under CUDA graphs end to end at **58 output
+  tok/s of decode** (17.4 ms ITL, measured serially), which is 2.4x off upstream's
+  compressed path (142) and 5.7x off its own fp16 control (329). The whole-request
+  rate is 7.3-7.5 tok/s regardless, because a 4k prefill takes 1.9-4.1 s against
+  upstream's 74 ms. 16k and 32k do not run yet — see *Known issues*.
 - **Correctness**: the kernel matches a dequantized-fp16 oracle at
   `atol=rtol=1e-2`, and the GPU suite is green except one unwired stub.
 
@@ -66,7 +66,7 @@ are measured on two pins.
 | 4096 | upstream vLLM 0.25.1 | fp16 | 16.0 MiB | 88.9 ms | 3.10 ms | 323 | 172.9 |
 | 4096 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 3.4 MiB | **74.3 ms** | 7.03 ms | 142 | 109.5 |
 | 4096 | thunder (pinned vLLM) | fp16, control | 16.0 MiB | 99.0 ms | 3.04 ms | 329 | 165.6 |
-| 4096 | thunder (pinned vLLM) | packed k4v4 | 4.1 MiB | 1.9-3.7 s | 16.6-56.7 ms | **18-60** | 7.4-7.5 |
+| 4096 | thunder (pinned vLLM) | packed k4v4 | 4.1 MiB | 1.9-4.1 s | 17.4 ms | **58** | 7.3-7.5 |
 | 32768 | upstream vLLM 0.25.1 | fp16 | 128.0 MiB | 706.3 ms | 3.78 ms | 265 | 38.9 |
 | 32768 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 27.0 MiB | 1380.2 ms | 12.23 ms | 82 | 18.2 |
 | 32768 | thunder (pinned vLLM) | fp16, control | 128.0 MiB | 724.1 ms | 3.60 ms | 278 | 38.3 |
@@ -89,17 +89,18 @@ Reading the table:
   | whole request (32 tokens / wall time) | 4.3-4.4 s | **7.4-7.5 tok/s** |
 
   The first row is the kernel and it is the fast part — 0.078 ms per launch,
-  measured on the engine's own shapes. The second is the served decode rate, and
-  the spread within it is real: 60 tok/s with vLLM's engine multiprocessing on
-  (vLLM's default) against 13 with it forced off, plus run-to-run variation. The
-  gap to the first row is per-layer host work, of which the measured pieces are
-  0.25 ms per launch of launcher plumbing (argument packing and `from_dlpack`,
-  36 x = 9 ms/token) plus the gather and the merge. The third row is what a client
-  sees for a 32-token request, and the gap to the second is a 4k prefill that
-  currently takes 1.9-3.7 s. Earlier revisions of this file quoted a *derived*
-  151 tok/s (0.184 ms per launch x 36 layers); the same derivation on the current
-  kernel gives ~357, so the kernel has moved the right way while the serving path —
-  newly measurable now that capture works — is the open problem.
+  measured on the engine's own shapes. The gap to the second is **per-layer host
+  work in the launch path**, which is the whole serving story: the launcher's
+  plumbing bucket measures 0.73 ms per launch, so 36 launches per token cost
+  ~26 ms/token against a 17.4 ms ITL, and the fast-launch cache itself is working
+  (6 arms, 461 hits, 0.73 ms of plumbing per call). The third row is what a client
+  sees for a 32-token request, and the gap to the second is a 4k prefill that takes
+  1.9-4.1 s; ablating the kernel launch drops that TTFT to 217 ms, so the prefill
+  is the same per-layer launch cost, not the gather (ablating the gather changes
+  neither TTFT nor ITL). Earlier revisions of this file quoted a *derived* 151
+  tok/s (0.184 ms per launch x 36 layers); the same derivation on the current kernel
+  gives ~357, so the kernel has moved the right way while the serving path — newly
+  measurable now that capture works — is the open problem.
 - **Two throughput columns, because one number was misleading.** `request tok/s`
   is `generated tokens / total wall time` — the same definition upstream's rows
   use, kept so the tables stay comparable — and at 32 generated tokens it is
