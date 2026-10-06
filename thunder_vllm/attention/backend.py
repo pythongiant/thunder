@@ -43,10 +43,16 @@ logger = get_logger("attention.backend")
 #
 # The budget is a CONSTANT, not a fraction of free memory: the two paths share one
 # reservation and whichever reserves first fixes its size, so a path that flips
-# with memory pressure would make the other path write past the buffer. 16 GiB
-# keeps 4k and 8k (the shapes that fit comfortably) on the cheaper path and
-# switches where the reservation stops being reasonable.
-REQUEST_MAJOR_GATHER_BUDGET_BYTES = 16 << 30
+# with memory pressure would make the other path write past the buffer.
+#
+# It sits between what 16k needs (15.5 GiB) and what 32k needs (30.7 GiB) on
+# purpose: the CSR path is NOT
+# capturable in this stack (deterministic cudaErrorStreamCaptureUnsupported, see
+# docs/FAILURE_MODES.md 14), so switching to it anywhere the request-major
+# reservation still fits would turn a working context length into a startup
+# failure. 16k needs 16.4 GiB and stays on request-major; only 32k, which cannot
+# fit at all, attempts the dense path.
+REQUEST_MAJOR_GATHER_BUDGET_BYTES = 24 << 30
 
 
 def _request_major_gather_bytes(paged, layout, num_kv_heads: int) -> int:

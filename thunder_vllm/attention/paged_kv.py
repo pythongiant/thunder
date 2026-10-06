@@ -429,24 +429,27 @@ class PagedKVManager:
         indptr.zero_()
         if r > 0:
             bpr.zero_()
-            # int32 arithmetic: copy_ casts, and a .to(int64) here would allocate
-            # inside the captured region.
-            bpr[:r].copy_(
-                ((metadata.seq_lens[:r] + (bs - 1)) // bs).clamp_(0, b)
-            )
             ar = bufs["ar"][:b].unsqueeze(0)
             n = r * b
-            valid = bufs["valid"][:n].view(r, b)
+            dead = bufs["valid"][:n].view(r, b)
             dest = bufs["dest"][:n].view(r, b)
             off = bufs["off"][:r]
-            torch.lt(ar, bpr[:r].unsqueeze(1), out=valid)
+            # Every step writes only into persistent buffers: an allocation inside
+            # a captured region has to come from the graph pool, and this build
+            # runs inside the capture.
+            off.copy_(metadata.seq_lens[:r])
+            off.add_(bs - 1)
+            off.floor_divide_(bs)
+            off.clamp_(0, b)
+            bpr[:r].copy_(off)
+            torch.ge(ar, bpr[:r].unsqueeze(1), out=dead)
             torch.cumsum(bpr[:r], 0, out=off)
             off.sub_(bpr[:r])
             torch.add(off.unsqueeze(1), ar, out=dest)
             dest.clamp_(0, cap - 1)
-            # Invalid slots point at the sentinel slot of `padded` (which is one
-            # longer than cap), so the scatter writes them somewhere harmless.
-            dest.masked_fill_(~valid, cap)
+            # Dead slots point at the sentinel slot of `padded` (one longer than
+            # cap), so the scatter writes them somewhere harmless.
+            dest.masked_fill_(dead, cap)
             padded.zero_()
             padded.scatter_(
                 0, dest.reshape(-1), metadata.block_table[:r].reshape(-1)
@@ -505,6 +508,13 @@ class PagedKVManager:
             # and at 32k the large-batch capture graphs want 3 GiB per layer,
             # which invalidated the capture (cudaErrorStreamCaptureInvalidated)
             # when this path built temporaries per layer.
+            # Select straight into the reservation's rows: at long context the
+            # intermediate is ~1.4 GB per tensor, and a capture cannot grow the
+            # pool (cudaErrorStreamCaptureUnsupported), so this path must not
+            # allocate at all.
+            # Select straight into the reservation's rows: at long context the
+            # intermediate is ~1.4 GB per tensor, and a capture cannot grow the
+            # pool, so this path must not allocate at all.
             sel = index.sel[:nrows]
             torch.index_select(self.layout.k_codes(kv_cache), 0, sel,
                                out=out.k_packed.view(-1, bs, hk, k_pb)[:nrows])

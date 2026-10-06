@@ -142,3 +142,28 @@ bug and cost a session's worth of bisecting the wrong thing.
   The budget is a constant and `reserve()` refuses to grow after the first
   allocation, because the two paths share one reservation: a path that flipped
   with memory pressure would make the other path write past the buffer.
+
+## 14. A gather path that cannot be captured — LIVED
+
+The dense (CSR/indirect) gather packs the live blocks and reserves by the physical
+block count, which is the only layout that fits a long context: the request-major
+layout reserves `max_num_reqs * max_blocks_per_req` block-rows (30.7 GiB at 32k on
+Qwen3-8B) because its row stride is the engine's table width and cannot be
+trimmed. But that dense path cannot be captured in this stack: vLLM's cudagraph
+memory profiling dies with `cudaErrorStreamCaptureUnsupported`, deterministically,
+in both of its forms (select-into-the-reservation and temporaries + `copy_`) --
+after its allocations were removed (the build is fully temporary-free, the gather
+selects into the reservation) and with no sync left anywhere in the path. Ablating
+the build body alone, or the gather alone, does not help; ablating the kernel
+launch and the merge (`THUNDER_SKIP_KERNEL=1`) does not either. `THUNDER_SKIP_BACKEND=1`
+makes the capture succeed, so the fault is in this backend and in the dense path.
+
+- Detection: `cudaErrorStreamCaptureUnsupported` (not `...Invalidated`) raised at
+  `profile_cudagraph_memory`, at 4k as well as 32k, i.e. it is the path and not the
+  context length. Two identical runs fail identically, so it is not a race.
+- Mitigation: the path is chosen by reservation size with a 24 GiB budget, so 4k,
+  8k and 16k (15.5 GiB) stay on the capturable request-major path and only 32k
+  attempts the dense one. Long-context serving must run with `enforce_eager=True`
+  until the dense gather is capturable -- the eager path is correct (vLLM's own
+  warmup run completes at 32k). Do not "fix" this by lowering the budget: that
+  trades a working context length for a startup failure.

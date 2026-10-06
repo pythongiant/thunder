@@ -69,9 +69,13 @@ At 32k the run died before that:
   path then invalidated the capture, which was its per-layer temporaries (3 GiB
   each) being allocated inside the captured region; it now selects straight into
   the reservation with no temporary and no second copy.
-- **The 32k row itself is not yet re-measured**: the Modal workspace was disabled
-  by spend limit mid-session, so the fix is in the tree, CPU-tested, and unverified
-  on GPU. Do not quote a 32k e2e number until it is.
+- **32k under graphs is still blocked, for a different reason**: with the OOM gone
+  the dense (CSR) gather is selected and the capture then dies with
+  `cudaErrorStreamCaptureUnsupported`, deterministically, at 4k as well as 32k.
+  The request-major layout cannot substitute there (30.7 GiB reservation), so
+  long-context serving needs `enforce_eager=True` until the dense gather is
+  capturable. See `docs/FAILURE_MODES.md` 14 for the evidence chain. Eager at 32k
+  is correct: vLLM's own warmup run completes and generates.
 
 What *is* measurable is the attention launch itself, from `./autoresearch.sh`
 (engine config: `onepass`/`reg_rescale`/`causal_bound` on, the tile and split
