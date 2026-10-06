@@ -46,10 +46,16 @@ Reading the table:
 - **Upstream's compression buys memory, not speed at batch 1**: 2.3x (4k) and
   3.2x (32k) more inter-token latency than its own fp16 KV. TTFT improves at 4k
   (74.3 vs 88.9 ms) and degrades 2x at 32k.
-- **Thunder is at parity on decode** (~102 vs 109.5 tok/s at 4k, ~14 vs 18.2 at
-  32k) and far behind on prefill (~263 vs 74.3 ms TTFT at 4k) — attention alone
-  is the whole cost there, because the prefill kernel is the least optimized part
-  of the schedule.
+- **Thunder is slower than upstream, on every row.** Its rows are attention only
+  — 36 layers of the measured launch — so they are a *lower bound* on its step
+  time, and that lower bound already exceeds upstream's *entire* step: 9.8 ms vs
+  7.03 ms at 4k and 69.7 ms vs 12.23 ms at 32k. Prefill is 263 ms vs 74.3 ms
+  TTFT. Weight GEMMs, sampling and engine overhead can only widen the gap.
+
+The reason is the schedule, not the compression: FlashAttention-4 does the same
+16k decode shape in 0.196 ms per layer — 7.0 ms per 36-layer step, reading
+*dense fp16* — about 6x faster than this kernel while moving 3.9x more bytes.
+That measured gap, not the format, is what the v2 work is for.
 
 At the kernel level, one attention launch in the configuration the engine
 actually launches (single-pass online softmax, register-local rescale, causal
@@ -57,10 +63,11 @@ bound, engine split-K policy = 4, `k_bits=4` / `v_bits=4`, CUDA-graph medians)
 takes **0.273 ms** at 4k decode, **1.935 ms** at 32k decode and **7.304 ms** at
 4k prefill, against **2.498 / 5.602 / 14.769 ms** for the same cache
 dequantized to fp16 and run through SDPA — 9.1x, 2.9x and 2.0x. That reference
-is a kernel-level sanity bound, never the competition. Marginal shares of decode
-time, by ablation: MMAs 38%, packed-KV load 22%, K+V dequant 19%, split-K merge
-1.5%. Run-to-run noise on these medians is about ±1%. Full method, caveats and
-raw rows: `benchmarks/results/upstream_vs_ours.md`.
+is a kernel-level sanity bound: it says fusing dequantization into attention is
+worth 2-9x, not that the kernel is competitive. Marginal shares of decode time,
+by ablation: MMAs 38%, packed-KV load 22%, K+V dequant 19%, split-K merge 1.5%.
+Run-to-run noise on these medians is about ±1%. Full method, caveats and raw
+rows: `benchmarks/results/upstream_vs_ours.md`.
 
 ### Correctness
 

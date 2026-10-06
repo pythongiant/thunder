@@ -68,11 +68,20 @@ our throughput, not a measurement):
 | 4096 | ~9.8 ms ITL, ~102 tok/s | 7.03 ms, 109.5 tok/s | 3.10 ms, 172.9 tok/s |
 | 32768 | ~69.7 ms ITL, ~14 tok/s | 12.23 ms, 18.2 tok/s | 3.78 ms, 38.9 tok/s |
 
-So on decode the kernel is roughly **at parity with upstream's compressed-KV path
-at 4k and ~25% behind it at 32k** — despite being 3.3-6x off FA4 on the same
-shapes (`benchmarks/results/fa4_matrix_b200_full.md`), because upstream's own
-compressed path is itself ~3x off its fp16 baseline. Prefill is the reverse: our
-prefill launch (7.30 ms) times 36 layers exceeds upstream's *entire* 4k TTFT.
+Read the columns with their provenance in mind: ours counts attention only, while
+upstream's is a whole decode step (weights, MLP, sampling and engine overhead
+included), so ours is a **lower bound on our step time** and its throughput is an
+upper bound. That lower bound already exceeds upstream's *entire* step at both
+contexts — 9.8 ms vs 7.03 ms at 4k, 69.7 ms vs 12.23 ms at 32k — so this kernel
+is slower than upstream's compressed-KV path, and by more than those ratios once
+the non-attention work is added. Prefill is worse still: 263 ms vs 74.3 ms TTFT
+at 4k.
+
+The cause is the v1 schedule, not the compressed format: FA4 does the 16k decode
+shape in 0.196 ms per layer — 7.0 ms per 36-layer step, reading *dense fp16* —
+about 6x faster than this kernel while moving 3.9x more bytes
+(`benchmarks/results/fa4_matrix_b200_full.md`). Compression only pays once the
+schedule is at parity.
 
 ## Bugs found while building this
 
