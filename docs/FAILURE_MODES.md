@@ -222,3 +222,20 @@ generation. The `plumbing` bucket is small and believable in the same dump
 - Mitigation: read `plumbing` only, or reset the counters after warmup before
   attributing a decode step. `docs/FAILURE_MODES.md` 3 already warns that these
   buckets measure dispatch, not execution.
+
+## 17. A synthetic batch that is not the geometry it claims — LIVED
+
+`make_synthetic_batch(batch, seqlen, ...)` builds one full sequence per request and
+the smoke runner takes the first `batch * seqlen_q` rows of it, so a "chunked
+prefill" shape (batch 256, seqlen_q 16, seqlen_k 4096) puts every query row at the
+START of its request's KV. A real chunk sits at the END and attends the whole
+prefix, so that shape's causal work is a small fraction of the engine's and its
+timings cannot be read as the engine's. It is still useful for M-tile questions
+(those are about how full the tile is, not how far it walks), which is how the
+-30% chunked-prefill tile number was measured -- but the ratio must not be quoted
+for the engine until the synthetic geometry places the chunk at the end.
+
+- Detection: check where `query_start_loc` puts the rows relative to `seqlen_k`
+  before believing a prefill timing from the grid.
+- Mitigation: teach `make_synthetic_batch` a `query_offset` (rows at the end) and
+  re-measure the prefill shapes.
