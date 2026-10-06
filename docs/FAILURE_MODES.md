@@ -168,23 +168,37 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   warmup run completes at 32k). Do not "fix" this by lowering the budget: that
   trades a working context length for a startup failure.
 
-## 15. An illegal address at 16k engine geometry — OPEN
+## 15. An illegal address at a many-request prefill — OPEN
 
-At ctx 16384 the plugin faults with `cudaErrorIllegalAddress` in both eager and
-graph mode, while ctx 4096 works. The error surfaces at the first synchronising op
-*after* the prefill (`torch.equal` inside `HadamardRotation.__init__`, reached from
-`do_kv_cache_update`), which is why the traceback points at the quantizer instead of
-at the fault.
+At ctx 16384 the plugin faults with `cudaErrorIllegalAddress`, in eager and in graph
+mode, reproducibly (3 of 3 engine runs). The error surfaces at the first
+synchronising op *after* the prefill (`torch.equal` inside `HadamardRotation.__init__`,
+reached from `do_kv_cache_update`), which is why the traceback points at the
+quantizer instead of at the fault.
 
-- `THUNDER_SKIP_BACKEND=1` runs (17.3 tok/s), so it is this backend.
-- `THUNDER_SKIP_KERNEL=1` also runs (9.3 tok/s), so it is the **kernel launch**,
-  not the gather or the metadata.
-- The kernel itself is fine at that shape in the harness: a new `prefill-16k` grid
-  shape (batch 1, 16384/16384, the shipped prefill tile) measures 63.1 ms with
-  n=16 and 79.4 ms with n=64. So the fault is **engine-geometry dependent** -- the
-  engine's manager is `max_num_reqs=952`, `max_blocks_per_req=1028` (15.4 GiB
-  reservation, `kv_row_stride` 16,448 tokens), where the harness uses batch-1
-  geometry.
-- Next probe: `--e2e "16384|ours-eager|4|4|0|THUNDER_DEBUG_LAUNCH=1"` prints the
-  exact `q`/`kv`/`bt`/`sl`/`max_query_len`/`is_prefill` the kernel is launched with;
-  compare against the harness's batch-1 geometry to find the bound that is wrong.
+What the engine actually launches there, from `THUNDER_DEBUG_LAUNCH=1`:
+
+```
+q=(16384, 32, 128) fp16   n=16384
+kv=(243585, 8, 16, 128)   bt=(1024, 1032)   sl=(1024,)   qsl=(1025,)
+num_reqs=1024   max_blocks_per_req=1032   is_prefill=True   max_query_len=16
+```
+
+So vLLM chunks the 16k prompt into **1024 requests of 16 query rows each** -- a
+multi-request prefill. Nothing in the loop covered that: the only prefill shape was
+batch 1 at 4k, and the 4k path is fine.
+
+- `THUNDER_SKIP_BACKEND=1` runs (17.3 tok/s) and `THUNDER_SKIP_KERNEL=1` runs
+  (9.3 tok/s), so the fault is in the **kernel launch**, not the gather or the
+  metadata.
+- The grid reproduces it with the engine's geometry: a new `prefill-b1024-16k`
+  shape (batch 1024, seqlen_q 16, seqlen_k 16384) faults with the same error --
+  **but not every time**: a four-cell batch sweep (2/64/256/1024) passed all four,
+  while the same cell alone failed twice. Treat a single grid cell at this geometry
+  as flaky, and prefer repeated runs before believing a pass.
+- Tile shape is not the trigger: n=16/32/64 and m=128/t=256 all fault alike, so the
+  prefill KV-tile change this session is not the cause.
+
+- Next: bisect inside the kernel for the many-request prefill (the row base
+  `req * kv_row_stride` with `num_reqs` = 1024 and a 16-row query block is the prime
+  suspect, e.g. an index or a grid bound that assumes one query row per request).
