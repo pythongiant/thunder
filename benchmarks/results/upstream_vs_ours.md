@@ -56,32 +56,35 @@ What is measurable is the attention launch itself, from `./.auto/measure.sh`
 
 | shape | ours (launch) | dequant-fp16 ref |
 |---|---|---|
-| decode 4k | 0.2732 ms | 2.4984 ms |
-| decode 32k | 1.9351 ms | 5.6024 ms |
-| prefill 4k | 7.3042 ms | 14.7688 ms |
+| decode 4k | 0.1843 ms | 2.4984 ms |
+| decode 32k | 1.3887 ms | 5.6024 ms |
+| prefill 4k | 5.6884 ms | 14.7688 ms |
 
 Deriving e2e from that (36 layers, attention as the only cost — an upper bound on
 our throughput, not a measurement):
 
 | ctx | ours (derived) | upstream tq3 | upstream fp16 |
 |---|---|---|---|
-| 4096 | ~9.8 ms ITL, ~102 tok/s | 7.03 ms, 109.5 tok/s | 3.10 ms, 172.9 tok/s |
-| 32768 | ~69.7 ms ITL, ~14 tok/s | 12.23 ms, 18.2 tok/s | 3.78 ms, 38.9 tok/s |
+| 4096 | ~6.6 ms ITL, ~151 tok/s | 7.03 ms, 109.5 tok/s | 3.10 ms, 172.9 tok/s |
+| 32768 | ~50.0 ms ITL, ~20 tok/s | 12.23 ms, 18.2 tok/s | 3.78 ms, 38.9 tok/s |
 
 Read the columns with their provenance in mind: ours counts attention only, while
 upstream's is a whole decode step (weights, MLP, sampling and engine overhead
 included), so ours is a **lower bound on our step time** and its throughput is an
-upper bound. That lower bound already exceeds upstream's *entire* step at both
-contexts — 9.8 ms vs 7.03 ms at 4k, 69.7 ms vs 12.23 ms at 32k — so this kernel
-is slower than upstream's compressed-KV path, and by more than those ratios once
-the non-attention work is added. Prefill is worse still: 263 ms vs 74.3 ms TTFT
-at 4k.
+upper bound. On that footing the 4k row is a tie: our attention alone (6.6 ms)
+now costs less than their entire step (7.03 ms), so parity is plausible — but our
+step also carries non-attention work, so parity is not demonstrated. The 32k row
+is a clear loss: 50.0 ms of attention against their 12.23 ms whole step. Prefill
+is worse still, 205 ms vs 74.3 ms TTFT at 4k.
 
-The cause is the v1 schedule, not the compressed format: FA4 does the 16k decode
-shape in 0.196 ms per layer — 7.0 ms per 36-layer step, reading *dense fp16* —
-about 6x faster than this kernel while moving 3.9x more bytes
-(`benchmarks/results/fa4_matrix_b200_full.md`). Compression only pays once the
-schedule is at parity.
+Do not read the tok/s columns against each other without this: 151 tok/s is
+attention-only, 109.5 tok/s is a served step. The only like-for-like comparison
+here is milliseconds of attention, and even that favours upstream at 32k.
+
+The remaining distance is the schedule, not the compressed format: FA4 does the
+16k decode shape in 0.196 ms per layer — 7.0 ms per 36-layer step, reading *dense
+fp16* — about 4x faster than this kernel while moving 3.9x more bytes
+(`benchmarks/results/fa4_matrix_b200_full.md`).
 
 ## Bugs found while building this
 

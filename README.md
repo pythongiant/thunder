@@ -26,11 +26,11 @@ are measured on two pins.
 | 4096 | upstream vLLM 0.25.1 | fp16 | 88.9 ms | 3.10 ms | 172.9 |
 | 4096 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | **74.3 ms** | 7.03 ms | 109.5 |
 | 4096 | thunder (pinned vLLM) | fp16, control | 99.0 ms | 3.04 ms | 165.6 |
-| 4096 | thunder (pinned vLLM) | packed k4v4 | *263 ms* | *9.8 ms* | *102* |
+| 4096 | thunder (pinned vLLM) | packed k4v4 | *205 ms* | *6.6 ms* | ***151*** |
 | 32768 | upstream vLLM 0.25.1 | fp16 | 706.3 ms | 3.78 ms | 38.9 |
 | 32768 | upstream vLLM 0.25.1 | `turboquant_3bit_nc` | 1380.2 ms | 12.23 ms | 18.2 |
 | 32768 | thunder (pinned vLLM) | fp16, control | 724.1 ms | 3.60 ms | 38.3 |
-| 32768 | thunder (pinned vLLM) | packed k4v4 | *—* | *69.7 ms* | *14* |
+| 32768 | thunder (pinned vLLM) | packed k4v4 | *—* | *50.0 ms* | ***20*** |
 
 *Italic = derived, not measured*: this plugin cannot yet be served end to end
 (graph capture faults — see *Known issues*), so its rows are the measured
@@ -46,28 +46,30 @@ Reading the table:
 - **Upstream's compression buys memory, not speed at batch 1**: 2.3x (4k) and
   3.2x (32k) more inter-token latency than its own fp16 KV. TTFT improves at 4k
   (74.3 vs 88.9 ms) and degrades 2x at 32k.
-- **Thunder is slower than upstream, on every row.** Its rows are attention only
-  — 36 layers of the measured launch — so they are a *lower bound* on its step
-  time, and that lower bound already exceeds upstream's *entire* step: 9.8 ms vs
-  7.03 ms at 4k and 69.7 ms vs 12.23 ms at 32k. Prefill is 263 ms vs 74.3 ms
-  TTFT. Weight GEMMs, sampling and engine overhead can only widen the gap.
+- **Thunder's decode is now at parity with upstream at 4k, and still behind at
+  32k.** Its rows are attention only — 36 layers of the measured launch — so they
+  are a *lower bound* on its step time; upstream's column is a whole step, with
+  weights and engine overhead included. On that footing: 6.6 ms against 7.03 ms
+  at 4k (attention alone now costs less than their entire step, so parity is
+  plausible but not demonstrated — our step also carries non-attention work), and
+  50.0 ms against 12.23 ms at 32k, a 4x deficit that no amount of the same
+  optimisation closes. Prefill is 205 ms vs 74.3 ms TTFT.
 
-The reason is the schedule, not the compression: FlashAttention-4 does the same
-16k decode shape in 0.196 ms per layer — 7.0 ms per 36-layer step, reading
-*dense fp16* — about 6x faster than this kernel while moving 3.9x more bytes.
-That measured gap, not the format, is what the v2 work is for.
+The remaining distance is the schedule, not the compression: FlashAttention-4
+does the same 16k decode shape in 0.196 ms per layer — 7.0 ms per 36-layer step,
+reading *dense fp16* — still about 4x faster than this kernel while moving 3.9x
+more bytes. That measured gap, not the format, is what the v2 work is for.
 
 At the kernel level, one attention launch in the configuration the engine
 actually launches (single-pass online softmax, register-local rescale, causal
 bound, engine split-K policy = 4, `k_bits=4` / `v_bits=4`, CUDA-graph medians)
-takes **0.273 ms** at 4k decode, **1.935 ms** at 32k decode and **7.304 ms** at
+takes **0.184 ms** at 4k decode, **1.389 ms** at 32k decode and **5.688 ms** at
 4k prefill, against **2.498 / 5.602 / 14.769 ms** for the same cache
-dequantized to fp16 and run through SDPA — 9.1x, 2.9x and 2.0x. That reference
+dequantized to fp16 and run through SDPA — 13.6x, 4.0x and 2.6x. That reference
 is a kernel-level sanity bound: it says fusing dequantization into attention is
-worth 2-9x, not that the kernel is competitive. Marginal shares of decode time,
-by ablation: MMAs 38%, packed-KV load 22%, K+V dequant 19%, split-K merge 1.5%.
-Run-to-run noise on these medians is about ±1%. Full method, caveats and raw
-rows: `benchmarks/results/upstream_vs_ours.md`.
+worth this much, not that the kernel is competitive. Run-to-run noise on these
+medians is about ±1%. Full method, caveats and raw rows:
+`benchmarks/results/upstream_vs_ours.md`.
 
 ### Correctness
 
@@ -146,10 +148,24 @@ the compression changes the traffic, not the math. That is why the kernel can
 match a dequantized-fp16 oracle to 1e-2 while reading 3.9x fewer bytes.
 
 **Batch-1 decode fills the machine with split-K.** A 32-head decode grid is only
-32 CTAs on 148 SMs, so the KV range is split: 4 ways gives 128 CTAs and measures
-**3.5x** (4k) and **3.9x** (32k) over the unsplit schedule. The split partials
-are reduced by an online-softmax rescale, so the extra CTAs cost one small merge
-(1.5% of decode at 32k, 10% at 4k).
+32 CTAs on 148 SMs, so the KV range is split 8 ways: 256 CTAs, measuring **3.5x**
+(4k) and **3.9x** (32k) over the unsplit schedule. The knee is at 8 rather than
+4, and that follows from the next point — extra CTAs only help once the SM can
+keep two resident. The partials are reduced by an online-softmax rescale in one
+fused kernel; the ten-launch torch chain it replaced cost 13% of 4k decode.
+
+**Two CTAs per SM, not one.** Shared memory was 121 KB, just over the 113 KB
+line, so each SM ran a single CTA and sat largely idle — about 29k cycles per KV
+tile against ~7k of modelled work. Writing the output staging buffer as fp16
+instead of fp32 (it is pure staging: written from the accumulator fragment, read
+back one row per thread) took the kernel to ~89 KB and fits two CTAs. Prefill,
+which has 2048 CTAs, fell 21% on that change alone; decode needed the split-count
+change to turn the same headroom into CTAs.
+
+**The packed load no longer waits on itself.** It was one dependent load->store
+chain per byte, 32 iterations per thread per buffer, and ablating the load
+entirely measured 22% of decode. Every global load now issues before any store,
+so the latencies overlap instead of serializing (-2.4%).
 
 **The KV is traversed once.** Single-pass online softmax removes the separate
 row-max pass — otherwise every tile loads and dequantizes K twice — and
@@ -168,7 +184,7 @@ function by kernel config instead of re-tracing MLIR per call: a launch costs
 graph capture cheap.
 
 Where this is *not* fast yet: against FlashAttention-4 on the same shapes we are
-3.3x off at 4k decode and about 6x at 16k
+2.25x off at 4k decode and about 4x at 16k
 (`benchmarks/results/fa4_matrix_b200_full.md`). The remaining gap is
 schedule-level, not parameter-level — the MMA M tile is bound to the warp count
 (`m_block == num_warps * 16`), so a one-row decode pays for a 64-row tile, and
