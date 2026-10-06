@@ -167,3 +167,24 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   until the dense gather is capturable -- the eager path is correct (vLLM's own
   warmup run completes at 32k). Do not "fix" this by lowering the budget: that
   trades a working context length for a startup failure.
+
+## 15. An illegal address at 16k engine geometry — OPEN
+
+At ctx 16384 the plugin faults with `cudaErrorIllegalAddress` in both eager and
+graph mode, while ctx 4096 works. The error surfaces at the first synchronising op
+*after* the prefill (`torch.equal` inside `HadamardRotation.__init__`, reached from
+`do_kv_cache_update`), which is why the traceback points at the quantizer instead of
+at the fault.
+
+- `THUNDER_SKIP_BACKEND=1` runs (17.3 tok/s), so it is this backend.
+- `THUNDER_SKIP_KERNEL=1` also runs (9.3 tok/s), so it is the **kernel launch**,
+  not the gather or the metadata.
+- The kernel itself is fine at that shape in the harness: a new `prefill-16k` grid
+  shape (batch 1, 16384/16384, the shipped prefill tile) measures 63.1 ms with
+  n=16 and 79.4 ms with n=64. So the fault is **engine-geometry dependent** -- the
+  engine's manager is `max_num_reqs=952`, `max_blocks_per_req=1028` (15.4 GiB
+  reservation, `kv_row_stride` 16,448 tokens), where the harness uses batch-1
+  geometry.
+- Next probe: `--e2e "16384|ours-eager|4|4|0|THUNDER_DEBUG_LAUNCH=1"` prints the
+  exact `q`/`kv`/`bt`/`sl`/`max_query_len`/`is_prefill` the kernel is launched with;
+  compare against the harness's batch-1 geometry to find the bound that is wrong.
