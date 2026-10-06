@@ -152,7 +152,20 @@ class PagedKVManager:
                 "bpr": torch.zeros(self.max_num_reqs, dtype=torch.int64,
                                    device=self.device),
                 "sel": torch.zeros(cap, dtype=torch.int64, device=self.device),
-                "padded": torch.zeros(cap + 1, dtype=torch.int64, device=self.device),
+                # int32 to match the block table: scatter_ requires equal dtypes,
+                # and a cast would allocate inside the captured region.
+                "padded": torch.zeros(cap + 1, dtype=torch.int32, device=self.device),
+                # Build scratch. The device-side CSR build runs inside the captured
+                # region, and an allocation there has to come from the graph pool:
+                # it was building ~65 MB of temporaries per layer, which made the
+                # pool grow mid-capture and invalidated the 32k capture. These are
+                # persistent and reused, so the build allocates nothing.
+                "ar": torch.arange(self.max_blocks_per_req, dtype=torch.int64,
+                                   device=self.device),
+                "dest": torch.zeros(cap, dtype=torch.int64, device=self.device),
+                "valid": torch.zeros(cap, dtype=torch.bool, device=self.device),
+                "off": torch.zeros(self.max_num_reqs, dtype=torch.int64,
+                                   device=self.device),
             }
             self._csr = None
             self._csr_md = None
@@ -416,22 +429,35 @@ class PagedKVManager:
         indptr.zero_()
         if r > 0:
             bpr.zero_()
+            # int32 arithmetic: copy_ casts, and a .to(int64) here would allocate
+            # inside the captured region.
             bpr[:r].copy_(
-                ((metadata.seq_lens[:r].to(torch.int64) + bs - 1) // bs)
-                .clamp_(0, b)
+                ((metadata.seq_lens[:r] + (bs - 1)) // bs).clamp_(0, b)
             )
-            ar = torch.arange(b, device=dev, dtype=torch.int64).unsqueeze(0)
-            valid = ar < bpr[:r].unsqueeze(1)
-            off = bpr[:r].cumsum(0) - bpr[:r]
-            dest = (off.unsqueeze(1) + ar).clamp_(0, cap - 1)
-            dest = torch.where(valid, dest, torch.full_like(dest, cap))
+            ar = bufs["ar"][:b].unsqueeze(0)
+            n = r * b
+            valid = bufs["valid"][:n].view(r, b)
+            dest = bufs["dest"][:n].view(r, b)
+            off = bufs["off"][:r]
+            torch.lt(ar, bpr[:r].unsqueeze(1), out=valid)
+            torch.cumsum(bpr[:r], 0, out=off)
+            off.sub_(bpr[:r])
+            torch.add(off.unsqueeze(1), ar, out=dest)
+            dest.clamp_(0, cap - 1)
+            # Invalid slots point at the sentinel slot of `padded` (which is one
+            # longer than cap), so the scatter writes them somewhere harmless.
+            dest.masked_fill_(~valid, cap)
             padded.zero_()
             padded.scatter_(
-                0, dest.reshape(-1), metadata.block_table[:r].reshape(-1).to(torch.int64)
+                0, dest.reshape(-1), metadata.block_table[:r].reshape(-1)
             )
             sel.copy_(padded[:cap])
             sel.clamp_(0, max(int(num_blocks) - 1, 0))
-            indptr[1:r + 1].copy_((bpr[:r].cumsum(0) * bs).to(torch.int32))
+            # indptr[i] is request i's token base, i.e. the EXCLUSIVE prefix sum --
+            # which is the inclusive sum shifted one slot, since indptr[0] = 0.
+            off.add_(bpr[:r])
+            indptr[1:r + 1].copy_(off)
+            indptr[1:r + 1].mul_(bs)
         nrows = int(bpr[:r].sum().item()) if (compute_nrows and r > 0) else -1
         self._indptr = indptr
         CSR_COUNTS["uploads"] += 1
