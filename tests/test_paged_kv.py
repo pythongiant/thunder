@@ -15,6 +15,11 @@ from thunder_vllm.attention.cache_layout import (
     allocate_kv_cache,
     reshape_and_cache_ref,
 )
+from thunder_vllm.attention.backend import (
+    REQUEST_MAJOR_GATHER_BUDGET_BYTES,
+    _request_major_gather_bytes,
+    _use_indirect_gather,
+)
 from thunder_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
 from thunder_vllm.quant.quantizer import ThunderQuantizer
 
@@ -338,3 +343,27 @@ def test_direct_paged_tile_bytes_match_csr_gather():
             got = k_codes_flat[rows]
             want = gathered_flat[base_token + nt * tile_n: base_token + nt * tile_n + tile_n]
             assert torch.equal(got, want), (req, nt)
+
+
+def test_gather_path_follows_the_reservation_size():
+    """Request-major cannot be trimmed without breaking its row layout
+    (row = req * max_blocks_per_req + block), so it is only used while its
+    worst-case reservation fits the budget -- past that the CSR path packs live
+    blocks densely and reserves by the physical block count. Measured sizes for
+    Qwen3-8B: 4k reserves 4.2 GiB (fits, request-major), 32k reserves 33 GiB and
+    used to die in ``reserve`` with CUDA OOM on a 178 GiB device already holding
+    a 98.9 GiB KV cache.
+    """
+    from types import SimpleNamespace
+
+    layout = SimpleNamespace(block_size=16, k_packed_bytes=64, v_packed_bytes=64)
+    req4k = SimpleNamespace(max_num_reqs=952, max_blocks_per_req=260)
+    req32k = SimpleNamespace(max_num_reqs=952, max_blocks_per_req=2052)
+
+    assert _request_major_gather_bytes(req4k, layout, 8) < REQUEST_MAJOR_GATHER_BUDGET_BYTES
+    assert _request_major_gather_bytes(req32k, layout, 8) > REQUEST_MAJOR_GATHER_BUDGET_BYTES
+    assert not _use_indirect_gather(req4k, layout, 8, "")
+    assert _use_indirect_gather(req32k, layout, 8, "")
+    # An explicit setting still wins, so the OOM stays reproducible on demand.
+    assert not _use_indirect_gather(req32k, layout, 8, "0")
+    assert _use_indirect_gather(req4k, layout, 8, "1")

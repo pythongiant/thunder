@@ -32,6 +32,40 @@ from thunder_vllm.utils.logging import env_flag, get_logger, log_once
 
 logger = get_logger("attention.backend")
 
+# Request-major gather budget. That path keeps request identity in the row stride
+# (row = req * max_blocks_per_req + block), so its reservation is the WORST case
+# max_num_reqs * max_blocks_per_req block-rows and cannot be trimmed without
+# breaking the layout. At 32k on Qwen3-8B that is 952 * 2052 block-rows =
+# 33 GiB of packed KV, which does not fit beside a 98.9 GiB KV cache on a
+# 178 GiB device -- the 32k e2e died in ``reserve`` with CUDA OOM. The CSR path
+# packs the live blocks densely and reserves by the physical block count
+# (32k: 180k block-rows = 3.0 GiB), so it takes over past this budget.
+REQUEST_MAJOR_GATHER_BUDGET_BYTES = 8 << 30
+
+
+def _request_major_gather_bytes(paged, layout, num_kv_heads: int) -> int:
+    """Bytes the request-major gather reservation would need (worst case)."""
+    per_block_row = (
+        int(layout.block_size) * int(num_kv_heads)
+        * (int(layout.k_packed_bytes) + int(layout.v_packed_bytes) + 4)
+    )
+    return int(paged.max_num_reqs) * int(paged.max_blocks_per_req) * per_block_row
+
+
+def _use_indirect_gather(paged, layout, num_kv_heads: int, setting: str) -> bool:
+    """CSR gather when asked for, or when the request-major table would not fit.
+
+    ``THUNDER_8B_INDIRECT`` still wins when set (``0`` forces request-major, even
+    past the budget, for reproducing the OOM).
+    """
+    val = (setting or "").strip().lower()
+    if val:
+        return val not in ("0", "false", "no", "off")
+    return (
+        _request_major_gather_bytes(paged, layout, num_kv_heads)
+        > REQUEST_MAJOR_GATHER_BUDGET_BYTES
+    )
+
 _ENGINE_HOOK = {"done": False}
 _PAGED_CACHE: dict = {}
 _CSR_DEBUG = {"done": False}
@@ -786,9 +820,9 @@ class ThunderAttentionImpl(AttentionImplBase):
                 1,
                 int(((_sl_cpu[:_r].to(torch.int64) + _bs - 1) // _bs).max().item()),
             )
-        _indirect = (
-            os.environ.get("THUNDER_8B_INDIRECT", "0").strip().lower()
-            not in ("", "0", "false", "no", "off")
+        _indirect = _use_indirect_gather(
+            paged, self.layout, self.num_kv_heads,
+            os.environ.get("THUNDER_8B_INDIRECT", ""),
         )
         _capturing = torch.cuda.is_current_stream_capturing()
         _indptr = None
