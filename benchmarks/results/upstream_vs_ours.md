@@ -64,7 +64,7 @@ At 32k the run died before that:
   request-major gather reserves `max_num_reqs * max_blocks_per_req` block-rows
   (952 x 2052 = 33 GiB at 32k) because its row layout cannot be trimmed. Under
   capture it surfaced as `CUDA_ERROR_ILLEGAL_ADDRESS` instead.
-- Fixed by selecting the CSR gather past an 8 GiB reservation budget (it packs
+- Fixed by selecting the CSR gather past a 16 GiB reservation budget (it packs
   live blocks and reserves by the physical block count: 3.0 GiB at 32k). The CSR
   path then invalidated the capture, which was its per-layer temporaries (3 GiB
   each) being allocated inside the captured region; it now selects straight into

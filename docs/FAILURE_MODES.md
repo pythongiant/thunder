@@ -136,5 +136,9 @@ bug and cost a session's worth of bisecting the wrong thing.
   kernel. Also: any buffer sized from `max_model_len` is a suspect at long context.
 - Mitigation: the CSR path packs live blocks densely and reserves by the physical
   block count, so the path is now chosen from the reservation size
-  (`_use_indirect_gather`, 8 GiB budget) rather than from a flag default; the
+  (`_use_indirect_gather`, 16 GiB budget: 4.2 GiB at 4k and 8.2 GiB at 8k stay on
+  request-major, 33 GiB at 32k switches) rather than from a flag default; the
   explicit `THUNDER_8B_INDIRECT` override still wins, so the OOM stays reproducible.
+  The budget is a constant and `reserve()` refuses to grow after the first
+  allocation, because the two paths share one reservation: a path that flipped
+  with memory pressure would make the other path write past the buffer.
