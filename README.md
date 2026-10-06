@@ -15,8 +15,36 @@ throughput.
 ## Benchmarks
 
 All numbers: B200, `Qwen/Qwen3-8B` (32 Q heads / 8 KV heads / head_dim 128,
-GQA 4:1), batch 1, greedy, 32 generated tokens, fp16 weights. Upstream's
-GQA/MHA KV path is **stock vLLM** since
+GQA 4:1), batch 1, greedy, 32 generated tokens, fp16 weights.
+
+### What this pass changed
+
+Every row is a measured attention launch on the engine-like shapes, in the
+configuration the engine ships (single-pass online softmax, register rescale,
+causal bound, split-K policy), `k_bits=4`/`v_bits=4`, CUDA-graph medians.
+
+| workload | before | after | win |
+|---|---|---|---|
+| decode, 4k context | 0.2732 ms | **0.1843 ms** | **1.48x** |
+| decode, 32k context | 1.9351 ms | **1.3887 ms** | **1.39x** |
+| prefill, 4k | 7.3042 ms | **5.6884 ms** | **1.28x** |
+| decode 4k vs dequant-fp16 reference | 2.498 ms | 0.184 ms | **13.6x** |
+| decode 32k vs dequant-fp16 reference | 5.602 ms | 1.389 ms | **4.0x** |
+| KV cache at 32k, one request | 128.0 MiB (fp16) | **33.0 MiB** | **3.9x smaller** |
+
+The win came from occupancy, not from the arithmetic: shared memory was 121 KB,
+just over the line for two CTAs per SM, so each SM ran one CTA and sat ~75%
+idle. Writing the output staging buffer as fp16 took the kernel to ~89 KB, and
+the split-K knee moved from 4 to 8 as the extra CTAs became resident (plus a
+two-phase packed load and a fused split-K merge). Details in *Why it is fast*.
+
+The dequant-fp16 column is a kernel-level sanity bound, not the competition —
+it measures the value of fusing dequantization into attention, not a win over
+another implementation. The competition is the next table.
+
+### Against upstream TurboQuant KV
+
+Upstream's GQA/MHA KV path is **stock vLLM** since
 [vllm#38479](https://github.com/vllm-project/vllm/pull/38479) — vLLM 0.25.1 with
 `--kv-cache-dtype turboquant_3bit_nc`, no plugin — which is why the two kernels
 are measured on two pins.
