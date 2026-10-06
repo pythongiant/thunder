@@ -85,18 +85,21 @@ Reading the table:
   | what is measured | number | rate |
   |---|---|---|
   | attention only (36 x 0.078 ms launch) | 2.80 ms/token | **~357 tok/s** |
-  | decode, served (`1 / ITL`) | 16.6-56.7 ms | **18-60 tok/s** |
+  | decode, served (`1 / ITL`) | 12.8-78.3 ms | **13-60 tok/s** |
   | whole request (32 tokens / wall time) | 4.3-4.4 s | **7.4-7.5 tok/s** |
 
   The first row is the kernel and it is the fast part — 0.078 ms per launch,
-  measured on the engine's own shapes. The second is the served decode rate; the
-  ~14 ms/token between them is per-layer host work (the CuTeDSL launch costs about
-  0.35 ms of host time per layer, plus the gather and the merge). The third is what
-  a client sees for a 32-token request, and the gap to the second is a 4k prefill
-  that currently takes 1.9-3.7 s. Earlier revisions of this file quoted a
-  *derived* 151 tok/s (0.184 ms per launch x 36 layers); the same derivation on the
-  current kernel gives ~357, so the kernel has moved the right way while the
-  serving path — newly measurable now that capture works — is the open problem.
+  measured on the engine's own shapes. The second is the served decode rate, and
+  the spread within it is real: 60 tok/s with vLLM's engine multiprocessing on
+  (vLLM's default) against 13 with it forced off, plus run-to-run variation. The
+  gap to the first row is per-layer host work, of which the measured pieces are
+  0.25 ms per launch of launcher plumbing (argument packing and `from_dlpack`,
+  36 x = 9 ms/token) plus the gather and the merge. The third row is what a client
+  sees for a 32-token request, and the gap to the second is a 4k prefill that
+  currently takes 1.9-3.7 s. Earlier revisions of this file quoted a *derived*
+  151 tok/s (0.184 ms per launch x 36 layers); the same derivation on the current
+  kernel gives ~357, so the kernel has moved the right way while the serving path —
+  newly measurable now that capture works — is the open problem.
 - **Two throughput columns, because one number was misleading.** `request tok/s`
   is `generated tokens / total wall time` — the same definition upstream's rows
   use, kept so the tables stay comparable — and at 32 generated tokens it is
