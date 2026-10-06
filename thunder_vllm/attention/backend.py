@@ -202,10 +202,11 @@ class ThunderCuteConfig:
             gqa_pack=_flag("THUNDER_GQA_PACK"),
         )
 
-    def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool) -> tuple:
-        # The tile comes from the schedule (decode vs prefill), not from the
-        # env defaults, so the key has to carry the tile actually compiled.
-        tile = tile_shape(bool(is_causal))
+    def kernel_key(self, head_dim: int, num_kv_heads: int, is_causal: bool,
+                   num_reqs: int = 1) -> tuple:
+        # The tile comes from the schedule and the batch, not from the env
+        # defaults, so the key has to carry the tile actually compiled.
+        tile = tile_shape(bool(is_causal), num_reqs)
         return (
             head_dim,
             self.k_bits,
@@ -578,10 +579,10 @@ class ThunderAttentionImpl(AttentionImplBase):
         self._paged = mgr
         return self._paged
 
-    def get_kernel(self, head_dim: int, is_causal: bool) -> Any:
-        """Compile (once) and cache the kernel for this shape."""
-        tile = tile_shape(bool(is_causal))
-        key = self.cfg.kernel_key(head_dim, self.num_kv_heads, is_causal)
+    def get_kernel(self, head_dim: int, is_causal: bool, num_reqs: int = 1) -> Any:
+        """Compile (once) and cache the kernel for this shape and schedule."""
+        tile = tile_shape(bool(is_causal), num_reqs)
+        key = self.cfg.kernel_key(head_dim, self.num_kv_heads, is_causal, num_reqs)
         kernel = self._kernels.get(key)
         if kernel is None:
             mod = _kernel_module()
@@ -711,7 +712,9 @@ class ThunderAttentionImpl(AttentionImplBase):
             )
 
         is_causal = attn_metadata.is_prefill or attn_metadata.max_query_len > 1
-        kernel = self.get_kernel(self.head_size, is_causal)
+        kernel = self.get_kernel(
+            self.head_size, is_causal, int(getattr(attn_metadata, "num_reqs", 0) or 1)
+        )
 
         # The KV-cache write is a separate op in vLLM main; if the runner has
         # not done it yet, do it here.
@@ -1007,7 +1010,7 @@ class ThunderAttentionImpl(AttentionImplBase):
             seq_len,
             is_prefill=is_causal,
             num_kv_groups=self.num_kv_groups,
-            tile_n=tile_shape(bool(is_causal))["n_block"],
+            tile_n=tile_shape(bool(is_causal), n_reqs)["n_block"],
         )
 
     def do_kv_cache_update(self, *args: Any, **kwargs: Any) -> None:

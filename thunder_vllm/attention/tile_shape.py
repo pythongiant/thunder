@@ -30,13 +30,26 @@ from __future__ import annotations
 # so 32 rows go with 64 threads and 64 rows with 128.
 DECODE_TILE = {"m_block": 32, "n_block": 32, "num_threads": 64}
 PREFILL_TILE = {"m_block": 64, "n_block": 64, "num_threads": 128}
+# Batched decode fills the M tile with one live row per request: at batch 16 the
+# 32-row tile is half live and the 16-row tile is exactly live, which measures
+# 4.3% faster (11.63 vs 12.15 ms at 32k). At batch 1 the same tile is 34% slower,
+# so the switch is gated on the batch rather than applied globally.
+DECODE_TILE_BATCHED = {"m_block": 16, "n_block": 16, "num_threads": 32}
+BATCHED_DECODE_FROM = 16
 
 
-def tile_shape(is_prefill: bool) -> dict[str, int]:
-    """Tile shape for a step: the decode schedule or the prefill schedule.
+def tile_shape(is_prefill: bool, num_reqs: int = 1) -> dict[str, int]:
+    """Tile shape for a step: prefill, batched decode, or plain decode.
 
     ``is_prefill`` is the engine's "this step is prefill-like" flag
     (``is_causal = is_prefill or max_query_len > 1``); a one-token decode step
-    takes the decode shape even when the attention itself is causal.
+    takes a decode shape even when the attention itself is causal.
+    ``num_reqs`` only matters for decode, and only above the measured threshold
+    (batch 1 and 16 were measured; nothing in between was, so the switch waits
+    for the batch that was actually measured).
     """
-    return PREFILL_TILE if is_prefill else DECODE_TILE
+    if is_prefill:
+        return PREFILL_TILE
+    if num_reqs >= BATCHED_DECODE_FROM:
+        return DECODE_TILE_BATCHED
+    return DECODE_TILE
