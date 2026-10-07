@@ -223,19 +223,19 @@ generation. The `plumbing` bucket is small and believable in the same dump
   attributing a decode step. `docs/FAILURE_MODES.md` 3 already warns that these
   buckets measure dispatch, not execution.
 
-## 17. A synthetic batch that is not the geometry it claims — LIVED
+## 17. Reading a measurement's geometry off the wrong thing — LIVED
 
-`make_synthetic_batch(batch, seqlen, ...)` builds one full sequence per request and
-the smoke runner takes the first `batch * seqlen_q` rows of it, so a "chunked
-prefill" shape (batch 256, seqlen_q 16, seqlen_k 4096) puts every query row at the
-START of its request's KV. A real chunk sits at the END and attends the whole
-prefix, so that shape's causal work is a small fraction of the engine's and its
-timings cannot be read as the engine's. It is still useful for M-tile questions
-(those are about how full the tile is, not how far it walks), which is how the
--30% chunked-prefill tile number was measured -- but the ratio must not be quoted
-for the engine until the synthetic geometry places the chunk at the end.
+I recorded that the grid's chunked-prefill shapes (batch 256, seqlen_q 16,
+seqlen_k 4096) understated their causal work, because `make_synthetic_batch` fills
+`q` from the start of a synthetic sequence and the rows therefore *look* like they
+sit at the start of the KV. That was wrong, and it nearly cost a valid measurement:
+the kernel anchors a request's query rows at the END of its context --
+`_valid` masks with `kv_len - q_len + q_off + row` "because vLLM appends the query
+tokens to the request's existing context" -- so those rows attend the whole
+4096-token prefix, exactly as an engine chunk does. The -30% chunked-prefill tile
+number is faithful.
 
-- Detection: check where `query_start_loc` puts the rows relative to `seqlen_k`
-  before believing a prefill timing from the grid.
-- Mitigation: teach `make_synthetic_batch` a `query_offset` (rows at the end) and
-  re-measure the prefill shapes.
+- Detection: read the kernel's masking, not the tensor's contents. Synthetic values
+  are random, so the *data* never tells you where the rows are; only the mask does.
+- Mitigation: when a measurement's validity depends on geometry, cite the code that
+  defines it (here `_valid`) in the same breath as the number.

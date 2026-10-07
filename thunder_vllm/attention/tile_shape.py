@@ -64,11 +64,10 @@ def tile_shape(is_prefill: bool, num_reqs: int = 1,
         # engine's 4k geometry (256 requests x 16 rows) the full-height tile
         # measures 34.07 ms per layer against 23.86 ms for the 32-row one --
         # -30% -- because 16 live rows inside a 64-row tile waste three quarters
-        # of the QK/PV and staging work. Caveat: that grid shape puts the query
-        # rows at the START of the KV, so its causal work is a fraction of a real
-        # chunk's (the engine's chunk sits at the END, attending the whole
-        # prefix); the M-efficiency argument carries over, the ratio does not --
-        # re-measure once the synthetic chunked-prefill geometry is faithful. A genuinely long prefill keeps the
+        # of the QK/PV and staging work. The grid shape is faithful: the kernel
+        # anchors each request's query rows at the END of its context (see
+        # _valid in cute_kernel.py), so those 16 rows attend the whole 4096-token
+        # prefix exactly as an engine chunk does. A genuinely long prefill keeps the
         # full-height tile (it has thousands of live rows and pays for the extra
         # q-blocks otherwise).
         if max_query_len is not None and max_query_len <= CHUNKED_PREFILL_MAX_Q:
