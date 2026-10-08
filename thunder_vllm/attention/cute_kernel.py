@@ -1278,6 +1278,10 @@ def _fast_key(kernel_cfg, shapes, num_reqs, max_query_len, num_splits,
 # recycled id() cannot alias a dead buffer, and it is tiny -- a process sees a
 # handful of distinct buffer sets.
 _ARGS_CACHE: dict = {}
+# Leading dimension every launch uses, so the compiled function is reused across
+# steps. Large enough for a full prefill chunk, small enough to stay in every
+# allocation (``_fixed_rows`` caps it by the storage).
+_LAUNCH_ROWS = 1 << 16
 _ARGS_CACHE_MAX = 16
 
 
@@ -1292,6 +1296,34 @@ def _dlpack_cached(tensors):
         _ARGS_CACHE.clear()
     _ARGS_CACHE[key] = (wrapped, list(tensors))
     return wrapped
+
+
+def _fixed_rows(t: "torch.Tensor", rows: int) -> "torch.Tensor":
+    """View ``t`` with a stable leading dimension, capped by its own storage.
+
+    CuTeDSL traces tensor shapes into the generated MLIR, so a new leading dimension
+    is a new compile (~1.9 s, measured as the p90 of the launch bucket against a
+    1.07 ms median). The kernel's work comes from the metadata -- ``seq_lens``,
+    ``query_start_loc`` and ``max_query_len`` -- not from this dimension, and every
+    read is masked by them, so the view only has to stay inside the allocation. The
+    row count is rounded down to a power of two so it does not wobble with the step.
+    """
+    import torch
+
+    per_row = 1
+    for d in t.shape[1:]:
+        per_row *= int(d)
+    capacity = t.untyped_storage().nbytes() // max(t.element_size() * per_row, 1)
+    # Deliberately NOT capped by t.shape[0]: a view larger than the live row count is
+    # sound here because every read and write is masked by the metadata, and it is
+    # what makes the shape stable. The storage is vLLM's own buffer, so it covers it.
+    rows = min(int(rows), int(capacity))
+    if rows < 1:
+        return t
+    rows = 1 << (rows.bit_length() - 1)
+    if rows == t.shape[0]:
+        return t
+    return t.as_strided((rows,) + tuple(t.shape[1:]), t.stride())
 
 
 def launch_thunder_attention(
@@ -1368,7 +1400,13 @@ def launch_thunder_attention(
 
     seq_lens = metadata.seq_lens.to(torch.int32).contiguous()
     q_start = metadata.query_start_loc.to(torch.int32).contiguous()
-    o3 = out.reshape(q.shape[0], q.shape[1], q.shape[2]).contiguous()
+    # Launch with a stable shape: the leading dimension of q/out otherwise changes
+    # with the token count (the prompt length for a prefill), and each new value is
+    # a fresh CuTeDSL compile inside the request.
+    q = _fixed_rows(q.reshape(q.shape[0], q.shape[1], q.shape[2]).contiguous(),
+                    _LAUNCH_ROWS)
+    o3 = _fixed_rows(out.reshape(q.shape[0], q.shape[1], q.shape[2]).contiguous(),
+                     _LAUNCH_ROWS)
 
     _torch_args = [q.contiguous(), k, v, kn, vn, k_lut, v_lut, o3, seq_lens, q_start]
     args = _dlpack_cached(_torch_args)
