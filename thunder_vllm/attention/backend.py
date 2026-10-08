@@ -591,7 +591,8 @@ class ThunderAttentionImpl(AttentionImplBase):
         )
 
         self._quantizer: Any = None
-        self._needs_full_prefill_warm = False
+        self._warmed = False
+        self._warm_plans: list = []
         self._paged: PagedKVManager | None = None
 
     # ------------------------------------------------------------------ #
@@ -775,12 +776,13 @@ class ThunderAttentionImpl(AttentionImplBase):
             int(getattr(attn_metadata, "num_reqs", 0) or 1),
             int(getattr(attn_metadata, "max_query_len", 0) or 0) or None,
         )
-        # A chunked (or profiling) step is a prefill with few rows per request.
-        # vLLM's warmup only ever runs that geometry, so compile the full-height
-        # prefill kernel here too rather than inside the first real request, where
-        # it costs ~1.5 s of TTFT.
-        if is_causal and 0 < int(getattr(attn_metadata, "max_query_len", 0) or 0) <= 32:
-            self._needs_full_prefill_warm = True
+        # Compile every (tile, causal) config the policy can produce, during the
+        # first step, so no CuTeDSL compile (~1.6 s each) lands inside a request.
+        # vLLM's own warmup only exercises its profiling geometry, which is the
+        # chunked prefill tile.
+        if not self._warmed:
+            self._warmed = True
+            self._warm_plans = [(True, None), (True, 16), (False, 1)]
 
         # The KV-cache write is a separate op in vLLM main; if the runner has
         # not done it yet, do it here.
@@ -965,25 +967,29 @@ class ThunderAttentionImpl(AttentionImplBase):
             and int(getattr(attn_metadata, "max_query_len", 0) or 0) == 1
             and self.num_kv_groups > 1
         )
-        if getattr(self, "_needs_full_prefill_warm", False):
-            # vLLM's warmup only runs the chunked/profiling geometry, so compile the
-            # full-height prefill kernel here instead of inside the first real
-            # request, where it costs ~1.5 s of TTFT (first call 1501 ms host
-            # against 6.6 ms steady state, measured with the launcher isolated).
-            self._needs_full_prefill_warm = False
-            try:
-                launch_thunder_attention(
-                    self.get_kernel(self.head_size, True,
-                                    int(getattr(attn_metadata, "num_reqs", 0) or 1), None),
-                    q, gathered, o, attn_metadata, self.scale,
-                    quantizer=quantizer, num_splits=1, gqa_pack=False,
-                    onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
-                    causal_bound=self.cfg.causal_bound,
-                    indptr=_indptr, indirect=bool(_indirect),
-                    compile_only=True,
-                )
-            except Exception:
-                logger.exception("full-prefill kernel warmup failed (non-fatal)")
+        if getattr(self, "_warm_plans", None):
+            # CuTeDSL compiles on the first call of each (tile, causal) config and a
+            # compile costs ~1.6 s, so every config the policy can produce has to be
+            # compiled during warmup: vLLM's warmup only runs its own profiling
+            # geometry, and a compile landing inside a request shows up as TTFT.
+            # Measured in-process: the launcher's steady cost is 0.15 ms per call,
+            # but the mean over a run reads 13.86 ms because several compiles are
+            # spread through it.
+            plans, self._warm_plans = self._warm_plans, []
+            n_reqs = int(getattr(attn_metadata, "num_reqs", 0) or 1)
+            for warm_causal, warm_q in plans:
+                try:
+                    launch_thunder_attention(
+                        self.get_kernel(self.head_size, warm_causal, n_reqs, warm_q),
+                        q, gathered, o, attn_metadata, self.scale,
+                        quantizer=quantizer, num_splits=1, gqa_pack=False,
+                        onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
+                        causal_bound=self.cfg.causal_bound,
+                        indptr=_indptr, indirect=bool(_indirect),
+                        compile_only=True,
+                    )
+                except Exception:
+                    logger.exception("kernel warmup failed (non-fatal)")
 
         launch_thunder_attention(
             kernel,
