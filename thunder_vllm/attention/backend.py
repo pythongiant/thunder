@@ -263,6 +263,12 @@ class ThunderCuteConfig:
                    num_reqs: int = 1, max_query_len: int | None = None) -> tuple:
         # The tile comes from the schedule and the batch, not from the env
         # defaults, so the key has to carry the tile actually compiled.
+        # ``num_reqs`` and ``max_query_len`` are deliberately NOT in the key: they
+        # only matter through the tile, and the tile IS in the key. Including them
+        # made the key depend on the step's request count, so a warmup at
+        # num_reqs=1024 (vLLM's profiling batch) did not cover the real prefill's
+        # num_reqs=1 and the first request paid a ~1.9 s CuTeDSL compile -- measured
+        # as the p90 of the launch bucket against a 1.07 ms median.
         tile = tile_shape(bool(is_causal), num_reqs, max_query_len)
         return (
             head_dim,
