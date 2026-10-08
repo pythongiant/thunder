@@ -127,3 +127,40 @@ def test_cache_write_scatter_matches_reference():
         assert torch.allclose(
             scales[blk, :, off, 0].float(), expected.k_norm[i].float()
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton scatter needs CUDA")
+def test_triton_scatter_matches_reference_at_the_engine_geometry():
+    """The Triton scatter at the contract the ENGINE actually uses.
+
+    `test_cache_write_scatter_matches_reference` covers the torch reference at
+    4-bit K, which takes `_reshape_and_cache_kernel`; the engine's default is
+    3-bit K, an unsupported width that routes to `_scatter_codes` -- torch
+    quantizer plus the Triton data movement -- which therefore had NO parity
+    coverage at all. The shapes here are the engine's measured ones
+    (`k_packed=(n, 8, 48)`, `k_norm=(n, 8)`, cache `(nb, 8, 16, 112)`), and the
+    slot mapping carries PAD_SLOT_ID, since the engine's padded batches do.
+    """
+    from thunder_vllm.attention.cache_layout import reshape_and_cache
+
+    layout = ThunderCacheLayout(
+        num_kv_heads=8, head_dim=128, k_bits=3, v_bits=4, block_size=16
+    )
+    q = ThunderQuantizer(128, 3, 4)
+    nb, n = 6, 20
+    torch.manual_seed(11)
+    key = torch.randn(n, 8, 128, dtype=torch.float16, device="cuda")
+    value = torch.randn(n, 8, 128, dtype=torch.float16, device="cuda")
+    slot = torch.randperm(nb * 16, device="cuda")[:n].to(torch.long)
+    slot[3] = -1  # PAD_SLOT_ID, as a padded engine batch has
+
+    kv_ref, sc_ref = allocate_kv_cache(nb, 16, 8, 128, 3, 4, device="cuda")
+    kv_tri, sc_tri = allocate_kv_cache(nb, 16, 8, 128, 3, 4, device="cuda")
+    reshape_and_cache_ref(key, value, slot, kv_ref, sc_ref, q, layout)
+    reshape_and_cache(key, value, slot, kv_tri, sc_tri, q, layout)
+    torch.cuda.synchronize()
+
+    assert torch.equal(layout.k_codes(kv_tri), layout.k_codes(kv_ref))
+    assert torch.equal(layout.v_codes(kv_tri), layout.v_codes(kv_ref))
+    assert torch.equal(layout.k_norm(sc_tri), layout.k_norm(sc_ref))
+    assert torch.equal(layout.v_norm(sc_tri), layout.v_norm(sc_ref))
