@@ -273,11 +273,12 @@ makes the capture succeed, so the fault is in this backend and in the dense path
 - **The store's engine-level divergence is now REPRODUCED (this session).** The
   Triton `_scatter_codes` -- which the engine ran by default for 3-bit K -- fails
   `tests/test_cache_layout.py::test_triton_scatter_matches_reference_at_the_engine_geometry`
-  (the engine's contract: 3-bit K, Hk=8, bs=16, PAD_SLOT_ID), and an EAGER engine
-  run (`--mode e2e`, `enforce_eager=True`, no capture at all) fails to initialize
-  with it as the default. The pre-existing parity case covered only the torch
+  (the engine's contract: 3-bit K, Hk=8, bs=16, PAD_SLOT_ID). The pre-existing parity case covered only the torch
   reference at 4-bit K, which takes the OTHER kernel, so the path the engine
-  actually shipped had no coverage. The Triton scatter is therefore opt-in now
+  actually shipped had no coverage. (An `--mode e2e` run with the Triton store as
+  the default also fails to initialize, but that config is `ours`, which captures,
+  so it is NOT evidence about the eager path; the eager control is `ours-eager`.)
+  The Triton scatter is therefore opt-in now
   (`THUNDER_STORE_TRITON=1`) and the torch reference is the default again: it
   syncs (fatal inside a capture) and it is correct. The capture path needs the
   sync-free store, and the capture path does not work yet either.
