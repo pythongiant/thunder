@@ -310,11 +310,26 @@ exhausted, all measured:
 | lever | result |
 |---|---|
 | tile (m/t/n) | 64/128/16 is the optimum; 128/256/16 5.24 ms, 128/256/32 5.11, unpacked 5.41 |
-| pipeline depth (num_stages / num_dequant_stages) | flat, 4.64-4.82 ms at depths 2/3/4 |
+| pipeline depth (num_stages / num_dequant_stages) | DEAD KNOB, not a result: stored on the kernel and never read (no circular pipeline in v0), so the "flat" measurement was noise |
 | GQA packing the prefill | -6.8% at the served shape (4.77 -> 4.45), -33.6% at vLLM's profiling batch |
 | 16-byte vectorized KV load / paired 4-bit dequant reads | regressed (+9.9%, +24%) |
 | wider M for the packed schedule (rp = tile_m // G) | regressed (4.63 -> 5.24 ms) |
 | wider KV tile at the same warp count (decode) | regressed: b16/32k 2.72 -> 3.73 (n=32) -> 5.91 (n=64); b16/4k 0.350 -> 0.466; b1/32k 0.215 -> 0.329 |
+
+**Resolved (host side): the KV store ran twice per layer per step.** `forward`
+guarded its fallback store with `if not getattr(layer, "_tq_cache_updated", False)`,
+and `do_kv_cache_update` set that flag with
+`for holder in args: if hasattr(holder, "_tq_cache_updated")` -- a fresh layer never
+has the attribute, so the guard was never satisfied and EVERY layer stored its K/V
+again on top of the hook's own store. `THUNDER_STAGE_TIMING=1` at 4k put the
+forward's `prefix` bucket (which contains that store) at **p50 6.906 ms per layer**
+against 0.125 gather / 0.075 qrot / 0.253 launch / 0.035 inverse; with the flag set
+unconditionally the same bucket reads **p50 0.007 ms**, the forward's host total
+falls from 7.407 to 0.465 ms (16x), and the decode rate in the serialized
+diagnostic config goes 1.7 -> 3.3 tok/s. The store itself is still the largest
+remaining host term (it is the exact torch reference path for 3-bit K, see the
+store notes), but the duplicate is gone. `prefix` is the bucket to watch: it should
+stay in the microseconds.
 
 What is left is structural: the dequant is ~70% of the prefill's issue rate and every
 cheap way to reduce its op count has been tried and measured. The other half of the
@@ -324,3 +339,30 @@ happens once per request, and the ablation that removes the kernel launch
 (THUNDER_SKIP_KERNEL) removes it. The GPU-event timer added for this returns -1 (its
 own except catches something) and needs debugging: it is the one instrument that can
 say whether that 1.5 s is GPU or host.
+
+## 19. A guard that can never be satisfied — LIVED (fixed)
+
+`forward` stores the layer's K/V only when vLLM's separate hook has not already
+done it: `if not getattr(layer, "_tq_cache_updated", False)`. The hook set that
+flag with `for holder in args: if hasattr(holder, "_tq_cache_updated")` -- and a
+fresh attention layer never has the attribute, so the condition was false for
+every holder, every step: the flag was never set, the guard was never satisfied,
+and **every layer stored its K/V twice per step** (once through the hook, once
+through the fallback). Nothing failed and nothing was wrong numerically -- the
+store is idempotent for the same K/V -- so the only symptom was time, and it read
+as "the CuTeDSL launcher is expensive" because the forward's own buckets were the
+only instrument pointed at the host path.
+
+- Detection: `THUNDER_STAGE_TIMING=1` at 4k (with
+  `VLLM_ENABLE_V1_MULTIPROCESSING=0` so the dump lands in the same process as the
+  engine). The forward's `prefix` bucket -- the phase that contains that store --
+  read **p50 6.906 ms per layer** against gather 0.125 / qrot 0.075 / launch 0.253
+  / inverse 0.035. A phase that is 93% of a 7.4 ms forward is not a launch cost.
+- Mitigation: set the flag unconditionally on every positional holder, and CONSUME
+  it in `forward` (`layer._tq_cache_updated = False` after the check) so a step
+  whose hook does not run -- a KV-sharing layer with `key is None` -- still stores
+  through the fallback. Measured after: `prefix` p50 **0.007 ms**, forward host
+  total 7.407 -> 0.465 ms (16x), decode 1.7 -> 3.3 tok/s in the serialized
+  diagnostic config. `prefix` is now a bucket to watch: it belongs in the
+  microseconds, and anything above ~0.05 ms means a store is running where it
+  should not.

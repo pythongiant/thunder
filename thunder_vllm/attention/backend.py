@@ -835,7 +835,11 @@ class ThunderAttentionImpl(AttentionImplBase):
         # reverted as unsafe) or a device-side compile cache.
 
         # The KV-cache write is a separate op in vLLM main; if the runner has
-        # not done it yet, do it here.
+        # not done it yet, do it here. The flag is CONSUMED here, not just read:
+        # `do_kv_cache_update` sets it for the step's own store, and leaving it set
+        # would make a later step skip its store entirely (a missing write, not a
+        # redundant one) whenever the hook does not run -- e.g. a KV-sharing layer
+        # whose key/value are None.
         if not getattr(layer, "_tq_cache_updated", False):
             quantizer = self._ensure_quantizer(query.device)
             reshape_and_cache(
@@ -847,6 +851,10 @@ class ThunderAttentionImpl(AttentionImplBase):
                 quantizer,
                 self.layout,
             )
+        try:
+            layer._tq_cache_updated = False
+        except Exception:  # noqa: BLE001 - a holder we cannot write is not a layer
+            pass
 
         # Reserve for the ENGINE capacity, not this batch: under CUDA-graph
         # capture the first forward can be batch 1 and a later one full batch,
@@ -1345,9 +1353,18 @@ class ThunderAttentionImpl(AttentionImplBase):
                 _STORE_AB["done"] = True
               except Exception as e:  # noqa: BLE001
                 print(f"[STORE-AB] failed: {e}", flush=True)
+        # Mark the layer so ``forward`` does not store the same K/V a second
+        # time. The old guard was ``if hasattr(holder, "_tq_cache_updated")`` --
+        # a fresh layer never has that attribute, so it was never set and EVERY
+        # forward ran the store again on top of this hook: two stores per layer
+        # per step. Measured with `THUNDER_STAGE_TIMING=1` at 4k, the forward's
+        # `prefix` bucket (which contains that store) was p50 6.9 ms per layer,
+        # i.e. the dominant host cost in the eager path.
         for holder in args:
-            if hasattr(holder, "_tq_cache_updated"):
+            try:
                 holder._tq_cache_updated = True
+            except Exception:  # noqa: BLE001 - a non-settable holder is not a layer
+                pass
 
     def _scales_for(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """The norm tensor paired with ``kv_cache``.

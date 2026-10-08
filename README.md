@@ -274,9 +274,15 @@ split policies, so re-run it before quoting a ratio.
   and the dense path alike, and on the pre-session baseline commit as well. Serve
   with `enforce_eager=True`. `docs/FAILURE_MODES.md` 14 has the evidence and the
   next instrument (the CUDA API log).
-- **Eager is host-bound**: ~134 ms per token at 4k on Qwen3-8B, dominated by the
-  CuTeDSL launcher rather than the GPU, so eager numbers are not comparable to
-  graph-captured ones.
+- **Eager is host-bound**: ~134 ms per token at 4k on Qwen3-8B, so eager numbers
+  are not comparable to graph-captured ones. It is not the CuTeDSL launcher
+  (`THUNDER_TIME_LAUNCH=1` puts launch plumbing at 0.15 ms and the kernel call at
+  0.25 ms): the forward used to store the layer's K/V a SECOND time, because the
+  `_tq_cache_updated` flag could never be set (`hasattr` on a fresh layer is always
+  false). `THUNDER_STAGE_TIMING=1` showed the forward's `prefix` bucket -- which
+  holds that store -- at p50 6.9 ms per layer; it is now 0.007 ms and the forward's
+  host total is 0.465 ms. The remaining host cost is the (now single, exact-torch)
+  store and vLLM's own eager overhead.
 
 ## Repository layout
 
