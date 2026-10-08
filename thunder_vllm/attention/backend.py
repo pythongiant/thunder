@@ -91,6 +91,70 @@ def _use_indirect_gather(paged, layout, num_kv_heads: int, setting: str) -> bool
                                  layout, num_kv_heads) > ADDRESSABLE_GATHER_BYTES
     )
 
+# --------------------------------------------------------------------------- #
+# Capacity-geometry warm-up (EXPERIMENT, THUNDER_WARM_CAPACITY=1)
+#
+# vLLM warms a CUDA-graph capture with `_dummy_run(desc.num_tokens, mode=NONE)`
+# and then captures the SAME descriptor with mode=FULL/PIECEWISE, where
+# `pad_attn` is true: the captured step's `num_tokens_padded`/`num_reqs_padded`
+# are the dispatcher's padded sizes (bounded by `max_num_seqs`/`max_model_len`),
+# NOT the batch's. CuTeDSL's jit cache is keyed per tensor shape AND per grid,
+# so that padded geometry is a COLD COMPILE INSIDE the capture -- which is what
+# the capture dies on (`cudaErrorStreamCaptureUnsupported` when a sync is in the
+# way, a hang when the compile blocks on the allocator). The old warm-up plans
+# compiled the geometry the step OBSERVED, never the padded one, which is why
+# they never covered the capture.
+#
+# This issues one eager launch per (config, capacity geometry) before the
+# capture, from a capacity-padded metadata whose padding is ZEROED: a padding
+# request then has kv_len 0 and q_len 0, so its CTAs exit without reading
+# anything (the kernel's tile loop is `ceil(0/tile_n) == 0` and its epilogue is
+# guarded by `q_off + tok < q_len`), and it doubles as the eager allocation of
+# the capture-sized split-K partials.
+_WARM_CAPACITY_DONE: set = set()
+
+
+class _CapacityMeta:
+    """Metadata view for a launch at the engine's capacity geometry."""
+
+    def __init__(self, seq_lens, query_start_loc, block_table,
+                 max_blocks_per_req: int, max_query_len: int, num_reqs: int) -> None:
+        self.seq_lens = seq_lens
+        self.query_start_loc = query_start_loc
+        self.block_table = block_table
+        self.max_blocks_per_req = int(max_blocks_per_req)
+        self.max_query_len = int(max_query_len)
+        self.num_reqs = int(num_reqs)
+        self.num_actual_tokens = int(query_start_loc[-1])
+
+
+def _capacity_warm_meta(attn_metadata, device):
+    """Build (and cache) a capacity-padded metadata mirror of this step."""
+    cap = int(getattr(attn_metadata, "max_num_reqs_capacity", 0) or 0)
+    n_obs = int(attn_metadata.seq_lens.shape[0])
+    if cap <= n_obs or cap <= 0:
+        return None
+    cache = _capacity_warm_meta.__dict__.setdefault("_cache", {})
+    key = (cap, n_obs, str(device))
+    hit = cache.get(key)
+    if hit is None:
+        sl = torch.zeros(cap, dtype=torch.int32, device=device)
+        qsl = torch.zeros(cap + 1, dtype=torch.int32, device=device)
+        sl[:n_obs].copy_(attn_metadata.seq_lens[:n_obs])
+        qsl[: n_obs + 1].copy_(attn_metadata.query_start_loc[: n_obs + 1])
+        hit = cache[key] = (sl, qsl)
+    sl, qsl = hit
+    # Refresh the live prefix every step: the padded launch must see THIS step's
+    # lengths, and the padding stays zero.
+    sl[:n_obs].copy_(attn_metadata.seq_lens[:n_obs])
+    qsl[: n_obs + 1].copy_(attn_metadata.query_start_loc[: n_obs + 1])
+    return _CapacityMeta(
+        sl, qsl, attn_metadata.block_table,
+        int(getattr(attn_metadata, "max_blocks_per_req", 0) or 0),
+        int(getattr(attn_metadata, "max_query_len", 0) or 1), cap,
+    )
+
+
 _ENGINE_HOOK = {"done": False}
 _PAGED_CACHE: dict = {}
 # Compiled kernels, shared across the 36 layer impls. The kernel object carries
@@ -1080,6 +1144,26 @@ class ThunderAttentionImpl(AttentionImplBase):
             _ev3.record()
             _o_pre = o.detach().clone()
 
+        # EXPERIMENT (THUNDER_WARM_CAPACITY=1, off by default): compile and
+        # allocate the CAPTURE's geometry before vLLM captures it.
+        #
+        # The capture's kernel is not the step's kernel. `_decode_split_count`
+        # returns 1 while capturing (a device read is illegal there), and
+        # `tile_shape(False, num_reqs)` picks the 16-row batched tile at the
+        # engine's capacity but the 32-row tile at batch 1 -- and the capture
+        # pads `num_reqs` to the capacity. So the captured launch is a different
+        # (config, shape, grid) triple than anything the warm-up dummies ran: a
+        # cold CuTeDSL compile plus a cold split-buffer allocation inside the
+        # capture, which is what kills it. This runs exactly that triple once,
+        # eagerly, with a capacity-shaped metadata whose padding is zeroed (so
+        # the padding requests do nothing).
+        if env_flag("THUNDER_WARM_CAPACITY") and not _capturing:
+            try:
+                self._capacity_warm(q, gathered, o, attn_metadata, quantizer,
+                                    _indptr, bool(_indirect))
+            except Exception:  # noqa: BLE001 - never let an experiment break a step
+                logger.exception("capacity warm-up failed (non-fatal)")
+
         # The kernel accumulates ``O_rot = P @ (R V) = R (P @ V)``: scores are
         # rotation invariant but the value contribution is not. Undo the
         # rotation once, on the flattened head axis. This is the plugin's
@@ -1138,6 +1222,35 @@ class ThunderAttentionImpl(AttentionImplBase):
             import time as _tm3
             _STAGE["suffix"].append((_tm3.perf_counter() - _stage_t[4]) * 1e3)
         return output
+
+    def _capacity_warm(self, q, gathered, o, attn_metadata, quantizer,
+                       indptr, indirect: bool) -> None:
+        """Compile+allocate the capture's (config, shape, grid) once, eagerly."""
+        cap = int(getattr(attn_metadata, "max_num_reqs_capacity", 0) or 0)
+        if cap <= 0 or cap <= int(attn_metadata.seq_lens.shape[0]):
+            return
+        key = (cap, int(self.head_size), int(self.num_kv_groups))
+        if key in _WARM_CAPACITY_DONE:
+            return
+        md = _capacity_warm_meta(attn_metadata, q.device)
+        if md is None:
+            return
+        _WARM_CAPACITY_DONE.add(key)
+        # The capture is a uniform decode: one query token per request, no
+        # split-K (the split policy refuses to decide on the host while
+        # capturing), GQA-packed.
+        kernel = self.get_kernel(self.head_size, False, cap, 1)
+        md.max_query_len = 1
+        launch_thunder_attention(
+            kernel, q, gathered, o, md, self.scale,
+            quantizer=quantizer, num_splits=1, gqa_pack=bool(self.num_kv_groups > 1),
+            onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
+            causal_bound=self.cfg.causal_bound, indptr=indptr, indirect=indirect,
+        )
+        logger.info(
+            "capacity warm-up: cap=%d tile=(m=%d,n=%d,threads=%d) splits=1",
+            cap, kernel.tile_m, kernel.tile_n, kernel.num_threads,
+        )
 
     def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:
         """Split-K count for a decode step, or 1 when splitting would not help.

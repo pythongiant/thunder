@@ -183,21 +183,33 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   | Triton (no sync) | yes | runs long (a hang, cancelled at ~20 min) |
   | Triton (no sync), `THUNDER_SPLITS=1` | no | fails fast at init again |
 
-  So removing the syncs lets the capture get further but does not fix it, and the
-  symptom depends on what else is inside the captured region. Two candidates left,
-  both structural, neither established:
-  1. the split-K merge (`_merge_splits_kernel`, Triton) inside the capture -- the
-     only op that changes between rows 2 and 3. Triton's own launch path shows no
-     host sync (checked in its source), so "Triton cannot be captured" is NOT
-     established;
-  2. the CuTeDSL jit cache, which is keyed per tensor shape AND per grid: the
-     captured geometry (vLLM's padded batch descriptor) can be a cold compile
-     inside the capture, which is the same shape-key issue that costs the first
-     request ~1.5 s of TTFT (15b). That one has prior evidence.
-  Next instrument: the engine's own capture logs with the harness's FULL tails
-  (`--e2e "...|CUDA_LOG_FILE=stderr"` prints stderr; do not grep the root cause
-  line away, as it is the only line that names the failing call), and an A/B of
-  row 3 with `THUNDER_STORE_TORCH=1` to re-confirm the syncs' role.
+  So removing the syncs lets the capture get further but does not fix it. **The
+  remaining blocker is code-verified, and it is the shape-key problem of 15b.**
+  The capture's kernel is not the step's kernel, in three independent ways:
+  1. `_decode_split_count` returns 1 while capturing (its host read is illegal
+     there), so the captured launch has NO split-K, while every eager decode step
+     has S=16..64;
+  2. `tile_shape(is_prefill=False, num_reqs)` picks `DECODE_TILE_BATCHED`
+     (16 rows / 16-wide KV / 32 threads) at the engine's capacity >= 16 but
+     `DECODE_TILE` (32/32/64) at batch 1 -- a DIFFERENT kernel object;
+  3. vLLM's capture pads `num_reqs` to the capacity (`pad_attn`) while its own
+     warm-up dummy for the same descriptor runs the batch's unpadded geometry.
+  CuTeDSL's jit cache is keyed per (constexpr config, tensor shape, grid), so the
+  captured launch is a cold compile -- and a cold split-partial allocation --
+  inside the capture. That fits every observation: eager-only failure before (the
+  store's sync died first), a hang once the sync was removed (the compile blocks
+  on the allocator), and `THUNDER_SPLITS=1` moving the symptom again (it changes
+  which config is cold).
+- Mitigation (experiment, OFF by default): `THUNDER_WARM_CAPACITY=1` issues one
+  eager launch of exactly the capture's triple -- the capacity's `num_reqs`, the
+  capacity's tile, `num_splits=1`, GQA-packed -- from a capacity-shaped metadata
+  whose padding is ZEROED (`tests/test_capacity_warm.py` pins that invariant, since
+  a stale tail entry would be an out-of-bounds read), so the padding requests have
+  `kv_len == 0`/`q_len == 0` and their CTAs do nothing. It doubles as the eager
+  allocation of the capture-sized split partials. Verify on the GPU with
+  `THUNDER_WARM_CAPACITY=1 --e2e "4096|ours|3|4"`; if the capture then succeeds,
+  the same launch belongs in the engine's warm-up path (not behind a flag).
+  The Triton merge is NOT implicated: the capture never runs it (point 1).
 - **Correction (measured again):** with the current harness config
   (`cudagraph_mode="FULL_AND_PIECEWISE"`, `cudagraph_capture_sizes=[1]`) capture
   fails at `capture_model` on the REQUEST-MAJOR path too, with BOTH error classes

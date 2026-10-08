@@ -44,6 +44,10 @@ Runtime flags change behavior. Diagnostic flags are for measurement/debug only a
 - `THUNDER_SKIP_BACKEND=1`, `THUNDER_SKIP_GATHER=1`, `THUNDER_SKIP_KERNEL=1`, `THUNDER_SKIP_ROT=1`: ablation switches; outputs may be wrong.
 - `THUNDER_ALLOW_UNADDRESSABLE=1`: skip the gathered-buffer addressability check so
   the 32-bit wrap (`FAILURE_MODES.md` 15) can be reproduced; results are garbage.
+- `THUNDER_WARM_CAPACITY=1`: before vLLM captures its CUDA graphs, issue one eager
+  launch of the geometry the capture will use (capacity `num_reqs`, the capacity's
+  tile, `num_splits=1`, GQA-packed) so the captured launch is not a cold CuTeDSL
+  compile. See `FAILURE_MODES.md` 14; off by default.
 - `THUNDER_STORE_TORCH=1`: force the pure-torch KV scatter instead of the Triton one
   (bit-identical, but it syncs on `slot_mapping`). A/B switch for the CUDA-graph
   capture question, `FAILURE_MODES.md` 14.
