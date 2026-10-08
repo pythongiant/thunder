@@ -630,7 +630,9 @@ if _HAS_TRITON:
                 # slower, and it syncs, but never wrong.
                 if (kv.k_packed.is_contiguous() and kv.v_packed.is_contiguous()
                         and kv.k_norm.is_contiguous() and kv.v_norm.is_contiguous()):
-                    if _os.environ.get("THUNDER_DEBUG_KV"):
+                    if _os.environ.get("THUNDER_DEBUG_KV") and not (
+                        slot_mapping.is_cuda and torch.cuda.is_current_stream_capturing()
+                    ):
                         # Bounds, on eager steps only (a D2H read is fatal under
                         # capture). The engine-level store has never run before,
                         # so its geometry has never been checked against the

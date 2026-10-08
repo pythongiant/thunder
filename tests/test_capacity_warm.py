@@ -96,10 +96,11 @@ def test_capacity_warm_reaches_the_launcher(monkeypatch):
     q = torch.zeros((4, 32, 128), dtype=torch.float16)
     impl._capacity_warm(q, None, None, _Md(), None, None, False)
 
-    # One launch per capture geometry: sizes 1, 2 and the capacity. At 4160
-    # tokens every one of them splits 16 ways (the batched cap for the capacity).
-    assert [k["num_splits"] for _, k in launched] == [16, 16, 16]
-    assert [a[1].shape[0] for a, _ in launched] == [1, 2, 1024]
+    # Sizes 1 and 2 at the policy's count AND at 1 (the capture's own count is
+    # not knowable for certain); the capacity at 1 only -- measured: warming the
+    # capacity at 16 hangs the FULL capture, at 1 it completes.
+    assert [k["num_splits"] for _, k in launched] == [16, 1, 16, 1, 1]
+    assert [a[1].shape[0] for a, _ in launched] == [1, 1, 2, 2, 1024]
     # The capture's own q/o shape, not the step's storage-derived view.
     assert launched[0][0][1].shape == (1, 32, 128)
     assert launched[0][0][3].shape == (1, 32, 128)

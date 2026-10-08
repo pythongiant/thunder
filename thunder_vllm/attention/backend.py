@@ -1210,7 +1210,11 @@ class ThunderAttentionImpl(AttentionImplBase):
             try:
                 self._capacity_warm(q, gathered, o, attn_metadata, quantizer,
                                     _indptr, bool(_indirect))
-            except Exception:  # noqa: BLE001 - never let an experiment break a step
+            except Exception as e:  # noqa: BLE001 - never let an experiment break a step
+                # print, not logger.exception: this module's logger is separate
+                # from vLLM's and its output is suppressed, so a failing warm is
+                # invisible (which is how the NameError survived several runs).
+                print(f"[TQ-WARM-FAIL] {type(e).__name__}: {e}", flush=True)
                 logger.exception("capacity warm-up failed (non-fatal)")
 
         # The kernel accumulates ``O_rot = P @ (R V) = R (P @ V)``: scores are
@@ -1329,7 +1333,15 @@ class ThunderAttentionImpl(AttentionImplBase):
                 num_reqs=n_reqs,
                 tile_n=tile_shape(False, n_reqs)["n_block"],
             )
-            for splits in (splits,):
+            # The FULL capture (num_reqs == the capacity, a padded batch) takes
+            # the no-mirror fallback in `_decode_split_count` and runs S=1; only
+            # the piecewise ones (the real `cudagraph_capture_sizes` entries) get
+            # a split count from the policy. Measured: warming the capacity at
+            # S=1 lets the FULL capture complete (50.9 s), warming it at S=16
+            # hangs it -- and the capacity's 16-way partials are ~1.2 GB.
+            is_capacity = cap > 0 and n_reqs == cap
+            cands = (1,) if is_capacity else (splits, 1)
+            for splits in cands:
                 key = (n_reqs, splits, self.head_size, self.num_kv_groups)
                 if key in _WARM_CAPACITY_DONE:
                     continue
