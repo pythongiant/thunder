@@ -129,25 +129,36 @@ class _CapacityMeta:
 
 
 def _capacity_warm_meta(attn_metadata, device):
-    """Build (and cache) a capacity-padded metadata mirror of this step."""
+    """Build (and refresh) a capacity-padded metadata mirror of this step.
+
+    ONE buffer per (capacity, device), and the previously live region is zeroed
+    before each refresh: the padding must never carry a stale `seq_lens`/
+    `query_start_loc` entry, because the launch that consumes it runs with
+    `num_reqs = capacity` over the gathered buffers, and a stale entry there is an
+    out-of-bounds read (the failure class of FAILURE_MODES 15). Caching per
+    observed batch size instead would work too, and would leak a buffer per size.
+    """
     cap = int(getattr(attn_metadata, "max_num_reqs_capacity", 0) or 0)
     n_obs = int(attn_metadata.seq_lens.shape[0])
     if cap <= n_obs or cap <= 0:
         return None
     cache = _capacity_warm_meta.__dict__.setdefault("_cache", {})
-    key = (cap, n_obs, str(device))
+    key = (cap, str(device))
     hit = cache.get(key)
     if hit is None:
-        sl = torch.zeros(cap, dtype=torch.int32, device=device)
-        qsl = torch.zeros(cap + 1, dtype=torch.int32, device=device)
-        sl[:n_obs].copy_(attn_metadata.seq_lens[:n_obs])
-        qsl[: n_obs + 1].copy_(attn_metadata.query_start_loc[: n_obs + 1])
-        hit = cache[key] = (sl, qsl)
-    sl, qsl = hit
-    # Refresh the live prefix every step: the padded launch must see THIS step's
-    # lengths, and the padding stays zero.
+        hit = cache[key] = (
+            torch.zeros(cap, dtype=torch.int32, device=device),
+            torch.zeros(cap + 1, dtype=torch.int32, device=device),
+            [],
+        )
+    sl, qsl, prev = hit
+    if prev:
+        prev_n = int(prev[0])
+        sl[:prev_n].zero_()
+        qsl[: prev_n + 1].zero_()
     sl[:n_obs].copy_(attn_metadata.seq_lens[:n_obs])
     qsl[: n_obs + 1].copy_(attn_metadata.query_start_loc[: n_obs + 1])
+    prev[:] = [n_obs]
     return _CapacityMeta(
         sl, qsl, attn_metadata.block_table,
         int(getattr(attn_metadata, "max_blocks_per_req", 0) or 0),
@@ -1241,15 +1252,39 @@ class ThunderAttentionImpl(AttentionImplBase):
         # capturing), GQA-packed.
         kernel = self.get_kernel(self.head_size, False, cap, 1)
         md.max_query_len = 1
-        launch_thunder_attention(
-            kernel, q, gathered, o, md, self.scale,
-            quantizer=quantizer, num_splits=1, gqa_pack=bool(self.num_kv_groups > 1),
-            onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
-            causal_bound=self.cfg.causal_bound, indptr=indptr, indirect=indirect,
-        )
+        # The warm launch writes the step's output buffer (the kernel's epilogue
+        # targets it, and only there are the launch shapes identical to the
+        # capture's -- `_fixed_rows` derives the view from the buffer's STORAGE,
+        # so a same-shaped scratch would not match). Its result is not the step's:
+        # this launch runs with num_splits=1 while a real decode uses S=16..64 and
+        # the two reductions differ in their last bits. Save and restore around it.
+        saved_o = o.clone()
+        # Likewise the CSR `indptr`: the eager step's is (observed + 1) long, and
+        # the kernel indexes mIndptr[req] for req < capacity. A capacity-sized
+        # zeroed copy keeps every address inside the reservation (the values are
+        # irrelevant to a compile, which is all this launch is for).
+        warm_indptr = indptr
+        if indirect:
+            wi = _capacity_warm_meta.__dict__.setdefault("_indptr", {})
+            warm_indptr = wi.get(key)
+            if warm_indptr is None:
+                warm_indptr = wi[key] = torch.zeros(cap + 1, dtype=torch.int32,
+                                                    device=q.device)
+        try:
+            launch_thunder_attention(
+                kernel, q, gathered, o, md, self.scale,
+                quantizer=quantizer, num_splits=1,
+                gqa_pack=bool(self.num_kv_groups > 1),
+                onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
+                causal_bound=self.cfg.causal_bound, indptr=warm_indptr,
+                indirect=indirect,
+            )
+        finally:
+            o.copy_(saved_o)
         logger.info(
-            "capacity warm-up: cap=%d tile=(m=%d,n=%d,threads=%d) splits=1",
-            cap, kernel.tile_m, kernel.tile_n, kernel.num_threads,
+            "capacity warm-up: cap=%d tile=(m=%d,n=%d,threads=%d) splits=1 "
+            "indirect=%d",
+            cap, kernel.tile_m, kernel.tile_n, kernel.num_threads, int(indirect),
         )
 
     def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:

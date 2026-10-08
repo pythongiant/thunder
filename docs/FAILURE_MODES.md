@@ -210,7 +210,17 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   whose padding is ZEROED (`tests/test_capacity_warm.py` pins that invariant, since
   a stale tail entry would be an out-of-bounds read), so the padding requests have
   `kv_len == 0`/`q_len == 0` and their CTAs do nothing. It doubles as the eager
-  allocation of the capture-sized split partials. Verify on the GPU with
+  allocation of the capture-sized split partials. Three hazards the audit found
+  and the implementation now defends against, each of which would have been an
+  out-of-bounds read or a silently corrupted step: (a) the step's `indptr` is only
+  `observed + 1` long while the kernel indexes it up to `capacity`, so the warm
+  uses a capacity-sized ZEROED copy; (b) `_merge_splits`-style reductions differ in
+  their last bits between `num_splits=1` and `S=16..64`, so the warm's output is
+  saved and restored around the launch (`o.clone()`/`copy_`) rather than left in
+  the step's buffer; (c) the metadata mirror is one buffer per (capacity, device)
+  with the previously live region ZEROED on every refresh -- keying it per observed
+  batch size would have leaked a buffer per size, and skipping the zeroing would
+  leave a stale tail. Verify on the GPU with
   `THUNDER_WARM_CAPACITY=1 --e2e "4096|ours|3|4"`; if the capture then succeeds,
   the same launch belongs in the engine's warm-up path (not behind a flag).
   The Triton merge is NOT implicated: the capture never runs it (point 1).

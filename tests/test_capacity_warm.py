@@ -50,3 +50,15 @@ def test_no_capacity_warm_without_headroom():
     # Nothing to warm when the step already has the capacity's geometry.
     assert _capacity_warm_meta(_meta(8, 8), torch.device("cpu")) is None
     assert _capacity_warm_meta(_meta(8, 0), torch.device("cpu")) is None
+
+
+def test_capacity_meta_clears_the_previous_live_tail():
+    """The buffer is reused across steps, so a smaller step must ZERO what the
+    previous step left live: the launch runs with `num_reqs = capacity`, and a
+    stale entry in that tail is an out-of-bounds read of the gathered buffers.
+    """
+    big = _capacity_warm_meta(_meta(8, 16), torch.device("cpu"))
+    assert big.seq_lens.tolist()[:8] == [1, 2, 3, 4, 5, 6, 7, 8]
+    small = _capacity_warm_meta(_meta(3, 16), torch.device("cpu"))
+    assert small.seq_lens.tolist() == [1, 2, 3] + [0] * 13
+    assert small.query_start_loc.tolist() == [0, 1, 2, 3] + [0] * 13
