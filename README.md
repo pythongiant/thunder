@@ -18,11 +18,14 @@ throughput.
   (decode, batch 16, 4k), 2.73 ms (decode, batch 16, 32k), 0.217 ms (decode,
   batch 1, 32k) and 4.66 ms (prefill, 4k) — against 5.61 ms and 14.92 ms for the
   same cache dequantized to fp16 and run through SDPA at the last two.
-- **Serving**: batch 1 at 4k runs under CUDA graphs end to end at **58 output
-  tok/s of decode** (17.4 ms ITL, measured serially), which is 2.4x off upstream's
-  compressed path (142) and 5.7x off its own fp16 control (329). The whole-request
-  rate is 7.3-7.5 tok/s regardless, because a 4k prefill takes 1.9-4.1 s against
-  upstream's 74 ms. 16k and 32k run eager only — see *Known issues*.
+- **Serving**: every context runs with `enforce_eager=True` — CUDA-graph capture
+  of this backend fails inside vLLM's profiling capture (see *Known issues*), on
+  both gather paths and on the pre-session baseline, so the graph numbers below
+  are from the last state where capture worked and are marked as such. Eager at
+  4k is host-bound: **58 output tok/s of decode** (17.4 ms ITL) was measured under
+  CUDA graphs before capture broke, against 5.2 tok/s eager, and upstream's
+  compressed path is 142. The whole-request rate is 1-7 tok/s depending on
+  context, because a prefill takes seconds against upstream's 74 ms.
 - **Correctness**: the kernel matches a dequantized-fp16 oracle at
   `atol=rtol=1e-2`, and the GPU suite is green except one unwired stub.
 
@@ -264,11 +267,13 @@ split policies, so re-run it before quoting a ratio.
   outright if even the dense one would be), so 16k initializes and generates —
   **eager only**, because the dense path is still not capturable (next bullet).
   `docs/FAILURE_MODES.md` 15.
-- **32k cannot be served under CUDA graphs.** The gather reservation that fits
-  long context (the dense/CSR path, 3.0 GiB at 32k) is not capturable in this
-  stack, and the layout that is capturable (request-major) would need a 30.7 GiB
-  reservation. 32k runs eager only, and eager is host-bound. `docs/FAILURE_MODES.md`
-  14.
+- **CUDA graphs are unavailable: capture fails in this backend.** vLLM's
+  profiling capture (`profile_cudagraph_memory` -> `capture_model`) dies with
+  `cudaErrorStreamCaptureUnsupported` ("operation not permitted when stream is
+  capturing") and then `cudaErrorStreamCaptureInvalidated`, on the request-major
+  and the dense path alike, and on the pre-session baseline commit as well. Serve
+  with `enforce_eager=True`. `docs/FAILURE_MODES.md` 14 has the evidence and the
+  next instrument (the CUDA API log).
 - **Eager is host-bound**: ~134 ms per token at 4k on Qwen3-8B, dominated by the
   CuTeDSL launcher rather than the GPU, so eager numbers are not comparable to
   graph-captured ones.

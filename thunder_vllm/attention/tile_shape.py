@@ -16,6 +16,24 @@ masked-out work per tile.
 | 32, 64, 32 | **0.215 ms** | — | — |
 | 16, 32, 16 | 0.924 ms | **2.72 ms** | — |
 
+The KV tile width is not a lever at the decode shapes either. The decode tile is
+one warp (`m_block == num_warps * 16` forces the warps onto M), so a wider KV tile
+at the SAME warp count was the obvious way to cut per-tile overheads -- it loses,
+badly, because the extra SMEM traffic and the longer masked tails outweigh the
+fewer barriers:
+
+| tile (m, threads, n) | decode b=16, 32k | decode b=16, 4k | decode b=1, 32k |
+|---|---|---|---|
+| 16, 32, 16 / 32, 64, 32 (shipped) | **2.723 ms** | **0.350 ms** | **0.215 ms** |
+| 16, 32, 32 | 3.734 ms (+37%) | 0.466 ms (+33%) | — |
+| 16, 32, 64 | 5.909 ms (+117%) | — | — |
+| 32, 64, 64 | — | — | 0.329 ms (+53%) |
+
+Measured with the split count pinned, so the tile is the only variable
+(`decode-b16-32k|16|1|16|32|<n>` in the grid). Both sweeps also reproduce the
+research loop's own numbers to three digits (2.7232 against 2.723), which is the
+harness's own correctness check.
+
 So the schedules want different tiles in every dimension: decode takes the
 smallest M tile that holds its live rows, prefill takes a full-height M tile with
 the narrowest KV tile that builds (8 does not; the MMA floor is 16). ``t`` is not

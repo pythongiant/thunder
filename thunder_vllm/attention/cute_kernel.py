@@ -1404,7 +1404,6 @@ def launch_thunder_attention(
     causal_bound: bool = False,
     indptr: "torch.Tensor | None" = None,
     indirect: bool = False,
-    compile_only: bool = False,
 ) -> None:
     """Launch the compiled cooperative kernel on gathered, contiguous tensors.
 
@@ -1553,39 +1552,6 @@ def launch_thunder_attention(
         indptr = seq_lens
     _torch_args += [part_o_t, part_m_t, part_l_t, indptr]
     args = _dlpack_cached(_torch_args)
-
-    if compile_only:
-        # Compile (and arm) this schedule without launching it. CuTeDSL compiles on
-        # the first call, and the engine's warmup only ever runs vLLM's profiling
-        # geometry, so the first real prefill otherwise pays the compile inside the
-        # request -- measured at 1501 ms host for the first call against 6.6 ms
-        # steady state. Shapes do not matter to the compile; the constexprs do.
-        #
-        # The argument list is ``_all_args`` EXACTLY: it was missing ``debug`` and
-        # every schedule constexpr (split_mode/gqa_mode/onepass/reg_rescale/
-        # causal_bound/indirect), so the trailing stream landed on ``num_splits``
-        # and the call raised ARG_ANNOTATION_MISMATCH every time -- the precompile
-        # never happened and the compile stayed inside the first request, which is
-        # the whole thing this path exists to prevent.
-        import cutlass.cute as _cute
-
-        _cute.compile(
-            kernel.__call__,
-            *args,
-            softmax_scale,
-            kv_row_stride,
-            int(debug),
-            max_query_len,
-            S,
-            int(split_mode),
-            int(gqa_mode),
-            int(1 if onepass else 0),
-            int(1 if reg_rescale else 0),
-            int(1 if causal_bound else 0),
-            int(1 if indirect else 0),
-            cuda.CUstream(stream),
-        )
-        return
 
     _COUNTS["launch_indirect" if indirect else "launch_reqmajor"] += 1
     if _TIME:

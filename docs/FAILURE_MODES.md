@@ -161,6 +161,21 @@ makes the capture succeed, so the fault is in this backend and in the dense path
 - Detection: `cudaErrorStreamCaptureUnsupported` (not `...Invalidated`) raised at
   `profile_cudagraph_memory`, at 4k as well as 32k, i.e. it is the path and not the
   context length. Two identical runs fail identically, so it is not a race.
+- **Correction (measured again):** with the current harness config
+  (`cudagraph_mode="FULL_AND_PIECEWISE"`, `cudagraph_capture_sizes=[1]`) capture
+  fails at `capture_model` on the REQUEST-MAJOR path too, with BOTH error classes
+  in one run (`cudaErrorStreamCaptureUnsupported`, "operation not permitted when
+  stream is capturing", then `cudaErrorStreamCaptureInvalidated`), and it does so
+  on the pre-session baseline commit `245eea2` as well -- so the dense-vs-request-
+  major attribution above is not what fails today, and this is not a regression
+  from the 16k work. What is still true: capture fails inside the backend's
+  forward, `THUNDER_SKIP_BACKEND=1` makes it succeed, and the failure is in vLLM's
+  *profiling* capture (`profile_cudagraph_memory` runs with a 1-block KV cache and
+  a throwaway graph pool, and calls `capture_model(profile_only=True)`). The
+  harness's own comment in `ci/modal_app.py` (`ours-eager`) has said this for
+  longer than this session. Every context therefore serves with
+  `enforce_eager=True` today; localizing it needs the CUDA API log
+  (`CUDA_LOG_FILE=stderr`) or a commit bisect, not another path ablation.
 - Mitigation: the path is chosen from the reservation -- the 24 GiB memory budget
   and, since FAILURE_MODES 15, `ADDRESSABLE_GATHER_BYTES` (4 GiB), because the
   request-major K/V tensor past that is not addressable by a 32-bit CuTeDSL
@@ -196,16 +211,19 @@ inside the same 6.5 GB buffer (silently wrong data) or outside it
 and fail alone, and why the engine's *decode* dummy steps at 16k never failed
 first: they address few requests, so their row offsets stay far below the wrap.
 
-- Detection: the fault follows the **buffer size**, not the rows read.
-  `prefill-b1024-16k` (1024 requests, 16384-token contexts) has a correct 16384-row
-  `q` and faults, while the same schedule with a 1-request reservation
-  (`prefill-16k`, and every `batch=1` shape) never has — the reservation, not the
-  schedule, is what changes. Forcing the dense gather (`THUNDER_8B_INDIRECT=1`,
-  2.12 GiB reservation) makes the whole 16k init *and* generation pass, and the
-  driver's XID MMU faults all sit inside a 4 GiB window (0x2a84..0x2b67) — that
-  window is the wrap. `use_32bit_stride=False` on the dlpack conversion does
-  **not** remove it (tested), so the wrap is not the dynamic-stride bitwidth: the
-  only fix is to keep the tensor addressable.
+- Detection: the fault follows the **buffer size**, not the rows read. One cell
+  pair settles it (`prefill-dummy-16k`, the engine's geometry with `live_blocks=1`,
+  so its `q` is a correct 16384 rows): the default policy takes the dense gather
+  and measures 0.760 ms, while `THUNDER_8B_INDIRECT=0` +
+  `THUNDER_ALLOW_UNADDRESSABLE=1` — the same launches on the request-major
+  reservation — takes an illegal address. Every `batch=1` shape is clean because a
+  1-request reservation is small, which is why `prefill-16k` always passed while
+  the 1024-request shapes did not. On the engine, forcing the dense gather makes
+  the whole 16k init *and* generation pass. The driver's XID MMU faults all sit
+  inside a 4 GiB window (0x2a84..0x2b67) — that window is the wrap.
+  `use_32bit_stride=False` on the dlpack conversion does **not** remove it
+  (tested), so the wrap is not the dynamic-stride bitwidth: the only fix is to
+  keep the tensor addressable.
 - Mitigation: `ADDRESSABLE_GATHER_BYTES` (4 GiB) is now a second reason to take
   the dense gather (`_use_indirect_gather`), and `PagedKVManager.reserve` refuses
   an unaddressable reservation outright, naming the geometry, so the failure
@@ -216,19 +234,38 @@ first: they address few requests, so their row offsets stay far below the wrap.
   2.06 GiB (V) and run; 16k's are 8.06 GiB and fault; the dense reservation at
   16k is 2.12 GiB and runs. 8k (4.06 GiB) switches to dense as well.
 
-## 15b. A warm-up compile that never ran — LIVED (fixed)
+## 15b. A warm-up compile that never ran, and cannot — LIVED (removed)
 
-`launch_thunder_attention(compile_only=True)` — the path that precompiles every
-schedule the tile policy can produce, so no CuTeDSL compile (~1.5 s) lands inside
-a request — passed the wrong argument list: it omitted `debug` and every schedule
-constexpr, so the trailing `CUstream` landed on `num_splits` and the call raised
-`ARG_ANNOTATION_MISMATCH` every single time. The exception is caught and logged
-as "kernel warmup failed (non-fatal)", so the only symptom was the compile still
-happening inside the first request — which is the TTFT number in 18.
+The engine is supposed to precompile every (tile, causal) config the tile policy
+can produce, so no CuTeDSL compile (~1.5 s) lands inside a request. It never
+happened, for three separate reasons, and the mechanism is now gone.
 
-- Detection: any run with `THUNDER_STAGE_TIMING` shows a first-call launch of
-  ~1.5 s against ~0.15 ms steady state; the traceback names `num_splits`.
-- Mitigation: the compile call now passes exactly `_all_args`.
+1. `launch_thunder_attention(compile_only=True)` passed the wrong argument list:
+   no `debug`, no schedule constexprs, so the trailing `CUstream` landed on
+   `num_splits` and every call raised `ARG_ANNOTATION_MISMATCH`. The exception is
+   caught and logged as "kernel warmup failed (non-fatal)", so the only symptom
+   was the compile still happening inside the first request.
+2. With the arguments fixed, `cutlass.cute.compile` still does not help: it
+   populates a different cache key than the `@cute.jit` call path looks up.
+   Measured (`ci_probe/probe_compile_cost.py`): the compile-only call took 2.8 s
+   and the *next* launch of the same schedule took 2.4 s, i.e. it compiled again.
+3. Doing the warm-up as REAL launches does precompile, but it breaks CUDA-graph
+   capture. The first forward of a step happens inside vLLM's capture context
+   (`profile_cudagraph_memory` -> `_warmup_and_capture`, which runs its warmup
+   dummy on the capture stream inside the graph pool), so a launch that allocates
+   there poisons the capture: the engine then dies at `capture_model` with
+   `cudaErrorStreamCaptureUnsupported` ("operation not permitted when stream is
+   capturing") and `cudaErrorStreamCaptureInvalidated`. Measured at 4k, which had
+   captured fine before.
+
+- Detection: a capture failure at `profile_cudagraph_memory` that appears only
+  once the warm-up launches; and, for the compile itself, timing the first launch
+  of a schedule (seconds means the compile is still in the request).
+- Mitigation: the mechanism is removed. The compile stays in the first request,
+  which is the TTFT number in 18. Making it cheap needs a shape-stable jit key
+  (a shapes-free key was tried and reverted as unsafe) or a device-side compile
+  cache -- the jit cache is keyed per tensor shape, and the gathered K/V shape is
+  the engine's reservation, so nothing outside `forward` can precompile it.
 
 ## 16. Host timing buckets that average over capture — LIVED
 
@@ -277,6 +314,7 @@ exhausted, all measured:
 | GQA packing the prefill | -6.8% at the served shape (4.77 -> 4.45), -33.6% at vLLM's profiling batch |
 | 16-byte vectorized KV load / paired 4-bit dequant reads | regressed (+9.9%, +24%) |
 | wider M for the packed schedule (rp = tile_m // G) | regressed (4.63 -> 5.24 ms) |
+| wider KV tile at the same warp count (decode) | regressed: b16/32k 2.72 -> 3.73 (n=32) -> 5.91 (n=64); b16/4k 0.350 -> 0.466; b1/32k 0.215 -> 0.329 |
 
 What is left is structural: the dequant is ~70% of the prefill's issue rate and every
 cheap way to reduce its op count has been tried and measured. The other half of the

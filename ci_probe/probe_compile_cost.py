@@ -1,17 +1,15 @@
-"""Does the warm-up precompile actually happen?
+"""What does the first launch of a schedule cost, and what does a second?
 
-``launch_thunder_attention(compile_only=True)`` exists so the CuTeDSL compile
-(~1.5 s) happens during warm-up instead of inside the first request. It passed
-the wrong argument list (no ``debug``, no schedule constexprs), so the trailing
-CUstream landed on ``num_splits`` and every call raised
-``ARG_ANNOTATION_MISMATCH`` -- caught upstream and logged as non-fatal, so the
-only symptom was the compile still landing in the first request.
+CuTeDSL compiles per (constexpr config, tensor shape), and the gathered K/V shape
+is the engine's reservation, so nothing outside the engine's own ``forward`` can
+precompile a schedule. That is why the engine's warm-up plans could not work
+(FAILURE_MODES 15b) and why the compile lands in the first request: this probe
+measures the two numbers with no engine and no model weights.
 
-This measures it directly, with no engine and no model weights: precompile a
-schedule, then time the FIRST real launch of that schedule. ~0.15 ms means the
-precompile landed; ~1.5 s means it did not (and the raise was swallowed).
+    [warm] <first launch>  -- a compile when the schedule is cold (~1.5 s)
+    [next] <second launch> -- the jit path's per-call cost once it is cached
 
-Run: python ci_probe/probe_compile_only.py
+Run: python ci_probe/probe_compile_cost.py
 """
 
 from __future__ import annotations
@@ -57,18 +55,13 @@ def main() -> int:
     kw = dict(num_splits=1, gqa_pack=True, onepass=True, reg_rescale=True,
               causal_bound=True)
 
-    # 1. The precompile itself: does it raise?
+    # 1. The first launch of this schedule: this is the compile a request pays.
     t0 = time.perf_counter()
-    try:
-        launch_thunder_attention(kernel, q, gathered, out, meta, 128 ** -0.5,
-                                 quantizer=sb.quantizer, compile_only=True, **kw)
-        print(f"[compile_only] ok in {(time.perf_counter() - t0) * 1e3:.1f} ms",
-              flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[compile_only] RAISED {type(exc).__name__}: {str(exc)[:200]}",
-              flush=True)
+    launch_thunder_attention(kernel, q, gathered, out, meta, 128 ** -0.5,
+                             quantizer=sb.quantizer, **kw)
+    warm = (time.perf_counter() - t0) * 1e3
 
-    # 2. The first real launch of that same schedule: compiled already or not?
+    # 2. The next launch of the same schedule: compiled already or not?
     t0 = time.perf_counter()
     launch_thunder_attention(kernel, q, gathered, out, meta, 128 ** -0.5,
                              quantizer=sb.quantizer, **kw)
@@ -80,9 +73,8 @@ def main() -> int:
                                  quantizer=sb.quantizer, **kw)
     torch.cuda.synchronize()
     steady = (time.perf_counter() - t0) * 1e3 / 10
-    print(f"[launch] first={first:.2f} ms steady={steady:.3f} ms "
-          f"verdict={'PRECOMPILED' if first < 50 else 'COMPILED IN REQUEST'}",
-          flush=True)
+    print(f"[warm] {warm:.1f} ms  [next] {first:.2f} ms  steady {steady:.3f} ms  "
+          f"cold_compile={'yes' if warm > 200 else 'no'}", flush=True)
     return 0
 
 

@@ -612,8 +612,6 @@ class ThunderAttentionImpl(AttentionImplBase):
         )
 
         self._quantizer: Any = None
-        self._warmed = False
-        self._warm_plans: list = []
         self._paged: PagedKVManager | None = None
 
     # ------------------------------------------------------------------ #
@@ -797,7 +795,12 @@ class ThunderAttentionImpl(AttentionImplBase):
                 f"is_prefill={attn_metadata.is_prefill} "
                 f"max_query_len={attn_metadata.max_query_len} "
                 f"num_heads={self.num_heads} Hk={self.num_kv_heads} "
-                f"head_size={self.head_size}",
+                f"head_size={self.head_size} "
+                # The gather path and the reservation capacities it is chosen
+                # from: `max_num_seqs` decides the request-major reservation, so
+                # it decides which path a context runs on.
+                f"cap_reqs={int(getattr(attn_metadata, 'max_num_reqs_capacity', 0) or 0)} "
+                f"cap_len={int(getattr(attn_metadata, 'max_model_len_capacity', 0) or 0)}",
                 flush=True,
             )
 
@@ -807,13 +810,29 @@ class ThunderAttentionImpl(AttentionImplBase):
             int(getattr(attn_metadata, "num_reqs", 0) or 1),
             int(getattr(attn_metadata, "max_query_len", 0) or 0) or None,
         )
-        # Compile every (tile, causal) config the policy can produce, during the
-        # first step, so no CuTeDSL compile (~1.6 s each) lands inside a request.
-        # vLLM's own warmup only exercises its profiling geometry, which is the
-        # chunked prefill tile.
-        if not self._warmed:
-            self._warmed = True
-            self._warm_plans = [(True, None), (True, 16), (False, 1)]
+        # No warm-up plans. The engine used to precompile every (tile, causal)
+        # config the policy can produce so no CuTeDSL compile (~1.5 s) landed in a
+        # request, but that mechanism cannot work here and was a no-op that could
+        # be turned into a capture failure:
+        #
+        # * the precompile call passed the wrong argument list, so it raised
+        #   ARG_ANNOTATION_MISMATCH and the compile stayed in the first request;
+        # * with the arguments fixed, `cutlass.cute.compile` still does not
+        #   populate the cache the `@cute.jit` call path looks up (measured: 2.8 s
+        #   "precompiled", then 2.4 s on the first real launch of the same
+        #   schedule);
+        # * real launches instead of the compile DO precompile, but the first
+        #   forward of a step happens inside vLLM's graph-capture context
+        #   (`profile_cudagraph_memory` -> `_warmup_and_capture`, on the capture
+        #   stream and in the graph pool), so they add launches and allocations to
+        #   the one phase that must not do either. They are NOT why capture fails
+        #   -- capture fails on the pre-session baseline too, see
+        #   docs/FAILURE_MODES.md 14 -- but they buy nothing that survives it.
+        #
+        # So the compile stays in the first request. Making it cheap needs a
+        # shape-stable jit key (the key carries `num_reqs` through the grid, so
+        # every new batch size is a new compile; a shapes-free key was tried and
+        # reverted as unsafe) or a device-side compile cache.
 
         # The KV-cache write is a separate op in vLLM main; if the runner has
         # not done it yet, do it here.
@@ -882,17 +901,40 @@ class ThunderAttentionImpl(AttentionImplBase):
                 1,
                 int(((_sl_cpu[:_r].to(torch.int64) + _bs - 1) // _bs).max().item()),
             )
-        _indirect = _use_indirect_gather(
-            paged, self.layout, self.num_kv_heads,
-            os.environ.get("THUNDER_8B_INDIRECT", ""),
-        )
         _capturing = torch.cuda.is_current_stream_capturing()
+        _path_setting = os.environ.get("THUNDER_8B_INDIRECT", "")
+        _indirect = _use_indirect_gather(
+            paged, self.layout, self.num_kv_heads, _path_setting
+        )
+        if _indirect and _capturing and not (_path_setting or "").strip():
+            # The dense reservation is sized from the block count of the cache
+            # THIS step sees, while a captured graph replays with whatever
+            # seq_lens the replay carries: the rows the kernel derives from
+            # `indptr` can therefore exceed the reservation, which is an
+            # out-of-bounds read (illegal address, or silent garbage). The
+            # request-major layout has no such mismatch -- its stride is the
+            # block-table width -- so a capture has to use it, and where that
+            # tensor is unaddressable (past `ADDRESSABLE_GATHER_BYTES`) the
+            # reservation refuses loudly and the engine has to run eager.
+            # An explicit THUNDER_8B_INDIRECT still forces the dense path.
+            _indirect = False
+        if env_flag("THUNDER_DEBUG_LAUNCH"):
+            print(
+                f"[TQ-PATH] indirect={int(_indirect)} capturing={int(_capturing)} "
+                f"page_rows={paged.page_rows} max_reqs={paged.max_num_reqs} "
+                f"blocks_per_req={paged.max_blocks_per_req} "
+                f"kv_blocks={int(kv_cache.shape[0])}",
+                flush=True,
+            )
         _indptr = None
         if os.environ.get("THUNDER_SKIP_GATHER", "0").strip().lower() not in (
             "", "0", "false", "no", "off"
         ):
-            # Diagnostic: use the reserved buffers without the torch gather.
-            gathered = paged.reserve()
+            # Diagnostic: use the reserved buffers without the torch gather. The
+            # reservation has to be the one the chosen path would make, or the
+            # pointers baked here differ from the ones a real step uses (and the
+            # dense path's cap is what keeps the tensor addressable).
+            gathered = paged.reserve(int(kv_cache.shape[0]) if _indirect else None)
         elif _indirect:
             # Phase A: build CSR metadata once per step (shared by all layers);
             # only the KV payload select is per-layer (each layer has its own
@@ -1009,30 +1051,6 @@ class ThunderAttentionImpl(AttentionImplBase):
                 and int(getattr(attn_metadata, "max_query_len", 0) or 0) == 1
                 and self.num_kv_groups > 1
             )
-        if getattr(self, "_warm_plans", None):
-            # CuTeDSL compiles on the first call of each (tile, causal) config and a
-            # compile costs ~1.6 s, so every config the policy can produce has to be
-            # compiled during warmup: vLLM's warmup only runs its own profiling
-            # geometry, and a compile landing inside a request shows up as TTFT.
-            # Measured in-process: the launcher's steady cost is 0.15 ms per call,
-            # but the mean over a run reads 13.86 ms because several compiles are
-            # spread through it.
-            plans, self._warm_plans = self._warm_plans, []
-            n_reqs = int(getattr(attn_metadata, "num_reqs", 0) or 1)
-            for warm_causal, warm_q in plans:
-                try:
-                    launch_thunder_attention(
-                        self.get_kernel(self.head_size, warm_causal, n_reqs, warm_q),
-                        q, gathered, o, attn_metadata, self.scale,
-                        quantizer=quantizer, num_splits=1, gqa_pack=False,
-                        onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
-                        causal_bound=self.cfg.causal_bound,
-                        indptr=_indptr, indirect=bool(_indirect),
-                        compile_only=True,
-                    )
-                except Exception:
-                    logger.exception("kernel warmup failed (non-fatal)")
-
         launch_thunder_attention(
             kernel,
             q,

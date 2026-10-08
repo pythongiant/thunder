@@ -93,7 +93,10 @@ def check_addressable(rows: int, layout: ThunderCacheLayout, num_kv_heads: int,
             f"{nbytes / 2**30:.2f} GiB, past the {ADDRESSABLE_GATHER_BYTES / 2**30:.0f} GiB "
             f"a 32-bit CuTeDSL tensor index can address (docs/FAILURE_MODES.md 15). "
             f"Use the dense gather (THUNDER_8B_INDIRECT=1 / a smaller batch "
-            f"reservation): it reserves by physical blocks, not by the block-table width."
+            f"reservation): it reserves by physical blocks, not by the block-table "
+            f"width. Under CUDA graphs there is no such option -- a captured graph "
+            f"replays with arbitrary seq_lens, which the dense reservation cannot "
+            f"cover -- so serve this context with enforce_eager=True."
         )
     return nbytes
 
