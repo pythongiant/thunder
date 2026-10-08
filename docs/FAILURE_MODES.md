@@ -196,7 +196,11 @@ makes the capture succeed, so the fault is in this backend and in the dense path
      warm-up dummy for the same descriptor runs the batch's unpadded geometry.
   CuTeDSL's jit cache is keyed per (constexpr config, tensor shape, grid), so the
   captured launch is a cold compile -- and a cold split-partial allocation --
-  inside the capture. That fits every observation: eager-only failure before (the
+  inside the capture. Note that only FULL captures pad (`pad_attn = mode == FULL`),
+  so PIECEWISE (prefill-shaped) captures run the same geometry their warm-up dummy
+  did: the decode/FULL case is the one to warm. Its other launch scalars are fixed
+  too -- `max_query_len = uniform_decode_query_len == 1` and `num_splits == 1`
+  (point 1) -- which is what the capacity warm replicates. That fits every observation: eager-only failure before (the
   store's sync died first), a hang once the sync was removed (the compile blocks
   on the allocator), and `THUNDER_SPLITS=1` moving the symptom again (it changes
   which config is cold).
