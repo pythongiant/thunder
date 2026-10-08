@@ -174,10 +174,30 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   kernels, so the 3-bit path has no host branch at all; the torch quantizer is
   unchanged and the parity probe (`ci_probe/modal_probe_store_parity.py`, 4/4,
   3/4, and both with PAD_SLOT_ID) reports `maxdiff == 0.0` on codes and norms.
-  Effect on capture: not yet settled -- with the scatter in place the capture no
-  longer fails fast, the 4k `ours` run instead runs long (bounded tests pending),
-  so the syncs were necessary but may not be sufficient. Next: run the 4k graph
-  path with `E2E_GEN` small and read the engine's own capture logs.
+  Effect on capture (measured, this session): the failure MODE changes and the
+  store is exonerated. Three 4k `ours` configurations, all `k=3/v=4`:
+
+  | store scatter | split-K merge in the captured region | outcome |
+  |---|---|---|
+  | torch (syncs on `slot_mapping`) | yes | fails fast at `capture_model`, `cudaErrorStreamCaptureUnsupported` + `...Invalidated` |
+  | Triton (no sync) | yes | runs long (a hang, cancelled at ~20 min) |
+  | Triton (no sync), `THUNDER_SPLITS=1` | no | fails fast at init again |
+
+  So removing the syncs lets the capture get further but does not fix it, and the
+  symptom depends on what else is inside the captured region. Two candidates left,
+  both structural, neither established:
+  1. the split-K merge (`_merge_splits_kernel`, Triton) inside the capture -- the
+     only op that changes between rows 2 and 3. Triton's own launch path shows no
+     host sync (checked in its source), so "Triton cannot be captured" is NOT
+     established;
+  2. the CuTeDSL jit cache, which is keyed per tensor shape AND per grid: the
+     captured geometry (vLLM's padded batch descriptor) can be a cold compile
+     inside the capture, which is the same shape-key issue that costs the first
+     request ~1.5 s of TTFT (15b). That one has prior evidence.
+  Next instrument: the engine's own capture logs with the harness's FULL tails
+  (`--e2e "...|CUDA_LOG_FILE=stderr"` prints stderr; do not grep the root cause
+  line away, as it is the only line that names the failing call), and an A/B of
+  row 3 with `THUNDER_STORE_TORCH=1` to re-confirm the syncs' role.
 - **Correction (measured again):** with the current harness config
   (`cudagraph_mode="FULL_AND_PIECEWISE"`, `cudagraph_capture_sizes=[1]`) capture
   fails at `capture_model` on the REQUEST-MAJOR path too, with BOTH error classes
