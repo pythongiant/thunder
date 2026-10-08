@@ -1467,9 +1467,16 @@ def launch_thunder_attention(
     # Launch with a stable shape: the leading dimension of q/out otherwise changes
     # with the token count (the prompt length for a prefill), and each new value is
     # a fresh CuTeDSL compile inside the request.
+    # Each is reshaped from its OWN row count, not from q's: _fixed_rows may grow
+    # q's leading dimension to its storage, and reshaping out to that grown size
+    # fails whenever out is a smaller buffer (the harness's grid cells hit exactly
+    # that, and so did the loop's primary metric).
     q = _fixed_rows(q.reshape(q.shape[0], q.shape[1], q.shape[2]).contiguous(),
                     _LAUNCH_ROWS)
-    o3 = _fixed_rows(out.reshape(q.shape[0], q.shape[1], q.shape[2]).contiguous(),
+    # ``out`` is (tokens, heads*dim) from the engine and (rows, heads, dim) from the
+    # harness; either way its own leading dimension is the row count, and it must be
+    # used rather than q's, which _fixed_rows may have grown to q's storage.
+    o3 = _fixed_rows(out.reshape(out.shape[0], q.shape[1], q.shape[2]).contiguous(),
                      _LAUNCH_ROWS)
 
     _torch_args = [q.contiguous(), k, v, kn, vn, k_lut, v_lut, o3, seq_lens, q_start]
