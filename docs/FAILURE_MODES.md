@@ -239,3 +239,28 @@ number is faithful.
   are random, so the *data* never tells you where the rows are; only the mask does.
 - Mitigation: when a measurement's validity depends on geometry, cite the code that
   defines it (here `_valid`) in the same breath as the number.
+
+## 18. A prefill target that the available levers do not reach — OPEN
+
+The goal was request throughput >1.4x upstream's 109.5 tok/s, i.e. >=153 tok/s, i.e.
+TTFT + 31 x ITL <= 209 ms. Measured floor with the packed prefill in place:
+36 x 4.45 ms = 160 ms of prefill attention plus 31 x 5.5 ms of best-case ITL = 331 ms,
+about 65 tok/s. The target needs the prefill KERNEL faster, and the cheap knobs are now
+exhausted, all measured:
+
+| lever | result |
+|---|---|
+| tile (m/t/n) | 64/128/16 is the optimum; 128/256/16 5.24 ms, 128/256/32 5.11, unpacked 5.41 |
+| pipeline depth (num_stages / num_dequant_stages) | flat, 4.64-4.82 ms at depths 2/3/4 |
+| GQA packing the prefill | -6.8% at the served shape (4.77 -> 4.45), -33.6% at vLLM's profiling batch |
+| 16-byte vectorized KV load / paired 4-bit dequant reads | regressed (+9.9%, +24%) |
+| wider M for the packed schedule (rp = tile_m // G) | regressed (4.63 -> 5.24 ms) |
+
+What is left is structural: the dequant is ~70% of the prefill's issue rate and every
+cheap way to reduce its op count has been tried and measured. The other half of the
+budget is unexplained and must be localized before anything else is attempted -- the
+TTFT is 1.8-4.2 s against 36 x (4.45 ms kernel + ~1 ms host) = ~0.2 s, so ~1.5 s
+happens once per request, and the ablation that removes the kernel launch
+(THUNDER_SKIP_KERNEL) removes it. The GPU-event timer added for this returns -1 (its
+own except catches something) and needs debugging: it is the one instrument that can
+say whether that 1.5 s is GPU or host.
