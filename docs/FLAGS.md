@@ -7,7 +7,7 @@ Runtime flags change behavior. Diagnostic flags are for measurement/debug only a
 - `THUNDER_K_BITS`, `THUNDER_V_BITS`: packed KV widths.
 - `THUNDER_ONEPASS=0`, `THUNDER_REG_RESCALE=0`, `THUNDER_CAUSAL_BOUND=0`: opt out of default-on kernel fast paths.
 - `THUNDER_8B_INDIRECT=0/1`: CSR/indirect gather vs request-major. Default `0` (request-major).
-- `THUNDER_GQA_PACK=0/1`: GQA-packed decode (one CTA per KV head scores the whole query group; plan steps 6+8). Decode-only, default **on**; `0` opts out. Worth -76.6% at batch 16/32k and -31% at batch 1 against the pre-packing schedule (and -60% more at batch 1 once the split count followed the narrower grid), so the old "off until validated" note is spent.
+- `THUNDER_GQA_PACK=0/1`: GQA-packed schedule (one CTA per KV head scores the whole query group; plan steps 6+8). Default **on**; `0` opts out. Worth -76.6% at batch 16/32k and -31% at batch 1 against the pre-packing schedule (and -60% more at batch 1 once the split count followed the narrower grid), so the old "off until validated" note is spent. Prefill packs too: the M axis carries the group's heads over `tile_m // qhead_per_kvhead` query tokens, so a CTA reconstructs the KV tile once for all of them.
 - `THUNDER_STORE3=0/1`: allow 3-bit Triton store packing.
 - `THUNDER_FASTLAUNCH=0/1`: reuse cached compiled launch instead of retracing MLIR host path.
 - `THUNDER_SPLITS`: force decode split-K count. Otherwise the policy picks it (`thunder_vllm/attention/splits.py`): as fine as the tile budget allows, at most 64, and at most 16 from batch 16 up. Decode-only.

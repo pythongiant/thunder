@@ -92,14 +92,15 @@ def kernel_parity(k_bits: int, v_bits: int, causal: bool, nt: int = 256,
                   gqa: bool = False) -> None:
     op, rr, cb = flags
     tag = "prefill" if causal else "decode"
-    # GQA-packed decode (plan steps 6+8): 32 query heads sharing 8 KV heads,
-    # one CTA per KV head. Decode-only: the launcher rejects max_query_len > 1
-    # for this schedule.
+    # GQA-packed schedule (plan steps 6+8): 32 query heads sharing 8 KV heads,
+    # one CTA per KV head. This probe only drives the decode layout (one token
+    # per CTA, gqa_rows_per_head == 1); the packed prefill layout is covered by
+    # tests/test_correctness.py::test_packed_prefill_matches_dequant_reference.
     hq = 32 if gqa else HK
     groups = hq // HK
     if gqa:
         tag += "+gqa"
-        assert not causal, "gqa_pack is decode-only"
+        assert not causal, "this probe packs decode only"
     torch.manual_seed(0)
     print(f"[kernel] {tag} K={k_bits} V={v_bits} n={nt} "
           f"onepass={op} reg_rescale={rr} causal_bound={cb}", flush=True)
