@@ -130,7 +130,11 @@ def test_cache_write_scatter_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton scatter needs CUDA")
-def test_triton_scatter_matches_reference_at_the_engine_geometry():
+def test_triton_scatter_matches_reference_at_the_engine_geometry(monkeypatch):
+    # The Triton scatter is opt-in (it does not pass this test), so the path under
+    # test has to be requested explicitly -- otherwise `reshape_and_cache` takes
+    # the reference and the comparison is against itself.
+    monkeypatch.setenv("THUNDER_STORE_TRITON", "1")
     """The Triton scatter at the contract the ENGINE actually uses.
 
     `test_cache_write_scatter_matches_reference` covers the torch reference at
@@ -160,7 +164,30 @@ def test_triton_scatter_matches_reference_at_the_engine_geometry():
     reshape_and_cache(key, value, slot, kv_tri, sc_tri, q, layout)
     torch.cuda.synchronize()
 
-    assert torch.equal(layout.k_codes(kv_tri), layout.k_codes(kv_ref))
-    assert torch.equal(layout.v_codes(kv_tri), layout.v_codes(kv_ref))
-    assert torch.equal(layout.k_norm(sc_tri), layout.k_norm(sc_ref))
-    assert torch.equal(layout.v_norm(sc_tri), layout.v_norm(sc_ref))
+    # Report WHERE it diverges before asserting: the engine-level divergence has
+    # never been localized, and "not equal" alone cannot distinguish a wrong
+    # address from a wrong quantizer.
+    bad = []
+    for name, a, b in (
+        ("k_codes", layout.k_codes(kv_tri), layout.k_codes(kv_ref)),
+        ("v_codes", layout.v_codes(kv_tri), layout.v_codes(kv_ref)),
+        ("k_norm", layout.k_norm(sc_tri), layout.k_norm(sc_ref)),
+        ("v_norm", layout.v_norm(sc_tri), layout.v_norm(sc_ref)),
+    ):
+        same = bool(torch.equal(a, b))
+        md = int((a.to(torch.int32) - b.to(torch.int32)).abs().max().item())
+        bad.append((name, same, md))
+    print(f"[SCATTER-PARITY] slot={slot.tolist()}")
+    print(f"[SCATTER-PARITY] fields={bad}")
+    for name, same, md in bad:
+        if not same:
+            a = {"k_codes": layout.k_codes(kv_tri), "v_codes": layout.v_codes(kv_tri),
+                 "k_norm": layout.k_norm(sc_tri), "v_norm": layout.v_norm(sc_ref)}[name]
+            b = {"k_codes": layout.k_codes(kv_ref), "v_codes": layout.v_codes(kv_ref),
+                 "k_norm": layout.k_norm(sc_ref), "v_norm": layout.v_norm(sc_ref)}[name]
+            d = (a.to(torch.int32) - b.to(torch.int32)).abs()
+            idx = tuple(int(i) for i in (d.flatten() > 0).nonzero()[0])
+            print(f"[SCATTER-PARITY] {name}: maxdiff={md} first_bad_idx={idx} "
+                  f"got={int(a.flatten()[d.flatten().argmax()])} "
+                  f"want={int(b.flatten()[d.flatten().argmax()])}", flush=True)
+    assert all(same for _, same, _ in bad), bad

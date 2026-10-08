@@ -270,6 +270,17 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   invisible otherwise. Verify on the GPU with
   `THUNDER_WARM_CAPACITY=1 --e2e "4096|ours|3|4"`; if the capture then succeeds,
   the same launch belongs in the engine's warm-up path (not behind a flag).
+- **The store's engine-level divergence is now REPRODUCED (this session).** The
+  Triton `_scatter_codes` -- which the engine ran by default for 3-bit K -- fails
+  `tests/test_cache_layout.py::test_triton_scatter_matches_reference_at_the_engine_geometry`
+  (the engine's contract: 3-bit K, Hk=8, bs=16, PAD_SLOT_ID), and an EAGER engine
+  run (`--mode e2e`, `enforce_eager=True`, no capture at all) fails to initialize
+  with it as the default. The pre-existing parity case covered only the torch
+  reference at 4-bit K, which takes the OTHER kernel, so the path the engine
+  actually shipped had no coverage. The Triton scatter is therefore opt-in now
+  (`THUNDER_STORE_TRITON=1`) and the torch reference is the default again: it
+  syncs (fatal inside a capture) and it is correct. The capture path needs the
+  sync-free store, and the capture path does not work yet either.
 - **Final measured state (this session).** With `THUNDER_WARM_CAPACITY=1` BOTH
   captures now complete -- `PIECEWISE 1/1` in 13.5 s and, for the first time,
   `FULL 1/1` in 50.5 s (they previously hung or died in `capture_model`). The warm
