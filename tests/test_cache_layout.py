@@ -150,7 +150,10 @@ def test_triton_scatter_matches_reference_at_the_engine_geometry(monkeypatch):
     layout = ThunderCacheLayout(
         num_kv_heads=8, head_dim=128, k_bits=3, v_bits=4, block_size=16
     )
-    q = ThunderQuantizer(128, 3, 4)
+    # Same construction as the engine's `_ensure_quantizer`: WITHOUT the device the
+    # rotation matrix stays on the CPU and `rotate` raises on CUDA input, which is
+    # how this test first "failed" (it never reached a comparison).
+    q = ThunderQuantizer(128, 3, 4, head_dim_padded=layout.head_dim_padded, device="cuda")
     nb, n = 6, 20
     torch.manual_seed(11)
     key = torch.randn(n, 8, 128, dtype=torch.float16, device="cuda")

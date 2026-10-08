@@ -270,18 +270,20 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   invisible otherwise. Verify on the GPU with
   `THUNDER_WARM_CAPACITY=1 --e2e "4096|ours|3|4"`; if the capture then succeeds,
   the same launch belongs in the engine's warm-up path (not behind a flag).
-- **The store's engine-level divergence is now REPRODUCED (this session).** The
-  Triton `_scatter_codes` -- which the engine ran by default for 3-bit K -- fails
-  `tests/test_cache_layout.py::test_triton_scatter_matches_reference_at_the_engine_geometry`
-  (the engine's contract: 3-bit K, Hk=8, bs=16, PAD_SLOT_ID). The pre-existing parity case covered only the torch
+- **The store's engine-level divergence: parity coverage added, verdict pending.**
+  The pre-existing parity case covered only the torch
   reference at 4-bit K, which takes the OTHER kernel, so the path the engine
-  actually shipped had no coverage. (An `--mode e2e` run with the Triton store as
-  the default also fails to initialize, but that config is `ours`, which captures,
-  so it is NOT evidence about the eager path; the eager control is `ours-eager`.)
-  The Triton scatter is therefore opt-in now
-  (`THUNDER_STORE_TRITON=1`) and the torch reference is the default again: it
-  syncs (fatal inside a capture) and it is correct. The capture path needs the
-  sync-free store, and the capture path does not work yet either.
+  actually shipped had no coverage, so
+  `test_triton_scatter_matches_reference_at_the_engine_geometry` now covers the
+  Triton scatter at the engine's contract (3-bit K, Hk=8, bs=16, PAD_SLOT_ID).
+  NOTE: its first two GPU runs "failed" on a TEST bug -- the quantizer was built
+  without `device=`, so its rotation matrix stayed on the CPU and `rotate` raised
+  before any comparison. That is not evidence about the scatter, and the earlier
+  e2e "evidence" was not either (that config is `ours`, which captures).
+  `--e2e "4096|ours-eager|3|4"` serves correctly (ITL 336.5 ms, matching the
+  post-FM19 notes), so the EAGER path is fine; the verdict on the Triton scatter
+  is the parity case above. The capture path still needs a sync-free store, and
+  the capture path does not work yet either.
 - **Final measured state (this session).** With `THUNDER_WARM_CAPACITY=1` BOTH
   captures now complete -- `PIECEWISE 1/1` in 13.5 s and, for the first time,
   `FULL 1/1` in 50.5 s (they previously hung or died in `capture_model`). The warm
