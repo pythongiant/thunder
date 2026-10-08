@@ -270,6 +270,20 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   invisible otherwise. Verify on the GPU with
   `THUNDER_WARM_CAPACITY=1 --e2e "4096|ours|3|4"`; if the capture then succeeds,
   the same launch belongs in the engine's warm-up path (not behind a flag).
+- **Final measured state (this session).** With `THUNDER_WARM_CAPACITY=1` BOTH
+  captures now complete -- `PIECEWISE 1/1` in 13.5 s and, for the first time,
+  `FULL 1/1` in 50.5 s (they previously hung or died in `capture_model`). The warm
+  launches the capture sizes at both the policy's split count and 1, and the
+  capacity at 1 only: warming the capacity at 16 hangs the FULL capture, whose
+  padded batch has no CPU seq-len mirror and therefore runs S=1. What still kills
+  the engine is an IMA *after* both captures (`XID 31 ... ACCESS_TYPE_VIRT_READ`),
+  in the KV-cache-init phase, with a traceback that surfaces at the store's
+  `reshape_and_cache` -- a reporting site, not a fault site. The store is the open
+  item: for 3-bit K (the engine default) `do_kv_cache_update` routes to the Triton
+  `_scatter_codes`, whose own docstring records an unresolved engine-level
+  divergence, and the engine has never served with it. Its instrumented bounds
+  (`THUNDER_DEBUG_KV=1` -> `[TQ-SCATTER]`, eager-only) were clean in the one step
+  measured (`sm_max=-1`, a padded slot), so the fault is elsewhere in that phase.
   The Triton merge is NOT implicated: the capture never runs it (point 1).
 - **Correction (measured again):** with the current harness config
   (`cudagraph_mode="FULL_AND_PIECEWISE"`, `cudagraph_capture_sizes=[1]`) capture
