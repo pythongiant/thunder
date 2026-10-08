@@ -234,23 +234,40 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   store's sync died first), a hang once the sync was removed (the compile blocks
   on the allocator), and `THUNDER_SPLITS=1` moving the symptom again (it changes
   which config is cold).
-- Mitigation (experiment, OFF by default): `THUNDER_WARM_CAPACITY=1` issues one
-  eager launch of exactly the capture's triple -- the capacity's `num_reqs`, the
-  capacity's tile, `num_splits=1`, GQA-packed -- from a capacity-shaped metadata
-  whose padding is ZEROED (`tests/test_capacity_warm.py` pins that invariant, since
-  a stale tail entry would be an out-of-bounds read), so the padding requests have
-  `kv_len == 0`/`q_len == 0` and their CTAs do nothing. It doubles as the eager
-  allocation of the capture-sized split partials. Three hazards the audit found
-  and the implementation now defends against, each of which would have been an
-  out-of-bounds read or a silently corrupted step: (a) the step's `indptr` is only
-  `observed + 1` long while the kernel indexes it up to `capacity`, so the warm
-  uses a capacity-sized ZEROED copy; (b) `_merge_splits`-style reductions differ in
-  their last bits between `num_splits=1` and `S=16..64`, so the warm's output is
-  saved and restored around the launch (`o.clone()`/`copy_`) rather than left in
-  the step's buffer; (c) the metadata mirror is one buffer per (capacity, device)
-  with the previously live region ZEROED on every refresh -- keying it per observed
-  batch size would have leaked a buffer per size, and skipping the zeroing would
-  leave a stale tail. Verify on the GPU with
+- **Correction (measured, not inferred): points 1 and 2 above are wrong, and the
+  warm never ran at all.** Three separate errors, each caught by measurement:
+  1. **The split count is NOT 1 under capture.** `_decode_split_count` only falls
+     back to 1 when there is no host mirror; vLLM's capture metadata DOES carry
+     `seq_lens_cpu_upper_bound` (= 4160 at this context), so the captured launch
+     gets `choose_split_count(4160, tile_n=32, num_reqs=1)` = **16**. The captured
+     decode is a split-K decode like any other.
+  2. **The capture's geometry is the capture SIZE, not the capacity, and not the
+     warm-up dummy's.** Its own launch, measured at `cudagraph_capture_sizes=[1]`:
+     `q=(1, 32, 128)`, `sl=(1,)`, `qsl=(2,)`, `num_reqs=1`, `max_query_len=1`,
+     `is_prefill=False`, `cap_reqs=1024`. `_fixed_rows` takes its view from the
+     buffer's STORAGE, so the capture's q/o view is its own token count (1) while
+     an eager step's is its own (16384 at the profile batch) -- different jit keys
+     from the same code.
+  3. **The warm raised `NameError` on every launch.** `launch_thunder_attention` is
+     imported *inside* `forward`, so it is not a module global and `_capacity_warm`
+     could not see it. The handler logged it and continued (`logger.exception`),
+     which is why the captures stayed cold while the flag looked like it worked:
+     every earlier negative result about warming is uninformative.
+- Mitigation (experiment, OFF by default): `THUNDER_WARM_CAPACITY=1` issues eager
+  launches of the capture geometries before vLLM captures them: each
+  `cudagraph_capture_sizes` entry (PIECEWISE, `num_reqs == size`) and the capacity
+  (FULL, `num_reqs == max_num_seqs` via `pad_attn`), each at every split count
+  `1..64`, with the capture's own tile (`get_kernel` per `num_reqs`), GQA-packed,
+  and -- the part that was missing -- q/o tensors of the CAPTURE's shape, allocated
+  by the warm itself (a step's tensors yield a different `_fixed_rows` view). The
+  metadata is all-zero (`tests/test_capacity_warm.py` pins that invariant: a stale
+  entry would be an out-of-bounds read, and a zero entry makes `kv_len == 0` and
+  `q_len == 0`, so the CTAs compile and allocate without touching a row). The warm
+  uses its own q/o, so no save/restore of the step's output is needed, and a
+  capacity-sized zeroed `indptr` copy covers the indirect path's `mIndptr[req]`
+  indexing. `tests/test_capacity_warm.py` also pins that the warm REACHES the
+  launcher, per capture size and at the capacity -- the NameError class of bug is
+  invisible otherwise. Verify on the GPU with
   `THUNDER_WARM_CAPACITY=1 --e2e "4096|ours|3|4"`; if the capture then succeeds,
   the same launch belongs in the engine's warm-up path (not behind a flag).
   The Triton merge is NOT implicated: the capture never runs it (point 1).

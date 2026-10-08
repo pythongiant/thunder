@@ -142,6 +142,27 @@ def _in_capture(attn_metadata=None) -> bool:
     return bool(torch.cuda.is_current_stream_capturing())
 
 
+def _warm_tensors(n_reqs: int, num_heads: int, head_size: int, device, dtype):
+    """Same-SHAPED q/o for a warm launch, with the capture's row count.
+
+    Not the step's: `_fixed_rows` derives its view from the storage, so a step's
+    buffer yields a view as large as that buffer, while the capture's yields the
+    capture's token count. The jit cache is keyed on the shapes, so the warm has to
+    reproduce them, and uninitialized memory is fine: a zero-row q/o is never read
+    (see `_warm_meta`).
+    """
+    cache = _warm_tensors.__dict__.setdefault("_cache", {})
+    key = (int(n_reqs), int(num_heads), int(head_size), str(device), str(dtype))
+    hit = cache.get(key)
+    if hit is None:
+        shape = (int(n_reqs), int(num_heads), int(head_size))
+        hit = cache[key] = (
+            torch.zeros(shape, dtype=dtype, device=device),
+            torch.zeros(shape, dtype=dtype, device=device),
+        )
+    return hit
+
+
 def _warm_meta(n_reqs: int, indptr_len: int, block_table, max_blocks_per_req: int,
                device):
     """An ALL-ZERO metadata for the capture geometry.
@@ -1262,10 +1283,23 @@ class ThunderAttentionImpl(AttentionImplBase):
         this the capture is the FIRST execution of that triple: a cold compile plus
         a cold allocation inside the captured region, which is what kills it.
         """
+        # Same lazy import as `forward`: the module must import without CUDA. A
+        # function-local import there means the name is NOT a module global, so
+        # this method must import it itself -- it did not, and every warm launch
+        # raised NameError into the non-fatal handler below, which is why the
+        # captures stayed cold while this looked like it was running.
+        from thunder_vllm.attention.cute_kernel import launch_thunder_attention
+
         sizes = [int(x) for x in (getattr(attn_metadata, "capture_sizes", ()) or ())]
         if not sizes:
             return  # graphs are off: nothing to warm
         cap = int(getattr(attn_metadata, "max_num_reqs_capacity", 0) or 0)
+        # Both capture geometries. PIECEWISE runs at each `cudagraph_capture_sizes`
+        # entry (`q=(1, 32, 128)`, `sl=(1,)` measured at size 1); FULL pads every
+        # batch to the capacity (`pad_attn`), so its launch is the capacity's
+        # num_reqs and, via the tile policy, the capacity's tile.
+        if cap > 0 and cap not in sizes:
+            sizes = [*sizes, cap]
         done = []
         for size in sizes:
             n_reqs = max(int(size), 1)
@@ -1280,8 +1314,17 @@ class ThunderAttentionImpl(AttentionImplBase):
                     q.device,
                 )
                 kernel = self.get_kernel(self.head_size, False, n_reqs, 1)
+                # The capture's OWN q/o, at the capture's OWN shape: measured from
+                # its launch (`q=(1, 32, 128)` at capture size 1). `_fixed_rows`
+                # takes its view from the buffer's STORAGE, so passing the step's
+                # q/o -- a 16384-row view -- compiles a different jit key, which is
+                # why warming the step's tensors never covered the capture. These
+                # are never read (the all-zero metadata makes every q row invalid
+                # and every KV tile empty); they exist to reproduce the shape.
+                wq, wo = _warm_tensors(n_reqs, self.num_heads, self.head_size,
+                                       q.device, q.dtype)
                 launch_thunder_attention(
-                    kernel, q, gathered, o, md, self.scale,
+                    kernel, wq, gathered, wo, md, self.scale,
                     quantizer=quantizer, num_splits=splits,
                     gqa_pack=bool(self.num_kv_groups > 1),
                     onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
@@ -1291,7 +1334,17 @@ class ThunderAttentionImpl(AttentionImplBase):
                 )
                 done.append((n_reqs, splits, kernel.tile_m, kernel.tile_n))
         if done:
-            logger.info("capture warm-up: %d launch(es), first=%s", len(done), done[0])
+            # print, not logger.info: this module's logger is separate from
+            # vLLM's and its INFO is suppressed, which is how a NameError in
+            # every launch stayed invisible for several GPU runs.
+            print(f"[TQ-WARM] {len(done)} launch(es) "
+                  f"first={done[0]} last={done[-1]} "
+                  f"q={tuple(wq.shape)}/{wq.dtype} o={tuple(wo.shape)} "
+                  f"sl={tuple(md.seq_lens.shape)} qsl={tuple(md.query_start_loc.shape)} "
+                  f"bt={tuple(md.block_table.shape)} "
+                  f"num_reqs={md.num_reqs} mql={md.max_query_len} "
+                  f"nat={md.num_actual_tokens} cap_reqs={cap}",
+                  flush=True)
 
     def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:
         """Split-K count for a decode step, or 1 when splitting would not help.

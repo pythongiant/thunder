@@ -79,6 +79,10 @@ def main() -> int:
     env["PYTHONPATH"] = "/opt/thunder_vllm"
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("VLLM_LOGGING_LEVEL", "INFO")
+    # So a hung engine can be made to print its own Python stack: the watchdog
+    # sends SIGABRT, which -- with faulthandler enabled by this variable -- dumps
+    # every thread's traceback to the engine's stderr, which this probe captures.
+    env.setdefault("PYTHONFAULTHANDLER", "1")
     proc = subprocess.Popen(
         [sys.executable, path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, cwd="/opt/thunder_vllm", env=env,
@@ -102,6 +106,13 @@ def main() -> int:
     if proc.poll() is None:
         print(f"[watch] STILL RUNNING after {WATCH:.0f}s -> hung", flush=True)
         print(f"[watch] state: {_proc_state()}", flush=True)
+        # Make the engine print its own stack before the container goes away.
+        for pid in subprocess.run(["pgrep", "-f", "EngineCore"], capture_output=True,
+                                  text=True).stdout.split()[:2]:
+            subprocess.run(["kill", "-ABRT", pid], capture_output=True)
+        time.sleep(5)
+        for line in proc.stdout.read().splitlines()[-80:]:
+            print(f"E| {line}", flush=True)
         proc.kill()
         return 3
     print(f"[watch] finished rc={proc.returncode}", flush=True)
