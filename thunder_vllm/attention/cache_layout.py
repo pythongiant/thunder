@@ -305,6 +305,110 @@ def reshape_and_cache_ref(
 
 if _HAS_TRITON:
 
+    @triton.jit(
+        # The strides are runtime values but never part of the schedule, and this
+        # kernel's cache key must not move with them: a fresh Triton compile
+        # inside a CUDA-graph capture is fatal.
+        do_not_specialize=["stride_cache_block", "stride_cache_pos",
+                           "stride_scales_block", "stride_scales_head",
+                           "stride_scales_pos"],
+    )
+    def _scatter_codes_kernel(
+        k_ptr,
+        v_ptr,
+        kn_ptr,
+        vn_ptr,
+        slot_ptr,
+        cache_ptr,
+        scales_ptr,
+        stride_cache_block,
+        stride_cache_head: tl.constexpr,
+        stride_cache_pos,
+        stride_scales_block,
+        stride_scales_head,
+        stride_scales_pos,
+        num_kv_heads: tl.constexpr,
+        k_packed_bytes: tl.constexpr,
+        v_packed_bytes: tl.constexpr,
+        v_offset: tl.constexpr,
+        block_size: tl.constexpr,
+        vec: tl.constexpr,
+    ):
+        """Write one token's ALREADY-QUANTIZED codes and norms into the cache.
+
+        A pure data movement: the values come from the exact torch quantizer, so
+        this cannot change numerics. It exists because the torch scatter it
+        replaces decides PAD_SLOT_ID on the host
+        (``if not bool(keep.any())`` plus ``t[mask]`` gathers), and that is a D2H
+        sync -- which is fatal inside vLLM's CUDA-graph capture, where this store
+        runs (the KV-update hook is part of the layer's forward). PAD_SLOT_ID is
+        skipped in-kernel, the way vLLM's own cache kernels do it.
+        """
+        row = tl.program_id(0)
+        slot = tl.load(slot_ptr + row)
+        if slot >= 0:
+            pos = slot % block_size
+            blk = slot // block_size
+            offs = tl.arange(0, vec)
+            for h in tl.static_range(num_kv_heads):
+                for b in tl.static_range(0, (k_packed_bytes + vec - 1) // vec):
+                    d = b * vec + offs
+                    m = d < k_packed_bytes
+                    val = tl.load(
+                        k_ptr + row * (num_kv_heads * k_packed_bytes) + h * k_packed_bytes + d,
+                        mask=m, other=0,
+                    )
+                    tl.store(
+                        cache_ptr + blk * stride_cache_block + h * stride_cache_head
+                        + pos * stride_cache_pos + d,
+                        val, mask=m,
+                    )
+                for b in tl.static_range(0, (v_packed_bytes + vec - 1) // vec):
+                    d = b * vec + offs
+                    m = d < v_packed_bytes
+                    val = tl.load(
+                        v_ptr + row * (num_kv_heads * v_packed_bytes) + h * v_packed_bytes + d,
+                        mask=m, other=0,
+                    )
+                    tl.store(
+                        cache_ptr + blk * stride_cache_block + h * stride_cache_head
+                        + pos * stride_cache_pos + v_offset + d,
+                        val, mask=m,
+                    )
+                kn = tl.load(kn_ptr + row * num_kv_heads + h)
+                tl.store(
+                    scales_ptr + blk * stride_scales_block + h * stride_scales_head
+                    + pos * stride_scales_pos,
+                    kn,
+                )
+                vn = tl.load(vn_ptr + row * num_kv_heads + h)
+                tl.store(
+                    scales_ptr + blk * stride_scales_block + h * stride_scales_head
+                    + pos * stride_scales_pos + 1,
+                    vn,
+                )
+
+    def _scatter_codes(kv, slot_mapping: torch.Tensor, kv_cache: torch.Tensor,
+                       kv_scales: torch.Tensor, layout: ThunderCacheLayout) -> None:
+        """Launch :func:`_scatter_codes_kernel` for one store."""
+        c_view = kv_cache.view(torch.uint8)
+        s_view = kv_scales
+        slot_i = slot_mapping.to(torch.int32)
+        _scatter_codes_kernel[(int(slot_i.numel()),)](
+            kv.k_packed, kv.v_packed, kv.k_norm, kv.v_norm, slot_i,
+            c_view, s_view,
+            int(c_view.stride(0)), int(c_view.stride(1)), int(c_view.stride(2)),
+            int(s_view.stride(0)), int(s_view.stride(1)), int(s_view.stride(2)),
+            num_kv_heads=layout.num_kv_heads,
+            k_packed_bytes=layout.k_packed_bytes,
+            v_packed_bytes=layout.v_packed_bytes,
+            v_offset=layout.k_packed_bytes,
+            block_size=layout.block_size,
+            vec=16,
+        )
+
+if _HAS_TRITON:
+
     @triton.jit
     def _reshape_and_cache_kernel(
         key_ptr,
@@ -506,6 +610,23 @@ if _HAS_TRITON:
             "", "0", "false", "no", "off")
         _ok_bits = (1, 2, 3, 4, 8) if _allow3 else (1, 2, 4, 8)
         if layout.k_bits not in _ok_bits or layout.v_bits not in _ok_bits:
+            # The vectorised packer does not cover this width (3-bit K is the
+            # engine's default). Keep the EXACT torch quantizer and replace only
+            # the scatter: the torch one decides PAD_SLOT_ID on the host
+            # (`if not bool(keep.any())` and `t[mask]` gathers -- both D2H syncs),
+            # and this store runs inside vLLM's CUDA-graph capture, where a sync
+            # is fatal (cudaErrorStreamCaptureUnsupported -> StreamCaptureInvalidated).
+            n = key.shape[0]
+            if _HAS_TRITON and slot_mapping.is_cuda and n > 0:
+                kv = quantizer.quantize(key, value)
+                # The kernel addresses the quantizer's tensors flat, which holds
+                # for everything `quantize` returns (all fresh, contiguous). A
+                # caller handing in a strided view gets the torch path instead:
+                # slower, and it syncs, but never wrong.
+                if (kv.k_packed.is_contiguous() and kv.v_packed.is_contiguous()
+                        and kv.k_norm.is_contiguous() and kv.v_norm.is_contiguous()):
+                    _scatter_codes(kv, slot_mapping[:n], kv_cache, kv_scales, layout)
+                    return
             reshape_and_cache_ref(
                 key, value, slot_mapping, kv_cache, kv_scales, quantizer, layout
             )

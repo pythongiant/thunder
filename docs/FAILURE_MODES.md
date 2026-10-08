@@ -161,6 +161,23 @@ makes the capture succeed, so the fault is in this backend and in the dense path
 - Detection: `cudaErrorStreamCaptureUnsupported` (not `...Invalidated`) raised at
   `profile_cudagraph_memory`, at 4k as well as 32k, i.e. it is the path and not the
   context length. Two identical runs fail identically, so it is not a race.
+- **Root cause candidate (this session): the store's host syncs.**
+  `reshape_and_cache_ref` -- the path 3-bit K uses, i.e. the engine's default --
+  decides PAD_SLOT_ID ON THE HOST (`if not bool(keep.any())`, plus the `t[mask]`
+  gathers next to it: two D2H syncs), and the store runs INSIDE the captured
+  region because vLLM's KV-update hook is part of the layer's forward. A sync
+  during capture is exactly `cudaErrorStreamCaptureUnsupported` ->
+  `...Invalidated`. Nothing else in the forward touches device data on the host
+  (the `seq_lens_cpu` mirror, the config flags and `is_current_stream_capturing()`
+  are all host-side; the quantizer has no syncs). The store now scatters through
+  `_scatter_codes_kernel`, which skips PAD_SLOT_ID in-kernel like vLLM's own cache
+  kernels, so the 3-bit path has no host branch at all; the torch quantizer is
+  unchanged and the parity probe (`ci_probe/modal_probe_store_parity.py`, 4/4,
+  3/4, and both with PAD_SLOT_ID) reports `maxdiff == 0.0` on codes and norms.
+  Effect on capture: not yet settled -- with the scatter in place the capture no
+  longer fails fast, the 4k `ours` run instead runs long (bounded tests pending),
+  so the syncs were necessary but may not be sufficient. Next: run the 4k graph
+  path with `E2E_GEN` small and read the engine's own capture logs.
 - **Correction (measured again):** with the current harness config
   (`cudagraph_mode="FULL_AND_PIECEWISE"`, `cudagraph_capture_sizes=[1]`) capture
   fails at `capture_model` on the REQUEST-MAJOR path too, with BOTH error classes
