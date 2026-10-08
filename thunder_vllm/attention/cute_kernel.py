@@ -1246,16 +1246,23 @@ def _merge_splits(part_o, part_m, part_l, num_reqs, num_splits, hq, hd, o3, q_st
 def _fast_key(kernel_cfg, shapes, num_reqs, max_query_len, num_splits,
               debug, split_mode, gqa_mode, gqa_pack, onepass, reg_rescale,
               causal_bound, indirect):
-    """Fast-launch cache key: kernel config + tensor shapes + launch scalars.
+    """Fast-launch cache key: kernel config + launch scalars.
 
-    Pure function (no torch/cute dependency) so it is unit-testable. It must
-    cover EVERY launch-time constexpr baked into the compiled function --
-    including ``gqa_pack`` and ``indirect``, which select different kernel
-    specializations even when all tensor shapes coincide.
+    Pure function (no torch/cute dependency) so it is unit-testable. It must cover
+    EVERY launch-time constexpr baked into the compiled function -- including
+    ``gqa_pack`` and ``indirect``, which select different kernel specializations
+    even when all tensor shapes coincide.
+
+    ``shapes`` is accepted but deliberately NOT part of the key. The compiled
+    function is specialized on constexprs only; tensor shapes are runtime arguments
+    it handles itself, so keying on them made the cache arm once per SHAPE instead
+    of once per config -- and an arm costs a ``generate_mlir`` (~166 ms, measured),
+    which landed in the first request of each new prompt length. Everything that
+    does vary the specialization (the tile, the bit widths, the flags, the split
+    count) is already in ``kernel_cfg`` and the scalars below.
     """
     return (
         tuple(kernel_cfg),
-        tuple(shapes),
         int(num_reqs), int(max_query_len), int(num_splits),
         int(bool(debug)), int(split_mode), int(gqa_mode), int(bool(gqa_pack)),
         int(bool(onepass)), int(bool(reg_rescale)), int(bool(causal_bound)),

@@ -51,8 +51,9 @@ def test_kernel_cfg_changes_key():
     assert _key(kernel_cfg=(128, 4, 4, 4, True, 64, 64, 128)) != _key()
 
 
-def test_shapes_change_key():
-    """Tensor shapes are the other half of the key: the gathered buffer is sized
-    by the reservation, which now depends on the gather path."""
-    assert _key(shapes=((1, 32, 128), (256, 16, 8, 64), (1,))) != _key()
-    assert _key(shapes=((1, 32, 128), (512, 16, 8, 64))) != _key()
+def test_shapes_do_not_change_key():
+    """Shapes are runtime arguments of the compiled function, not constexprs, so
+    they must NOT key the cache: keying on them armed it once per prompt length,
+    and an arm costs a generate_mlir (~166 ms) inside the first request."""
+    assert _key(shapes=((1, 32, 128), (256, 16, 8, 64), (1,))) == _key()
+    assert _key(shapes=((4096, 32, 128), (1024, 16, 8, 64))) == _key()
