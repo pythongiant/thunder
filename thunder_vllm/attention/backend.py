@@ -1300,10 +1300,36 @@ class ThunderAttentionImpl(AttentionImplBase):
         # num_reqs and, via the tile policy, the capacity's tile.
         if cap > 0 and cap not in sizes:
             sizes = [*sizes, cap]
+        # The capture's EXACT split count, from the same policy the engine applies
+        # and the same CPU seq-len mirror it reads. A sweep of 1..64 was both wrong
+        # (it allocated the capacity's 64-split partials, ~1.6 GB) and fragile (the
+        # first failure aborted every remaining key).
+        from thunder_vllm.attention.splits import decode_split_count
+        from thunder_vllm.attention.tile_shape import tile_shape
+
+        # The capture's OWN seq_len, not the step's: vLLM builds the capture's
+        # metadata with `profile_seq_lens = min(max_model_len, max_num_tokens //
+        # desc.num_tokens)`, which for a decode desc (num_tokens == 1) is exactly
+        # `max_model_len`. Reading the step's mirror instead (the KV-init dummy's
+        # 1) warmed splits=1 while the capture runs 16 -- measured: the piecewise
+        # capture took 11.1 s against 49.9 s, and the FULL one stayed at 50.9 s.
+        sl_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        cap_len = int(getattr(attn_metadata, "max_model_len_capacity", 0) or 0)
         done = []
         for size in sizes:
             n_reqs = max(int(size), 1)
-            for splits in (1, 2, 4, 8, 16, 32, 64):
+            if cap_len > 0:
+                seq_len = cap_len
+            elif torch.is_tensor(sl_cpu) and sl_cpu.numel() >= n_reqs and not sl_cpu.is_cuda:
+                seq_len = int(sl_cpu[:n_reqs].max().item())
+            else:
+                seq_len = int(attn_metadata.seq_lens[:n_reqs].max().item())
+            splits = decode_split_count(
+                seq_len, is_prefill=False, num_kv_groups=self.num_kv_groups,
+                num_reqs=n_reqs,
+                tile_n=tile_shape(False, n_reqs)["n_block"],
+            )
+            for splits in (splits,):
                 key = (n_reqs, splits, self.head_size, self.num_kv_groups)
                 if key in _WARM_CAPACITY_DONE:
                     continue
@@ -1334,6 +1360,10 @@ class ThunderAttentionImpl(AttentionImplBase):
                 )
                 done.append((n_reqs, splits, kernel.tile_m, kernel.tile_n))
         if done:
+            try:  # a diagnostic; CPU (the test) has no capture stream to ask
+                _cap_now = int(torch.cuda.is_current_stream_capturing())
+            except Exception:  # noqa: BLE001
+                _cap_now = -1
             # print, not logger.info: this module's logger is separate from
             # vLLM's and its INFO is suppressed, which is how a NameError in
             # every launch stayed invisible for several GPU runs.
@@ -1343,7 +1373,8 @@ class ThunderAttentionImpl(AttentionImplBase):
                   f"sl={tuple(md.seq_lens.shape)} qsl={tuple(md.query_start_loc.shape)} "
                   f"bt={tuple(md.block_table.shape)} "
                   f"num_reqs={md.num_reqs} mql={md.max_query_len} "
-                  f"nat={md.num_actual_tokens} cap_reqs={cap}",
+                  f"nat={md.num_actual_tokens} cap_reqs={cap} "
+                  f"capturing={_cap_now}",
                   flush=True)
 
     def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:

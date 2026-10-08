@@ -630,6 +630,27 @@ if _HAS_TRITON:
                 # slower, and it syncs, but never wrong.
                 if (kv.k_packed.is_contiguous() and kv.v_packed.is_contiguous()
                         and kv.k_norm.is_contiguous() and kv.v_norm.is_contiguous()):
+                    if _os.environ.get("THUNDER_DEBUG_KV"):
+                        # Bounds, on eager steps only (a D2H read is fatal under
+                        # capture). The engine-level store has never run before,
+                        # so its geometry has never been checked against the
+                        # cache's capacity.
+                        _sm = slot_mapping[:n].to(torch.int64)
+                        _keep = _sm >= 0
+                        _slots = int(kv_cache.shape[0]) * int(layout.block_size)
+                        print(
+                            "[TQ-SCATTER] n=%d sm_len=%d sm_max=%s slots=%d "
+                            "cache=%s scales=%s k_packed=%s k_norm=%s "
+                            "capturing=%d"
+                            % (
+                                n, int(slot_mapping.numel()),
+                                int(_sm[_keep].max().item()) if bool(_keep.any()) else -1,
+                                _slots, tuple(kv_cache.shape), tuple(kv_scales.shape),
+                                tuple(kv.k_packed.shape), tuple(kv.k_norm.shape),
+                                int(torch.cuda.is_current_stream_capturing()),
+                            ),
+                            flush=True,
+                        )
                     _scatter_codes(kv, slot_mapping[:n], kv_cache, kv_scales, layout)
                     return
             reshape_and_cache_ref(

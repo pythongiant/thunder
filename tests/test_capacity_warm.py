@@ -82,6 +82,10 @@ def test_capacity_warm_reaches_the_launcher(monkeypatch):
         max_num_reqs_capacity = 1024
         max_blocks_per_req = 264
         block_table = torch.zeros((1, 264), dtype=torch.int32)
+        # vLLM's CPU seq-len mirror, which the engine's split policy reads: the
+        # warm must derive the SAME split count from it, not sweep.
+        seq_lens = torch.full((1024,), 4160, dtype=torch.int32)
+        seq_lens_cpu = torch.full((1024,), 4160, dtype=torch.int32)
 
     impl = object.__new__(B.ThunderAttentionImpl)  # __init__ needs a CUDA config
     impl.head_size, impl.num_heads, impl.num_kv_heads = 128, 32, 8
@@ -92,8 +96,10 @@ def test_capacity_warm_reaches_the_launcher(monkeypatch):
     q = torch.zeros((4, 32, 128), dtype=torch.float16)
     impl._capacity_warm(q, None, None, _Md(), None, None, False)
 
-    assert [k["num_splits"] for _, k in launched]  # one per split count, per size
-    assert len(launched) == 3 * 7  # sizes 1, 2 and the capacity, x 7 split counts
+    # One launch per capture geometry: sizes 1, 2 and the capacity. At 4160
+    # tokens every one of them splits 16 ways (the batched cap for the capacity).
+    assert [k["num_splits"] for _, k in launched] == [16, 16, 16]
+    assert [a[1].shape[0] for a, _ in launched] == [1, 2, 1024]
     # The capture's own q/o shape, not the step's storage-derived view.
     assert launched[0][0][1].shape == (1, 32, 128)
     assert launched[0][0][3].shape == (1, 32, 128)
