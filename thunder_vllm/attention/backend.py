@@ -26,7 +26,12 @@ from thunder_vllm.attention.metadata import (
     ThunderMetadata,
     ThunderMetadataBuilder,
 )
-from thunder_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
+from thunder_vllm.attention.paged_kv import (
+    ADDRESSABLE_GATHER_BYTES,
+    PagedKVManager,
+    gathered_tensor_bytes,
+    make_paged_kv_manager,
+)
 from thunder_vllm.attention.tile_shape import tile_shape
 from thunder_vllm.utils.logging import env_flag, get_logger, log_once
 
@@ -68,7 +73,9 @@ def _use_indirect_gather(paged, layout, num_kv_heads: int, setting: str) -> bool
     """CSR gather when asked for, or when the request-major table would not fit.
 
     ``THUNDER_8B_INDIRECT`` still wins when set (``0`` forces request-major, even
-    past the budget, for reproducing the OOM).
+    past the budget, for reproducing the OOM; ``1`` forces CSR) -- which also
+    bypasses the addressability check below, so a fault can still be reproduced
+    on demand.
     """
     val = (setting or "").strip().lower()
     if val:
@@ -76,6 +83,12 @@ def _use_indirect_gather(paged, layout, num_kv_heads: int, setting: str) -> bool
     return (
         _request_major_gather_bytes(paged, layout, num_kv_heads)
         > REQUEST_MAJOR_GATHER_BUDGET_BYTES
+        # Not just memory: past `ADDRESSABLE_GATHER_BYTES` the K/V tensor itself
+        # is unaddressable by the kernel's 32-bit indices (see paged_kv.py). The
+        # dense path reserves by physical blocks, which is smaller by the ratio
+        # of live blocks to the block-table width.
+        or gathered_tensor_bytes(paged.max_num_reqs * paged.max_blocks_per_req,
+                                 layout, num_kv_heads) > ADDRESSABLE_GATHER_BYTES
     )
 
 _ENGINE_HOOK = {"done": False}

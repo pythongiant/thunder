@@ -22,7 +22,7 @@ throughput.
   tok/s of decode** (17.4 ms ITL, measured serially), which is 2.4x off upstream's
   compressed path (142) and 5.7x off its own fp16 control (329). The whole-request
   rate is 7.3-7.5 tok/s regardless, because a 4k prefill takes 1.9-4.1 s against
-  upstream's 74 ms. 16k and 32k do not run yet — see *Known issues*.
+  upstream's 74 ms. 16k and 32k run eager only — see *Known issues*.
 - **Correctness**: the kernel matches a dequantized-fp16 oracle at
   `atol=rtol=1e-2`, and the GPU suite is green except one unwired stub.
 
@@ -255,12 +255,15 @@ split policies, so re-run it before quoting a ratio.
 
 ## Known issues
 
-- **16k serving faults in the kernel.** At ctx 16384 the engine launches a
-  many-request prefill — vLLM chunks the prompt into 1024 requests of 16 query
-  rows — and the kernel takes an illegal memory access. It is pre-existing (the
-  pre-session tile configuration fails identically), and it is in the kernel
-  rather than the gather or the metadata. `docs/FAILURE_MODES.md` 15 has the
-  launch geometry and the evidence.
+- **16k used to fault in the kernel; the cause was 32-bit addressing.** The fault
+  was not a served prefill but vLLM's own warm-up (`_dummy_run` at 1024 requests
+  x 16 query rows), and it was the request-major gather's reservation: 1024 x 1032
+  block-rows is a 6.49 GB K tensor, past what a 32-bit CuTeDSL index can address,
+  so requests past the wrap read a wrapped address. The gather now switches to the
+  dense path when the request-major tensor would be unaddressable (and refuses
+  outright if even the dense one would be), so 16k initializes and generates —
+  **eager only**, because the dense path is still not capturable (next bullet).
+  `docs/FAILURE_MODES.md` 15.
 - **32k cannot be served under CUDA graphs.** The gather reservation that fits
   long context (the dense/CSR path, 3.0 GiB at 32k) is not capturable in this
   stack, and the layout that is capturable (request-major) would need a 30.7 GiB

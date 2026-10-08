@@ -20,7 +20,12 @@ from thunder_vllm.attention.backend import (
     _request_major_gather_bytes,
     _use_indirect_gather,
 )
-from thunder_vllm.attention.paged_kv import PagedKVManager, make_paged_kv_manager
+from thunder_vllm.attention.paged_kv import (
+    ADDRESSABLE_GATHER_BYTES,
+    PagedKVManager,
+    check_addressable,
+    make_paged_kv_manager,
+)
 from thunder_vllm.quant.quantizer import ThunderQuantizer
 
 
@@ -388,3 +393,54 @@ def test_reservation_refuses_to_grow_after_allocation():
     mgr.reserve(32)  # same size is fine (every replay asks for the same cap)
     with pytest.raises(ValueError, match="must not change size"):
         mgr.reserve(64)
+
+
+def test_reservation_is_refused_past_the_addressable_limit():
+    """A gathered K/V tensor past ``ADDRESSABLE_GATHER_BYTES`` is unaddressable.
+
+    CuTeDSL indexes these buffers with 32-bit offsets, so the request-major
+    reservation at ctx 16448 on Qwen3-8B (1024 requests x 1032 block columns =
+    16.9M token rows, V 8.65 GB) wrapped and the kernel took an illegal address
+    (docs/FAILURE_MODES.md 15). The boundary is bracketed by measurement: 4k's
+    request-major tensors are 2.06 GiB and run, the 16k ones are 8.06 GiB and
+    fault, and the dense reservation at 16k (2.12 GiB) runs. The check has to
+    fire at the reservation, where the traceback still names the geometry.
+    """
+    layout = ThunderCacheLayout(
+        num_kv_heads=8, head_dim=128, k_bits=3, v_bits=4, block_size=16
+    )
+    req4k = PagedKVManager(layout, max_num_reqs=1024, max_blocks_per_req=264, device="cpu")
+    req16k = PagedKVManager(layout, max_num_reqs=1024, max_blocks_per_req=1032, device="cpu")
+
+    # 4k: 270336 rows x 16 x 8 x 64 B = 2.06 GiB, the measured-working case.
+    assert check_addressable(req4k.max_page_rows, layout, 8, "test") == 270336 * 8192
+    with pytest.raises(RuntimeError, match="32-bit CuTeDSL tensor index"):
+        check_addressable(req16k.max_page_rows, layout, 8, "test")
+
+    # The manager refuses the same reservation, and the diagnostic escape hatch
+    # still reproduces the wrap on demand.
+    with pytest.raises(RuntimeError, match="PagedKVManager.reserve"):
+        req16k.reserve()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("THUNDER_ALLOW_UNADDRESSABLE", "1")
+    try:
+        assert req16k.reserve() is not None
+    finally:
+        monkeypatch.undo()
+
+
+def test_gather_path_switches_before_the_tensor_becomes_unaddressable():
+    """The 16k request-major reservation is chosen against on addressability, not
+    just on memory: the dense path reserves by physical blocks (2.12 GiB there)
+    and is the one that runs at ctx 16384.
+    """
+    layout = ThunderCacheLayout(
+        num_kv_heads=8, head_dim=128, k_bits=3, v_bits=4, block_size=16
+    )
+    req4k = PagedKVManager(layout, max_num_reqs=1024, max_blocks_per_req=264, device="cpu")
+    req16k = PagedKVManager(layout, max_num_reqs=1024, max_blocks_per_req=1032, device="cpu")
+
+    assert not _use_indirect_gather(req4k, layout, 8, "")
+    assert _use_indirect_gather(req16k, layout, 8, "")
+    # An explicit setting still wins, so the fault stays reproducible on demand.
+    assert not _use_indirect_gather(req16k, layout, 8, "0")

@@ -35,6 +35,68 @@ from thunder_vllm.utils.logging import env_flag, get_logger
 
 logger = get_logger("attention.paged_kv")
 
+# ---- the one hard limit on a gathered buffer -----------------------------
+# CuTeDSL addresses the buffers it is handed with 32-bit offsets. A gathered
+# tensor past this many bytes therefore WRAPS: the kernel reads a wrapped
+# address, which is `cudaErrorIllegalAddress` when it lands outside the
+# allocation and silently wrong data when it lands back inside it (the buffer is
+# much larger than the wrap window, so most CTAs are in the second case -- this
+# is why the fault looked flaky and why the engine's 16k decode steps "ran").
+#
+# The request-major layout is the one that gets big: its reservation is
+# `max_num_reqs * max_blocks_per_req` block-rows because the row stride is the
+# engine's block-table width. Measured on Qwen3-8B slots (block_size 16, Hk 8,
+# k 3-bit -> 48 B, v 4-bit -> 64 B per (token, head)):
+#
+#   4k  (ctx 4160): 4.33M token rows -> K 1.66 GB, V 2.22 GB -> clean
+#   8k  (ctx 8256): 8.52M token rows -> K 3.27 GB, V 4.36 GB
+#   16k (ctx 16448): 16.9M token rows -> K 6.49 GB, V 8.65 GB -> faults
+#
+# The dense (CSR) gather reserves by the PHYSICAL block count instead, which is
+# bounded by the cache: at 16k that is 1.71 / 2.28 GB and it runs (`THUNDER_8B_INDIRECT=1`
+# completes init and generation). So the boundary lies between 2.22 GB (clean)
+# and 6.49 GB (faulting) and this cap sits inside that gap: 4k and the loop's
+# batch-scaled shapes stay on request-major, 8k/16k switch.
+ADDRESSABLE_GATHER_BYTES = 4 << 30
+
+
+def gathered_tensor_bytes(rows: int, layout: ThunderCacheLayout,
+                          num_kv_heads: int) -> int:
+    """Bytes of the largest tensor the kernel addresses for ``rows`` block-rows.
+
+    The kernel sees K as ``(rows * block_size, Hk, k_packed_bytes)`` uint8, so
+    the unit is the (token, kv-head) row: bytes == elements for uint8, and V's
+    wider packing is what makes it the larger of the two.
+    """
+    per_token = int(layout.block_size) * int(num_kv_heads)
+    return per_token * max(int(layout.k_packed_bytes), int(layout.v_packed_bytes)) * int(rows)
+
+
+def check_addressable(rows: int, layout: ThunderCacheLayout, num_kv_heads: int,
+                      where: str) -> int:
+    """Refuse a reservation whose K/V tensor CuTeDSL cannot address.
+
+    A loud failure here is the whole point: the alternative is an illegal address
+    (or silent corruption) thousands of kernel launches later, with nothing in
+    the traceback pointing at the reservation.
+
+    ``THUNDER_ALLOW_UNADDRESSABLE=1`` skips the check, the same way
+    ``THUNDER_8B_INDIRECT`` bypasses the path policy: it is how the 32-bit wrap
+    itself is reproduced on demand.
+    """
+    nbytes = gathered_tensor_bytes(rows, layout, num_kv_heads)
+    if env_flag("THUNDER_ALLOW_UNADDRESSABLE"):
+        return nbytes
+    if nbytes > ADDRESSABLE_GATHER_BYTES:
+        raise RuntimeError(
+            f"{where}: the gathered K/V tensor for {int(rows)} block-rows would be "
+            f"{nbytes / 2**30:.2f} GiB, past the {ADDRESSABLE_GATHER_BYTES / 2**30:.0f} GiB "
+            f"a 32-bit CuTeDSL tensor index can address (docs/FAILURE_MODES.md 15). "
+            f"Use the dense gather (THUNDER_8B_INDIRECT=1 / a smaller batch "
+            f"reservation): it reserves by physical blocks, not by the block-table width."
+        )
+    return nbytes
+
 # Narrow debug counters (branch): how often CSR metadata is rebuilt/uploaded.
 CSR_COUNTS = {
     "gather_calls": 0,      # CSR METADATA builds (indptr + page index): 1/step
@@ -143,6 +205,11 @@ class PagedKVManager:
             CSR_COUNTS["reserve_calls"] += 1
             if cap_rows is not None:
                 self._rows = min(self.max_page_rows, max(int(cap_rows), 1))
+            check_addressable(
+                self._rows if self._rows is not None else self.max_page_rows,
+                self.layout, self.layout.num_kv_heads,
+                "PagedKVManager.reserve",
+            )
             # CSR metadata scratch, sized to the FULL table so no step can exceed
             # it (dest indices use max_blocks_per_req); address-stable for capture.
             cap = self.max_num_reqs * self.max_blocks_per_req

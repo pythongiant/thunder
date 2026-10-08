@@ -161,52 +161,74 @@ makes the capture succeed, so the fault is in this backend and in the dense path
 - Detection: `cudaErrorStreamCaptureUnsupported` (not `...Invalidated`) raised at
   `profile_cudagraph_memory`, at 4k as well as 32k, i.e. it is the path and not the
   context length. Two identical runs fail identically, so it is not a race.
-- Mitigation: the path is chosen by reservation size with a 24 GiB budget, so 4k,
-  8k and 16k (15.5 GiB) stay on the capturable request-major path and only 32k
-  attempts the dense one. Long-context serving must run with `enforce_eager=True`
-  until the dense gather is capturable -- the eager path is correct (vLLM's own
-  warmup run completes at 32k). Do not "fix" this by lowering the budget: that
-  trades a working context length for a startup failure.
+- Mitigation: the path is chosen from the reservation -- the 24 GiB memory budget
+  and, since FAILURE_MODES 15, `ADDRESSABLE_GATHER_BYTES` (4 GiB), because the
+  request-major K/V tensor past that is not addressable by a 32-bit CuTeDSL
+  index. 4k (2.06 GiB) keeps the capturable request-major path; 8k, 16k and 32k
+  take the dense one, so those contexts serve with `enforce_eager=True` until the
+  dense gather is capturable. The eager path is correct (vLLM's own warmup run
+  completes at 32k, and 16k's init + generation complete on the dense path). Do
+  not "fix" this by lowering the budget: that trades a working context length for
+  a startup failure.
 
-## 15. An illegal address at a many-request prefill — OPEN
+## 15. A gathered buffer past 32-bit addressing — LIVED (fixed)
 
-At ctx 16384 the plugin faults with `cudaErrorIllegalAddress`, in eager and in graph
-mode, reproducibly (3 of 3 engine runs). The error surfaces at the first
-synchronising op *after* the prefill (`torch.equal` inside `HadamardRotation.__init__`,
-reached from `do_kv_cache_update`), which is why the traceback points at the
-quantizer instead of at the fault.
-
-What the engine actually launches there, from `THUNDER_DEBUG_LAUNCH=1`:
+The ctx-16384 fault was never a served prefill and never an index bug: it is
+vLLM's own warm-up. `kernel_warmup` -> `_run_flashinfer_autotune_dummy_runs` ->
+`runner._dummy_run` launches a prefill-shaped step (1024 requests of 16 query
+rows, `seq_lens` 16 for every request, `max_query_len` 16), and the illegal
+address is taken in *that* launch. The engine's geometry, from
+`THUNDER_DEBUG_LAUNCH` plus a metadata dump wrapped around `forward`:
 
 ```
-q=(16384, 32, 128) fp16   n=16384
-kv=(243585, 8, 16, 128)   bt=(1024, 1032)   sl=(1024,)   qsl=(1025,)
-num_reqs=1024   max_blocks_per_req=1032   is_prefill=True   max_query_len=16
+q=(16384, 32, 128) fp16   num_reqs=1024   max_query_len=16   is_prefill=True
+kv=(278383, 8, 16, 128)   bt=(1024, 1032)   sl=(1024,) all 16   qsl=(1025,)
 ```
 
-So vLLM chunks the 16k prompt into **1024 requests of 16 query rows each** -- a
-multi-request prefill. Nothing in the loop covered that: the only prefill shape was
-batch 1 at 4k, and the 4k path is fine.
+`bt` is 1032 columns wide (`ceil(16448/16)` rounded up to a multiple of 8), so
+the request-major gather reserves `max_num_reqs * max_blocks_per_req` =
+1024 x 1032 = 1,056,768 block-rows = 16.9M token rows. The K tensor the kernel
+is handed is therefore `(16908288, 8, 48)` uint8 = **6.49e9 elements** and V is
+8.65e9. CuTeDSL addresses those buffers with 32-bit offsets, so any request whose
+row offset passes 2**32 bytes is addressed modulo the wrap: the read lands back
+inside the same 6.5 GB buffer (silently wrong data) or outside it
+(`cudaErrorIllegalAddress`). That is why the same grid cell could pass in a sweep
+and fail alone, and why the engine's *decode* dummy steps at 16k never failed
+first: they address few requests, so their row offsets stay far below the wrap.
 
-- `THUNDER_SKIP_BACKEND=1` runs (17.3 tok/s) and `THUNDER_SKIP_KERNEL=1` runs
-  (9.3 tok/s), so the fault is in the **kernel launch**, not the gather or the
-  metadata.
-- The grid reproduces it with the engine's geometry: a new `prefill-b1024-16k`
-  shape (batch 1024, seqlen_q 16, seqlen_k 16384) faults with the same error --
-  **but not every time**: a four-cell batch sweep (2/64/256/1024) passed all four,
-  while the same cell alone failed twice. Treat a single grid cell at this geometry
-  as flaky, and prefer repeated runs before believing a pass.
-- Tile shape is not the trigger: n=16/32/64 and m=128/t=256 all fault alike in the
-  grid, and in the engine the pre-session prefill tile (`PREFILL_TILE` n=64) fails
-  identically. The prefill KV-tile change this session is therefore not the cause --
-  this is a pre-existing bug in the many-request prefill path, not a regression.
-  (The `THUNDER_M_BLOCK`/`THUNDER_N_BLOCK`/`THUNDER_NUM_THREADS` env knobs cannot be
-  used to bisect it: the kernel is built from the tile policy, not from those
-  config fields, so setting them changes nothing.)
+- Detection: the fault follows the **buffer size**, not the rows read.
+  `prefill-b1024-16k` (1024 requests, 16384-token contexts) has a correct 16384-row
+  `q` and faults, while the same schedule with a 1-request reservation
+  (`prefill-16k`, and every `batch=1` shape) never has — the reservation, not the
+  schedule, is what changes. Forcing the dense gather (`THUNDER_8B_INDIRECT=1`,
+  2.12 GiB reservation) makes the whole 16k init *and* generation pass, and the
+  driver's XID MMU faults all sit inside a 4 GiB window (0x2a84..0x2b67) — that
+  window is the wrap. `use_32bit_stride=False` on the dlpack conversion does
+  **not** remove it (tested), so the wrap is not the dynamic-stride bitwidth: the
+  only fix is to keep the tensor addressable.
+- Mitigation: `ADDRESSABLE_GATHER_BYTES` (4 GiB) is now a second reason to take
+  the dense gather (`_use_indirect_gather`), and `PagedKVManager.reserve` refuses
+  an unaddressable reservation outright, naming the geometry, so the failure
+  cannot come back as an illegal address thousands of launches later.
+  `THUNDER_ALLOW_UNADDRESSABLE=1` reproduces the wrap on demand, the way
+  `THUNDER_8B_INDIRECT` reproduces the OOM.
+- Measured bracket for the 4 GiB constant: 4k's request-major tensors are
+  2.06 GiB (V) and run; 16k's are 8.06 GiB and fault; the dense reservation at
+  16k is 2.12 GiB and runs. 8k (4.06 GiB) switches to dense as well.
 
-- Next: bisect inside the kernel for the many-request prefill (the row base
-  `req * kv_row_stride` with `num_reqs` = 1024 and a 16-row query block is the prime
-  suspect, e.g. an index or a grid bound that assumes one query row per request).
+## 15b. A warm-up compile that never ran — LIVED (fixed)
+
+`launch_thunder_attention(compile_only=True)` — the path that precompiles every
+schedule the tile policy can produce, so no CuTeDSL compile (~1.5 s) lands inside
+a request — passed the wrong argument list: it omitted `debug` and every schedule
+constexpr, so the trailing `CUstream` landed on `num_splits` and the call raised
+`ARG_ANNOTATION_MISMATCH` every single time. The exception is caught and logged
+as "kernel warmup failed (non-fatal)", so the only symptom was the compile still
+happening inside the first request — which is the TTFT number in 18.
+
+- Detection: any run with `THUNDER_STAGE_TIMING` shows a first-call launch of
+  ~1.5 s against ~0.15 ms steady state; the traceback names `num_splits`.
+- Mitigation: the compile call now passes exactly `_all_args`.
 
 ## 16. Host timing buckets that average over capture — LIVED
 

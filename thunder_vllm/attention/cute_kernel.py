@@ -1560,10 +1560,31 @@ def launch_thunder_attention(
         # geometry, so the first real prefill otherwise pays the compile inside the
         # request -- measured at 1501 ms host for the first call against 6.6 ms
         # steady state. Shapes do not matter to the compile; the constexprs do.
+        #
+        # The argument list is ``_all_args`` EXACTLY: it was missing ``debug`` and
+        # every schedule constexpr (split_mode/gqa_mode/onepass/reg_rescale/
+        # causal_bound/indirect), so the trailing stream landed on ``num_splits``
+        # and the call raised ARG_ANNOTATION_MISMATCH every time -- the precompile
+        # never happened and the compile stayed inside the first request, which is
+        # the whole thing this path exists to prevent.
         import cutlass.cute as _cute
 
-        _cute.compile(kernel.__call__, *args, softmax_scale, kv_row_stride,
-                      max_query_len, S, cuda.CUstream(stream))
+        _cute.compile(
+            kernel.__call__,
+            *args,
+            softmax_scale,
+            kv_row_stride,
+            int(debug),
+            max_query_len,
+            S,
+            int(split_mode),
+            int(gqa_mode),
+            int(1 if onepass else 0),
+            int(1 if reg_rescale else 0),
+            int(1 if causal_bound else 0),
+            int(1 if indirect else 0),
+            cuda.CUstream(stream),
+        )
         return
 
     _COUNTS["launch_indirect" if indirect else "launch_reqmajor"] += 1
