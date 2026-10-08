@@ -270,20 +270,23 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   invisible otherwise. Verify on the GPU with
   `THUNDER_WARM_CAPACITY=1 --e2e "4096|ours|3|4"`; if the capture then succeeds,
   the same launch belongs in the engine's warm-up path (not behind a flag).
-- **The store's engine-level divergence: parity coverage added, verdict pending.**
-  The pre-existing parity case covered only the torch
-  reference at 4-bit K, which takes the OTHER kernel, so the path the engine
-  actually shipped had no coverage, so
-  `test_triton_scatter_matches_reference_at_the_engine_geometry` now covers the
-  Triton scatter at the engine's contract (3-bit K, Hk=8, bs=16, PAD_SLOT_ID).
-  NOTE: its first two GPU runs "failed" on a TEST bug -- the quantizer was built
-  without `device=`, so its rotation matrix stayed on the CPU and `rotate` raised
-  before any comparison. That is not evidence about the scatter, and the earlier
-  e2e "evidence" was not either (that config is `ours`, which captures).
-  `--e2e "4096|ours-eager|3|4"` serves correctly (ITL 336.5 ms, matching the
-  post-FM19 notes), so the EAGER path is fine; the verdict on the Triton scatter
-  is the parity case above. The capture path still needs a sync-free store, and
-  the capture path does not work yet either.
+- **The store is bit-exact; the capture-phase fault is still open.** The
+  pre-existing parity case covered only the torch reference at 4-bit K, which
+  takes the OTHER kernel, so the path the engine actually ships (3-bit K ->
+  torch quantizer + `_scatter_codes`) had no coverage. Added:
+  `tests/test_cache_layout.py::test_triton_scatter_matches_reference_at_the_engine_geometry`
+  (3-bit K, Hk=8, bs=16, PAD_SLOT_ID) -- **it passes, maxdiff 0 on k_codes,
+  v_codes, k_norm and v_norm**. The Triton scatter stays the default.
+  Two false alarms are worth remembering, because both looked like product bugs
+  and were not: the parity case's first two GPU runs failed because the TEST built
+  its quantizer without `device=`, so the rotation matrix stayed on the CPU and
+  `rotate` raised before any comparison; and an `--mode e2e` run "with the Triton
+  store" is not evidence either way, because that config (`ours`) captures, and
+  the capture path is broken independently. The eager control
+  (`--e2e "4096|ours-eager|3|4"`) serves correctly: ITL 336.5 ms, matching the
+  post-FM19 notes, so the eager store path is sound.
+  What is left is the IMA *after* both captures, in the KV-cache-init phase, and
+  it is the capture context -- not the store's bytes -- that needs explaining.
 - **Final measured state (this session).** With `THUNDER_WARM_CAPACITY=1` BOTH
   captures now complete -- `PIECEWISE 1/1` in 13.5 s and, for the first time,
   `FULL 1/1` in 50.5 s (they previously hung or died in `capture_model`). The warm

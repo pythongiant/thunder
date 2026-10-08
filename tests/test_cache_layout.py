@@ -131,10 +131,9 @@ def test_cache_write_scatter_matches_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton scatter needs CUDA")
 def test_triton_scatter_matches_reference_at_the_engine_geometry(monkeypatch):
-    # The Triton scatter is opt-in (it does not pass this test), so the path under
-    # test has to be requested explicitly -- otherwise `reshape_and_cache` takes
-    # the reference and the comparison is against itself.
-    monkeypatch.setenv("THUNDER_STORE_TRITON", "1")
+    # `reshape_and_cache` must take the Triton path here, not the reference, or the
+    # comparison is against itself. It is the default; this pins that.
+    monkeypatch.delenv("THUNDER_STORE_TORCH", raising=False)
     """The Triton scatter at the contract the ENGINE actually uses.
 
     `test_cache_write_scatter_matches_reference` covers the torch reference at

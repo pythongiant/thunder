@@ -343,11 +343,11 @@ if _HAS_TRITON:
         (the KV-update hook is part of the layer's forward). PAD_SLOT_ID is skipped
         in-kernel, the way vLLM's own cache kernels do it.
 
-        OPT-IN (`THUNDER_STORE_TRITON=1`) until it passes parity: it does NOT
-        reproduce the reference at the engine's contract (see the module docstring
-        and `test_triton_scatter_matches_reference_at_the_engine_geometry`), and an
-        eager engine run with it as the default fails to initialize. The capture
-        path is what needs it, and the capture path does not work yet either.
+        This is the default store. It is bit-exact against the reference at the
+        engine's contract -- maxdiff 0 on k_codes/v_codes/k_norm/v_norm with
+        PAD_SLOT_ID, pinned by
+        `test_triton_scatter_matches_reference_at_the_engine_geometry` -- and it is
+        the only sync-free one, which the capture path needs.
         """
         row = tl.program_id(0)
         slot = tl.load(slot_ptr + row)
@@ -625,16 +625,16 @@ if _HAS_TRITON:
             # and this store runs inside vLLM's CUDA-graph capture, where a sync
             # is fatal (cudaErrorStreamCaptureUnsupported -> StreamCaptureInvalidated).
             n = key.shape[0]
-            # The Triton scatter is OPT-IN (`THUNDER_STORE_TRITON=1`) and must stay
-            # that way until it passes parity. It is the only sync-free store, so
-            # the capture path needs it, but it does NOT match the reference at the
-            # engine's contract -- measured, deterministically, by
-            # `tests/test_cache_layout.py::test_triton_scatter_matches_reference_at_the_engine_geometry`
-            # (3-bit K, Hk=8, bs=16, PAD_SLOT_ID), and an eager engine run with it
-            # as the default fails to initialize. The torch reference below is the
-            # shipped path: it syncs (fatal inside a capture), and it is correct.
+            # THUNDER_STORE_TORCH=1 forces the pure-torch scatter. It is the A/B
+            # switch for the CUDA-graph capture question: the torch scatter syncs,
+            # the Triton one does not, and a capture cannot afford either a sync or
+            # a first-launch module load inside the captured region.
+            # The Triton path is the DEFAULT and is bit-exact against the reference
+            # at the engine's own contract (3-bit K, Hk=8, bs=16, PAD_SLOT_ID):
+            # measured maxdiff 0 on k_codes, v_codes, k_norm and v_norm, pinned by
+            # `tests/test_cache_layout.py::test_triton_scatter_matches_reference_at_the_engine_geometry`.
             if (_HAS_TRITON and slot_mapping.is_cuda and n > 0
-                    and env_flag("THUNDER_STORE_TRITON")):
+                    and not env_flag("THUNDER_STORE_TORCH")):
                 kv = quantizer.quantize(key, value)
                 # The kernel addresses the quantizer's tensors flat, which holds
                 # for everything `quantize` returns (all fresh, contiguous). A
