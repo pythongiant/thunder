@@ -48,13 +48,17 @@ reconstruction did not.
   the narrower grid (-60% more at batch 1, 0.537 → 0.215 ms).
 - Prefill packs too: the M axis carries the group's heads over
   `tile_m // qhead_per_kvhead` query tokens, so one CTA reconstructs each
-  shared KV tile. Measured at the batch-1 4k prefill: 4.77 → 4.45 ms (-7%;
-  a repeat pair measured 4.75 → 4.66, so 2-7%), much smaller than the
-  decode win, and structurally so -- the packed q-block is only
+  shared KV tile. At the **served** 4k prefill (batch 1, 4096 query rows,
+  `THUNDER_DEBUG_LAUNCH` on the 4k e2e) that is 4.77 → 4.45 ms (a repeat pair
+  measured 4.75 → 4.66): modest, because the packed q-block is only
   `tile_m // G` tokens wide, so the causal bound trims less per CTA and the
-  triangular total is nearly unchanged (measured: a 32-row tile, i.e. an
-  8-token block, is 7.17 ms, and a 32-wide KV tile 5.14 ms). More would
-  need a wider M tile, which SMEM bounds.
+  triangular dequant total barely moves (measured: a 32-row tile, i.e. an
+  8-token block, is 7.17 ms there, and a 32-wide KV tile 5.14 ms). At vLLM's
+  cudagraph *profiling* batch (256 requests x 16 rows, not a served prefill)
+  the same packing is worth -33.6% (23.87 → 15.84 ms), because the causal
+  bound barely trims there and the removed redundancy is the whole win. A
+  wider M tile is what would recover the rest at the served shape, and SMEM
+  bounds it.
 - The "8 KV-head CTAs trade redundancy for head-axis parallelism" caveat
   was real and is handled by the split policy, not by the packing shape:
   the grid lost 4× of its head-axis CTAs, so the split count had to

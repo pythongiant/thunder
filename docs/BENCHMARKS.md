@@ -20,12 +20,23 @@ configuration. Current medians:
 | decode 32k, batch 16 | 2.73 ms | — |
 | decode 32k, batch 1 | 0.215 ms | 5.60 ms |
 | prefill 4k | 4.45 ms (4.77 with GQA packing off) | 15.08 ms |
+| prefill 4k, 256 reqs x 16 rows (cudagraph profiling batch) | 15.84 ms (23.87 with GQA packing off) | — |
 
-The prefill cell is `prefill|policy|1|64|128|16`: the packed schedule now covers
-prefill too, so the shipped configuration is the one that packs. Measured
-tiles for it: 64x128x16 4.45 ms, 64x128x32 5.20 ms, 32x64x16 7.17 ms (a
-narrower M tile shrinks the packed q-block, which costs the causal bound more
-than the packing saves).
+Both prefill cells are `prefill|policy|1|...`: the packed schedule now covers
+prefill too, so the shipped configuration is the one that packs.
+
+The **served** 4k prefill is the batch-1 4096-row shape (`THUNDER_DEBUG_LAUNCH`
+on the 4k e2e: q=(4096, 32, 128), num_reqs=1, max_query_len=4096, one request).
+Packing is worth 4.77 → 4.45 ms there (a repeat pair measured 4.75 → 4.66):
+the packed q-block is only `tile_m // qhead_per_kvhead` tokens wide, so the
+causal bound trims less per CTA and the triangular dequant total barely moves.
+Measured tiles: 64x128x16 4.45 ms, 64x128x32 5.14 ms, 32x64x16 7.17 ms.
+
+The 256x16-row cell is vLLM's cudagraph *profiling* batch, not a served
+prefill (that geometry is also where the 16k illegal-address fault lives). It
+is reported because it is the other half of the attribution: with only 16 query
+rows per request the causal bound barely trims, so the removed 4x redundancy is
+the whole win and packing is worth -33.6% there.
 
 ## What the B200 e2e numbers mean
 

@@ -30,10 +30,13 @@ changes, which is why the batch-1 choice reversed -- see ``splits.py``.
 
 The prefill column is also with packing on (``GQA`` prefill packs the group's
 heads over ``tile_m // qhead_per_kvhead`` tokens, see ``cute_kernel.py``), and
-the prefill tile did not have to move for it: 4k measures 4.45 ms at 64x128x16
-against 5.14 ms at 64x128x32 and 7.17 ms at 32x64x16. A narrower M tile shrinks
-the packed q-block, and the causal bound then trims less per CTA, which costs
-more than the extra KV reuse buys.
+the prefill tile did not have to move for it. At the served 4k prefill (batch 1,
+4096 query rows) it measures 4.45 ms at 64x128x16 against 5.14 ms at 64x128x32
+and 7.17 ms at 32x64x16: a narrower M tile shrinks the packed q-block, and the
+causal bound then trims less per CTA, which costs more than the extra KV reuse
+buys. At vLLM's cudagraph profiling batch (256 requests x 16 rows, 32x64x16 --
+not a served prefill) packing is worth -33.6% (23.87 -> 15.84 ms), because the
+causal bound barely trims there and the removed redundancy is the whole win.
 """
 
 from __future__ import annotations
