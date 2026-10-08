@@ -375,6 +375,11 @@ only instrument pointed at the host path.
   engine). The forward's `prefix` bucket -- the phase that contains that store --
   read **p50 6.906 ms per layer** against gather 0.125 / qrot 0.075 / launch 0.253
   / inverse 0.035. A phase that is 93% of a 7.4 ms forward is not a launch cost.
+- Related (this session): the store's SCATTER is now a Triton kernel
+  (`_scatter_codes_kernel`) because the torch one decided `PAD_SLOT_ID` on the
+  host and this store runs inside vLLM's CUDA-graph capture (see 14). Bit-exact
+  against the torch reference in all four probe cases; the torch quantizer is
+  untouched.
 - Mitigation: set the flag unconditionally on every positional holder, and CONSUME
   it in `forward` (`layer._tq_cache_updated = False` after the check) so a step
   whose hook does not run -- a KV-sharing layer with `key is None` -- still stores

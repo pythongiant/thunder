@@ -617,7 +617,12 @@ if _HAS_TRITON:
             # and this store runs inside vLLM's CUDA-graph capture, where a sync
             # is fatal (cudaErrorStreamCaptureUnsupported -> StreamCaptureInvalidated).
             n = key.shape[0]
-            if _HAS_TRITON and slot_mapping.is_cuda and n > 0:
+            # THUNDER_STORE_TORCH=1 forces the pure-torch scatter. It is the A/B
+            # switch for the CUDA-graph capture question: the torch scatter syncs,
+            # the Triton one does not, and a capture cannot afford either a sync or
+            # a first-launch module load inside the captured region.
+            if (_HAS_TRITON and slot_mapping.is_cuda and n > 0
+                    and not env_flag("THUNDER_STORE_TORCH")):
                 kv = quantizer.quantize(key, value)
                 # The kernel addresses the quantizer's tensors flat, which holds
                 # for everything `quantize` returns (all fresh, contiguous). A

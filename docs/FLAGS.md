@@ -44,6 +44,9 @@ Runtime flags change behavior. Diagnostic flags are for measurement/debug only a
 - `THUNDER_SKIP_BACKEND=1`, `THUNDER_SKIP_GATHER=1`, `THUNDER_SKIP_KERNEL=1`, `THUNDER_SKIP_ROT=1`: ablation switches; outputs may be wrong.
 - `THUNDER_ALLOW_UNADDRESSABLE=1`: skip the gathered-buffer addressability check so
   the 32-bit wrap (`FAILURE_MODES.md` 15) can be reproduced; results are garbage.
+- `THUNDER_STORE_TORCH=1`: force the pure-torch KV scatter instead of the Triton one
+  (bit-identical, but it syncs on `slot_mapping`). A/B switch for the CUDA-graph
+  capture question, `FAILURE_MODES.md` 14.
 
 ## Telemetry
 
