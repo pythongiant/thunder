@@ -161,7 +161,32 @@ makes the capture succeed, so the fault is in this backend and in the dense path
 - Detection: `cudaErrorStreamCaptureUnsupported` (not `...Invalidated`) raised at
   `profile_cudagraph_memory`, at 4k as well as 32k, i.e. it is the path and not the
   context length. Two identical runs fail identically, so it is not a race.
-- **Root cause candidate (this session): the store's host syncs.**
+- **ROOT CAUSE (measured live, this session): we could not tell we were being
+  captured.** `torch.cuda.is_current_stream_capturing()` returns **False** during
+  vLLM's capture — vLLM captures on a side stream, and our forward does not run on
+  it. Caught with `ci_probe/probe_capture_watch.py`, which starts the engine itself
+  and prints its log live (the e2e worker buffers it, so a hang shows nothing):
+  every `[TQ-PATH]` line printed `capturing=0` while vLLM's progress bar read
+  `Capturing CUDA graphs (FULL)`. So every capture-safe branch in this backend was
+  dead code, and the capture ran the EAGER paths: `_scales_for` re-derived (and
+  re-allocated) the norms buffer for vLLM's 1-block profiling cache *inside* the
+  captured region, `_decode_split_count` could fall back to a host read, and the
+  dense-gather refusal never fired. The same run shows PIECEWISE capturing fine
+  (1/1) and FULL dying — and it dies with a real `cudaErrorIllegalAddress`, an
+  out-of-bounds read, not a capture-API error, which is what the store's syncs had
+  been masking. Fixed by an in-band signal: `build_for_cudagraph_capture` marks the
+  metadata (`is_capture`), and every capture-sensitive branch keys on
+  `_in_capture(attn_metadata)` instead of the stream query.
+  Corrections to what this file claimed earlier: the captured launch DOES split
+  (`_decode_split_count` uses vLLM's CPU seq-len mirror when it is present, so it is
+  not 1 during capture — measured S=16 at the 4k geometry), so the Triton merge IS
+  inside the captured region and the `THUNDER_SPLITS=1` row above is a different
+  configuration, not a control; and with `cudagraph_num_of_warmups = 0` (vLLM's
+  default) the capture is the FIRST execution of its geometry, so both the compile
+  and the split-partial allocation happen inside it. The warm-up now aims at exactly
+  that geometry (an ALL-ZERO metadata at each configured capture size, every split
+  count the policy can pick) instead of the engine capacity.
+- **Superseded hypothesis: the store's host syncs.**
   `reshape_and_cache_ref` -- the path 3-bit K uses, i.e. the engine's default --
   decides PAD_SLOT_ID ON THE HOST (`if not bool(keep.any())`, plus the `t[mask]`
   gathers next to it: two D2H syncs), and the store runs INSIDE the captured

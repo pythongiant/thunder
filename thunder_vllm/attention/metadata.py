@@ -213,6 +213,10 @@ class ThunderMetadataBuilder(AttentionMetadataBuilder[ThunderMetadata]):
             use_cuda_graph=False,
             query_start_loc_cpu=getattr(cam, "query_start_loc_cpu", None),
             seq_lens_cpu=getattr(cam, "seq_lens_cpu_upper_bound", None),
+            # Carried on EVERY metadata, not just the capture one: the warm-up runs
+            # on an eager step (the first forward) and needs to know which
+            # geometries vLLM is about to capture.
+            capture_sizes=tuple(self._capture_sizes),
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata: Any) -> ThunderMetadata:
