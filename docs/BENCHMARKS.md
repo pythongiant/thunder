@@ -19,7 +19,13 @@ configuration. Current medians:
 | decode 4k, batch 16 | 0.353 ms | — |
 | decode 32k, batch 16 | 2.73 ms | — |
 | decode 32k, batch 1 | 0.215 ms | 5.60 ms |
-| prefill 4k | 4.66 ms | 15.08 ms |
+| prefill 4k | 4.45 ms (4.77 with GQA packing off) | 15.08 ms |
+
+The prefill cell is `prefill|policy|1|64|128|16`: the packed schedule now covers
+prefill too, so the shipped configuration is the one that packs. Measured
+tiles for it: 64x128x16 4.45 ms, 64x128x32 5.20 ms, 32x64x16 7.17 ms (a
+narrower M tile shrinks the packed q-block, which costs the causal bound more
+than the packing saves).
 
 ## What the B200 e2e numbers mean
 

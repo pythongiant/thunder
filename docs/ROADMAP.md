@@ -46,6 +46,15 @@ reconstruction did not.
   at the tile current then. The prediction held: the win is the KV
   load/unpack fraction, not 4×, and it grew once split-K was retuned for
   the narrower grid (-60% more at batch 1, 0.537 → 0.215 ms).
+- Prefill packs too: the M axis carries the group's heads over
+  `tile_m // qhead_per_kvhead` query tokens, so one CTA reconstructs each
+  shared KV tile. Measured at the batch-1 4k prefill: 4.77 → 4.45 ms (-7%;
+  a repeat pair measured 4.75 → 4.66, so 2-7%), much smaller than the
+  decode win, and structurally so -- the packed q-block is only
+  `tile_m // G` tokens wide, so the causal bound trims less per CTA and the
+  triangular total is nearly unchanged (measured: a 32-row tile, i.e. an
+  8-token block, is 7.17 ms, and a 32-wide KV tile 5.14 ms). More would
+  need a wider M tile, which SMEM bounds.
 - The "8 KV-head CTAs trade redundancy for head-axis parallelism" caveat
   was real and is handled by the split policy, not by the packing shape:
   the grid lost 4× of its head-axis CTAs, so the split count had to

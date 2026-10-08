@@ -175,6 +175,11 @@ class ThunderAttentionForward:
 
     ``num_threads`` is a multiple of 32 and ``m_block_size == tile_m`` must be
     ``(num_threads // 32) * 16`` so the QK MMA atom layout tiles ``M`` exactly.
+
+    Under ``gqa_pack`` the M axis is not query rows but ``(head, token)`` pairs
+    of a GQA group: row ``r`` is head ``r // gqa_rows_per_head`` and token
+    ``r % gqa_rows_per_head`` of the q-block. Only one grid axis then covers KV
+    heads, and each CTA reconstructs the KV tile it shares exactly once.
     """
 
     def __init__(
@@ -183,6 +188,7 @@ class ThunderAttentionForward:
         K_BITS: cutlass.Constexpr[int],
         V_BITS: cutlass.Constexpr[int],
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+        gqa_rows_per_head: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         m_block_size: int = 64,
         n_block_size: int = 64,
@@ -202,6 +208,12 @@ class ThunderAttentionForward:
         self.k_packed_bytes = (head_dim * K_BITS + 7) // 8
         self.v_packed_bytes = (head_dim * V_BITS + 7) // 8
         self.qhead_per_kvhead = int(qhead_per_kvhead)
+        # GQA packing: how many query tokens each M row's head carries. 1 is the
+        # decode layout (one token per CTA, the group's heads stacked on M);
+        # ``tile_m // qhead_per_kvhead`` is the prefill layout (a whole group's
+        # heads over ``rows_per_head`` tokens of one q-block), so a CTA
+        # reconstructs each KV tile once for every head that shares it.
+        self.gqa_rows_per_head = max(1, int(gqa_rows_per_head))
         self.is_causal = bool(is_causal)
         self.num_threads = int(num_threads)
         self.num_warps = self.num_threads // 32
@@ -336,7 +348,15 @@ class ThunderAttentionForward:
         # probe because total_q <= tile_m so there was only ever block 0.
         # ``max_query_len`` is resolved on the host (a runtime branch cannot set
         # a variable visible after the staged ``if`` in CuTeDSL).
-        num_q_blocks = cute.ceil_div(max_query_len, self.tile_m)
+        #
+        # A packed CTA covers ``gqa_rows_per_head`` query tokens on its M axis
+        # (the rest of M is the group's heads), so the token-axis block is that
+        # many rows, not the full tile. It is 1 for the decode layout, which
+        # leaves the grid identical to the unpacked decode one.
+        num_q_blocks = cute.ceil_div(
+            max_query_len,
+            self.gqa_rows_per_head if gqa_pack else self.tile_m,
+        )
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         SharedStorage = self._get_shared_storage_cls()
@@ -498,22 +518,33 @@ class ThunderAttentionForward:
         _copy_lut_to_smem(mVLut, sVLut, tidx, self.V_BITS, self.tile_hdim, self.num_threads)
 
         # ---- Q tile ----------------------------------------------------
+        # With ``gqa_pack`` the M axis packs a whole GQA group: M row
+        # ``r = head_off * rows_per_head + token``. Decode (rows_per_head == 1)
+        # stacks the group's heads over the single query token; prefill carries
+        # ``rows_per_head`` tokens of each head of the group, so the same CTA
+        # scores every head that shares the KV tile it just reconstructed.
         mQh = mQ[None, None, q_head]
         mOh = mO[None, None, q_head]
         q_total: cutlass.Constexpr[int] = self.tile_m * self.tile_hdim
         q_iters: cutlass.Constexpr[int] = (q_total + self.num_threads - 1) // self.num_threads
+        # Token offset of this CTA's q-block inside the request. Non-packed it is
+        # a full M tile of tokens; packed it is the ``rows_per_head``-token strip
+        # that M spans.
+        q_off = q_block * (self.gqa_rows_per_head if gqa_pack else self.tile_m)
         if const_expr(gqa_pack):
-            # Decode: one query token, qhead_per_kvhead heads sharing this KV
-            # head. M row r is (token = q_start + q_block*tile_m, head =
-            # kv_head*G + r); rows >= G are padding.
-            token_q = q_start + q_block * self.tile_m
             for e in cutlass.range_constexpr(q_iters):
                 idx = tidx + e * self.num_threads
                 if idx < q_total:
                     row = idx // self.tile_hdim
                     col = idx % self.tile_hdim
-                    if row < self.qhead_per_kvhead:
-                        sQ[row, col] = mQ[token_q, col, kv_head * self.qhead_per_kvhead + row]
+                    head_off = row // self.gqa_rows_per_head
+                    tok = row % self.gqa_rows_per_head
+                    if (head_off < self.qhead_per_kvhead
+                            and q_off + tok < q_len):
+                        sQ[row, col] = mQ[
+                            q_start + q_off + tok, col,
+                            kv_head * self.qhead_per_kvhead + head_off,
+                        ]
                     else:
                         sQ[row, col] = cutlass.Float16(0.0)
         else:
@@ -580,16 +611,21 @@ class ThunderAttentionForward:
         cute.arch.barrier()
 
         n_tiles = cute.ceil_div(kv_len, self.tile_n)
-        q_off = q_block * self.tile_m
-        # Query validity / causal use these. gqa_pack: every M row is the SAME
-        # query token at a different head, so the row validity test is "row < G"
-        # and causal must not advance with the row (decode is not causal anyway;
-        # gqa_pack is only enabled for decode).
+        # Query validity / causal. Non-packed, the M row IS the query position
+        # inside the block. Packed decode (rows_per_head == 1) has one query
+        # token per CTA, so the "row" the mask sees is the head index and the
+        # live range is the group width -- causal must not advance with it (and
+        # a decode step is not causal anyway). Packed prefill keeps the query
+        # position: it is the row's token within the block.
         q_off_v = q_off
         q_len_v = q_len
+        q_row = tidx
         if const_expr(gqa_pack):
-            q_off_v = Int32(0)
-            q_len_v = Int32(self.qhead_per_kvhead)
+            if const_expr(self.gqa_rows_per_head == 1):
+                q_off_v = Int32(0)
+                q_len_v = Int32(self.qhead_per_kvhead)
+            else:
+                q_row = tidx % self.gqa_rows_per_head
         q_row_base = q_start + q_off_v
 
         # Causal bound: a q-block only attends KV at or below its highest query
@@ -598,9 +634,16 @@ class ThunderAttentionForward:
         n_eff = n_tiles
         if const_expr(causal_bound):
             if self.is_causal:
+                # The packed M axis spans ``rows_per_head`` tokens, not the
+                # whole tile: the highest query row is the last token of that
+                # strip, not row ``tile_m - 1``.
+                rows_in_block: cutlass.Constexpr[int] = self.tile_m
+                if const_expr(gqa_pack):
+                    if self.gqa_rows_per_head > 1:
+                        rows_in_block = self.gqa_rows_per_head
                 max_row = q_len - q_off_v - 1
-                if max_row > self.tile_m - 1:
-                    max_row = self.tile_m - 1
+                if max_row > rows_in_block - 1:
+                    max_row = rows_in_block - 1
                 max_kv = (kv_len - q_len) + q_off_v + max_row
                 n_eff = cute.ceil_div(max_kv + 1, self.tile_n)
                 if n_eff > n_tiles:
@@ -646,7 +689,7 @@ class ThunderAttentionForward:
                 for n in cutlass.range_constexpr(self.tile_n):
                     kv = nt * self.tile_n + n
                     val = sS[tidx, n] * Float32(sKNorm[n]) * softmax_scale
-                    if _valid(kv, tidx, kv_len, q_off_v, q_len_v, self.is_causal):
+                    if _valid(kv, q_row, kv_len, q_off_v, q_len_v, self.is_causal):
                         cur = cute.arch.fmax(cur, val)
                 sRowMax[tidx] = cute.arch.fmax(sRowMax[tidx], cur)
             cute.arch.barrier()
@@ -689,7 +732,7 @@ class ThunderAttentionForward:
                     cur = -Float32.inf
                     for n in cutlass.range_constexpr(self.tile_n):
                         kv = nt * self.tile_n + n
-                        if _valid(kv, tidx, kv_len, q_off_v, q_len_v, self.is_causal):
+                        if _valid(kv, q_row, kv_len, q_off_v, q_len_v, self.is_causal):
                             cur = cute.arch.fmax(
                                 cur, sS[tidx, n] * Float32(sKNorm[n]) * softmax_scale)
                     new_m = cute.arch.fmax(sRowMax[tidx], cur)
@@ -705,7 +748,7 @@ class ThunderAttentionForward:
                 for n in cutlass.range_constexpr(self.tile_n):
                     kv = nt * self.tile_n + n
                     p = Float32(0.0)
-                    if _valid(kv, tidx, kv_len, q_off_v, q_len_v, self.is_causal):
+                    if _valid(kv, q_row, kv_len, q_off_v, q_len_v, self.is_causal):
                         x = sS[tidx, n] * Float32(sKNorm[n]) * softmax_scale
                         p = cute.math.exp2((x - sRowMax[tidx]) * _LOG2E, fastmath=True)
                     sP[tidx, n] = (p * Float32(sVNorm[n])).to(cutlass.Float16)
@@ -751,10 +794,14 @@ class ThunderAttentionForward:
             sOf[cute.get(cO[e], 0), cute.get(cO[e], 1)] = acc_O[e].to(cutlass.Float16)
         cute.arch.barrier()
         if const_expr(gqa_pack):
-            # M row r is the query head kv_head*G + r; all rows share the same
-            # query token (q_row_base). Only G rows are live.
-            if tidx < self.qhead_per_kvhead:
-                head_t = kv_head * self.qhead_per_kvhead + tidx
+            # M row ``tidx = head_off * rows_per_head + token``; the head is
+            # ``kv_head * G + head_off`` and the query position is this CTA's
+            # token offset plus ``token``. Decode has rows_per_head == 1, so
+            # every live row is one head of the group at the single query token.
+            head_off = tidx // self.gqa_rows_per_head
+            tok = tidx % self.gqa_rows_per_head
+            if head_off < self.qhead_per_kvhead:
+                head_t = kv_head * self.qhead_per_kvhead + head_off
                 if const_expr(split_mode):
                     for c in cutlass.range_constexpr(self.tile_hdim):
                         mPartO[z, head_t, c] = sOf[tidx, c]
@@ -765,9 +812,11 @@ class ThunderAttentionForward:
                     if rs <= Float32(0.0):
                         rs = Float32(1.0)
                     mOh_t = mO[None, None, head_t]
-                    if q_row_base < q_start + q_len:
+                    if q_off_v + tok < q_len:
                         for c in cutlass.range_constexpr(self.tile_hdim):
-                            mOh_t[q_row_base, c] = (sOf[tidx, c] / rs).to(cutlass.Float16)
+                            mOh_t[q_start + q_off_v + tok, c] = (
+                                sOf[tidx, c] / rs
+                            ).to(cutlass.Float16)
         elif const_expr(split_mode):
             # Split-K: publish the UNNORMALISED partial state for this
             # (request, head, split) so the host merge can rescale by the global
@@ -1369,10 +1418,13 @@ def launch_thunder_attention(
     publishes unnormalised partial state, and ``_merge_splits`` reduces them.
     Only valid for single-query decode (``max_query_len == 1``).
 
-    ``gqa_pack`` selects the GQA-packed decode schedule: the grid's head axis
-    covers KV heads instead of query heads, so one CTA reconstructs each KV
-    tile once and scores every query head sharing it (plan steps 6+8). Also
-    decode-only (``max_query_len == 1``) and requires ``qhead_per_kvhead > 1``.
+    ``gqa_pack`` selects the GQA-packed schedule: the grid's head axis covers KV
+    heads instead of query heads, so one CTA reconstructs each KV tile once and
+    scores every query head sharing it. The M axis carries the group's heads,
+    over ``kernel.gqa_rows_per_head`` query tokens each (1 for decode, where the
+    CTA has a single query token; ``tile_m // qhead_per_kvhead`` for prefill).
+    Requires ``qhead_per_kvhead > 1``, and a multi-token step needs
+    ``gqa_rows_per_head > 1``.
     """
     import torch
 
@@ -1478,10 +1530,14 @@ def launch_thunder_attention(
             f"got {max_query_len}"
         )
     gqa_mode = 1 if (gqa_pack and int(kernel.qhead_per_kvhead) > 1) else 0
-    if gqa_mode and max_query_len > 1:
+    # A packed CTA's M axis carries ``gqa_rows_per_head`` query tokens (the rest
+    # is the group's heads), so a multi-token step needs more than one row per
+    # head -- otherwise every q-block would write the same query rows.
+    gqa_rows = max(1, int(getattr(kernel, "gqa_rows_per_head", 1)))
+    if gqa_mode and max_query_len > 1 and gqa_rows <= 1:
         raise ValueError(
-            "gqa_pack decode requires max_query_len == 1, "
-            f"got {max_query_len}"
+            "gqa_pack with max_query_len > 1 requires gqa_rows_per_head > 1, "
+            f"got rows_per_head={gqa_rows}, max_query_len={max_query_len}"
         )
     part_o_t, part_m_t, part_l_t = _split_buffers(
         num_reqs, S, hq, hd, q.device, q.dtype
@@ -1542,7 +1598,8 @@ def launch_thunder_attention(
         key = _fast_key(
             (
                 int(kernel.head_dim), int(kernel.K_BITS), int(kernel.V_BITS),
-                int(kernel.qhead_per_kvhead), bool(kernel.is_causal),
+                int(kernel.qhead_per_kvhead), int(kernel.gqa_rows_per_head),
+                bool(kernel.is_causal),
                 int(kernel.tile_m), int(kernel.tile_n), int(kernel.num_threads),
             ),
             tuple(tuple(t.shape) for t in _torch_args),

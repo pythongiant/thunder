@@ -27,6 +27,13 @@ a global config knob.
 The decode column is with GQA packing and split-K at the knee; the same decode
 tiles measured 1.229 ms (batch 1) and 12.153 ms (batch 16) before those two
 changes, which is why the batch-1 choice reversed -- see ``splits.py``.
+
+The prefill column is also with packing on (``GQA`` prefill packs the group's
+heads over ``tile_m // qhead_per_kvhead`` tokens, see ``cute_kernel.py``), and
+the prefill tile did not have to move for it: 4k measures 4.45 ms at 64x128x16
+against 5.14 ms at 64x128x32 and 7.17 ms at 32x64x16. A narrower M tile shrinks
+the packed q-block, and the causal bound then trims less per CTA, which costs
+more than the extra KV reuse buys.
 """
 
 from __future__ import annotations

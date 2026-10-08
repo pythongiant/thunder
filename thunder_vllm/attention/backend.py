@@ -219,13 +219,15 @@ class ThunderCuteConfig:
     onepass: bool = False
     reg_rescale: bool = False
     causal_bound: bool = False
-    # GQA-packed decode: one CTA per KV head scores the whole query group against
-    # each KV tile once, so the KV load and dequant happen once instead of once
-    # per query head. Decode-only and GQA-only. Default ON: at the current decode
-    # tile it measures 2.72 vs 11.62 ms at batch 16/32k (4.3x) and 0.536 vs 0.778
-    # at batch 1 (1.45x) -- the 4x redundant dequant it removes is the dominant
-    # cost now. It measured neutral at the old 64-row/64-wide tile, which is why
-    # it sat off. Set THUNDER_GQA_PACK=0 to opt out.
+    # GQA packing: one CTA per (q-block, KV head) scores the whole query group
+    # against each KV tile once, so the KV load and dequant happen once instead
+    # of once per query head. GQA-only. Default ON: at the current decode tile it
+    # measures 2.72 vs 11.62 ms at batch 16/32k (4.3x) and 0.536 vs 0.778 at
+    # batch 1 (1.45x) -- the 4x redundant dequant it removes is the dominant cost
+    # now. It measured neutral at the old 64-row/64-wide tile, which is why it sat
+    # off. Prefill packs too: the M axis carries the group's heads over
+    # ``tile_m // qhead_per_kvhead`` query tokens of the block. Set
+    # THUNDER_GQA_PACK=0 to opt out.
     gqa_pack: bool = True
 
     @classmethod
@@ -650,12 +652,22 @@ class ThunderAttentionImpl(AttentionImplBase):
                                   max_query_len)
         kernel = _KERNEL_CACHE.get(key)
         if kernel is None:
+            # GQA packing: the M axis carries the group's heads. Decode gives
+            # each head one M row over the request's single query token (1);
+            # a prefill-like step gives each head ``tile_m // G`` of the block's
+            # tokens, so the CTA reconstructs the shared KV tile once for all of
+            # them. Derived from the schedule, not from the step: the tile is in
+            # the cache key, so the two always agree.
+            gqa_rows_per_head = 1
+            if is_causal and self.num_kv_groups > 1:
+                gqa_rows_per_head = max(1, tile["m_block"] // self.num_kv_groups)
             mod = _kernel_module()
             kernel = mod.ThunderAttentionForward(
                 head_dim=head_dim,
                 K_BITS=self.cfg.k_bits,
                 V_BITS=self.cfg.v_bits,
                 qhead_per_kvhead=self.num_kv_groups,
+                gqa_rows_per_head=gqa_rows_per_head,
                 is_causal=is_causal,
                 m_block_size=tile["m_block"],
                 n_block_size=tile["n_block"],
@@ -962,17 +974,28 @@ class ThunderAttentionImpl(AttentionImplBase):
             _ev2.record()
         if _stage_t:
             _stage_t.append(__import__("time").perf_counter())
-        # GQA-packed decode: decode-only (max_query_len == 1), GQA-only, and
-        # eager-only until validated under capture. The launcher itself rejects
-        # max_query_len > 1 for this schedule.
+        # GQA-packed schedule: GQA-only, and no longer decode-only -- a prefill
+        # step packs the group's heads too, so one CTA per (q-block, KV head)
+        # dequantizes each shared KV tile once instead of once per query head.
+        # The decode arm is exactly the old condition (one query token per
+        # request); the prefill arm needs the M axis to hold more than one row
+        # per head, which is what the kernel was compiled with, and otherwise
+        # falls back to the baseline schedule.
         # No capture gate: it would silently hold captured decode -- the path
         # vLLM actually serves with -- on the slow schedule. (It was there because
         # gqa_pack was unvalidated; it is now the measured default.)
-        _use_gqa = (
-            bool(self.cfg.gqa_pack)
-            and int(getattr(attn_metadata, "max_query_len", 0) or 0) == 1
-            and self.num_kv_groups > 1
-        )
+        if is_causal:
+            _use_gqa = (
+                bool(self.cfg.gqa_pack)
+                and self.num_kv_groups > 1
+                and int(getattr(kernel, "gqa_rows_per_head", 1)) > 1
+            )
+        else:
+            _use_gqa = (
+                bool(self.cfg.gqa_pack)
+                and int(getattr(attn_metadata, "max_query_len", 0) or 0) == 1
+                and self.num_kv_groups > 1
+            )
         if getattr(self, "_warm_plans", None):
             # CuTeDSL compiles on the first call of each (tile, causal) config and a
             # compile costs ~1.6 s, so every config the policy can produce has to be

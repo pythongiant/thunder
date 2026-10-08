@@ -219,7 +219,10 @@ one fused kernel.
 **A GQA group shares one reconstruction.** With 32 Q heads over 8 KV heads the
 QK and PV math differ per head but the KV reconstruction does not, so the
 GQA-packed schedule reconstructs each tile once for the four heads that consume
-it. It is the decode default (`THUNDER_GQA_PACK=0` opts out).
+it. Decode packs the group's heads over its single query token; prefill packs
+them over `tile_m // qhead_per_kvhead` query tokens of the q-block, which is what
+removes the 4x-redundant dequant from the prefill. On by default
+(`THUNDER_GQA_PACK=0` opts out).
 
 **The KV is traversed once.** Single-pass online softmax removes the separate
 row-max pass — otherwise every tile loads and dequantizes K twice — and

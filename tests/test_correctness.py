@@ -136,7 +136,7 @@ def test_kernel_matches_dequant_reference(causal, k_bits, v_bits):
 
 
 def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale, causal,
-                num_splits: int = 1, gqa_pack: bool = False):
+                num_splits: int = 1, gqa_pack: bool = False, gqa_rows_per_head: int = 1):
     """Mirror the plugin contract: rotate Q in, un-rotate O out.
 
     The kernel scores in the rotated basis (exact, since the rotation is
@@ -170,7 +170,8 @@ def _run_kernel(q, kv, scales, layout, launcher, quant, nq, nk, hq, hk, d, scale
 
     kernel = ThunderAttentionForward(
         head_dim=d, K_BITS=layout.k_bits, V_BITS=layout.v_bits,
-        qhead_per_kvhead=hq // hk, is_causal=causal,
+        qhead_per_kvhead=hq // hk, gqa_rows_per_head=gqa_rows_per_head,
+        is_causal=causal,
         m_block_size=64, n_block_size=64, num_threads=128,
     )
     rot = quant.rotation
@@ -212,3 +213,44 @@ def test_split_k_decode_matches_dequant_reference(causal, num_splits, gqa_pack):
         pytest.skip("kernel not ready")
 
     torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.parametrize("nq,causal", [(128, True), (128, False), (100, True)])
+def test_packed_prefill_matches_dequant_reference(nq, causal):
+    """Packed multi-token GQA parity against the dequant oracle.
+
+    The packed schedule puts a whole GQA group on the M axis over
+    ``m_block // qhead_per_kvhead`` query tokens, so the Q load, the softmax
+    masks, the causal bound and the output store all address ``(head, token)``
+    instead of a query row -- none of which decode-only packing exercises. The
+    100-row case leaves a partially-live last q-block, which is where the
+    token-axis guard has to hold.
+    """
+    from thunder_vllm.attention.cute_kernel import (
+        KernelNotReadyError,
+        launch_thunder_attention,
+    )
+
+    nk, hq, hk, d = 2048, 32, 8, 128
+    scale = d**-0.5
+    q, kv, scales, layout, quant, ref = _build_case(nq, nk, hq, hk, d, 4, 4, causal)
+    # The launcher views q with a power-of-two leading dimension capped by the
+    # tensor's storage, so a bare ``(nq, ...)`` q cannot launch when nq is not a
+    # power of two. Give the odd case headroom: the kernel only touches rows
+    # below ``max_query_len``.
+    rows = 1 << (nq - 1).bit_length()
+    if rows != nq:
+        q = torch.cat(
+            [q, torch.zeros(rows - nq, hq, d, device=q.device, dtype=q.dtype)]
+        )
+
+    try:
+        out = _run_kernel(
+            q, kv, scales, layout, launch_thunder_attention, quant,
+            nq, nk, hq, hk, d, scale, causal,
+            gqa_pack=True, gqa_rows_per_head=64 // (hq // hk),
+        )
+    except KernelNotReadyError:
+        pytest.skip("kernel not ready")
+
+    torch.testing.assert_close(out[:nq].float(), ref.float(), atol=ATOL, rtol=RTOL)
