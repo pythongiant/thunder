@@ -601,10 +601,13 @@ if _HAS_TRITON:
         NOTE: the kernel now rotates in fp32 (``input_precision="ieee"``) with an
         exact normalize, matching ``Codebook.quantize``. 3-bit K/4-bit V is
         unit-bit-exact (N=2048, non-contiguous, ``unpack_maxdiff == 0``), but
-        enabling it for 3-bit STILL diverges the engine, so the store is left on
-        the exact torch ref path. The unit parity evidently does not cover the
-        engine's tensor contract (see next-experiment note). 4-bit K (16 levels)
-        can differ by one level from the norm reduction order.
+        enabling this kernel for 3-bit STILL diverges the engine, so 3-bit K does
+        NOT come here: it keeps the exact torch quantizer and takes the
+        ``_scatter_codes`` path below (the quantizer's own docstring records the
+        divergence; that path is the engine's default, and
+        ``tests/test_cache_layout.py::test_triton_scatter_matches_reference_at_the_engine_geometry``
+        is the parity case for it, GPU-gated). 4-bit K (16 levels) can differ by
+        one level from the norm reduction order.
         """
         _allow3 = _os.environ.get("THUNDER_STORE3", "0").strip().lower() not in (
             "", "0", "false", "no", "off")
