@@ -90,6 +90,15 @@ class ThunderMetadata(AttentionMetadata):
     # Split/batch structure
     num_decodes: int = 0  # decode requests occupy the first num_decodes slots
     is_prefill: bool = False
+    # True for the metadata vLLM builds for a CUDA-graph capture. This is the ONLY
+    # reliable in-band signal that a forward is being captured: vLLM captures on a
+    # side stream our forward does not run on, so
+    # `torch.cuda.is_current_stream_capturing()` is False there -- measured, and
+    # the reason every capture-safe branch in this backend used to be dead code.
+    is_capture: bool = False
+    # The token sizes vLLM will capture (CompilationConfig.cudagraph_capture_sizes).
+    # The warm-up needs them to pre-compile the geometry the capture will use.
+    capture_sizes: tuple[int, ...] = ()
 
     # CUDA-graph
     use_cuda_graph: bool = False
@@ -147,6 +156,16 @@ class ThunderMetadataBuilder(AttentionMetadataBuilder[ThunderMetadata]):
         # Engine capacities for the gather reservation (see ThunderMetadata).
         self._cap_num_reqs = 0
         self._cap_model_len = 0
+        # The sizes vLLM will capture: the warm-up compiles exactly those.
+        self._capture_sizes: list[int] = []
+        try:
+            self._capture_sizes = [
+                int(s) for s in
+                (getattr(vllm_config.compilation_config, "cudagraph_capture_sizes", None)
+                 or [])
+            ]
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self._cap_num_reqs = int(
                 getattr(vllm_config.scheduler_config, "max_num_seqs", 0) or 0
@@ -204,6 +223,8 @@ class ThunderMetadataBuilder(AttentionMetadataBuilder[ThunderMetadata]):
         """
         md = self.build(0, common_attn_metadata)
         md.use_cuda_graph = True
+        md.is_capture = True
+        md.capture_sizes = tuple(self._capture_sizes)
         if md.seq_lens is not None:
             md.seq_lens.fill_(1)
         return md

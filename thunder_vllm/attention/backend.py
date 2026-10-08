@@ -128,42 +128,50 @@ class _CapacityMeta:
         self.num_actual_tokens = int(query_start_loc[-1])
 
 
-def _capacity_warm_meta(attn_metadata, device):
-    """Build (and refresh) a capacity-padded metadata mirror of this step.
+def _in_capture(attn_metadata=None) -> bool:
+    """Is this forward part of a CUDA-graph capture?
 
-    ONE buffer per (capacity, device), and the previously live region is zeroed
-    before each refresh: the padding must never carry a stale `seq_lens`/
-    `query_start_loc` entry, because the launch that consumes it runs with
-    `num_reqs = capacity` over the gathered buffers, and a stale entry there is an
-    out-of-bounds read (the failure class of FAILURE_MODES 15). Caching per
-    observed batch size instead would work too, and would leak a buffer per size.
+    NOT just `torch.cuda.is_current_stream_capturing()`: vLLM captures on a side
+    stream our forward does not run on, so that call returns False there (measured
+    live -- the debug dump printed `capturing=0` while vLLM's FULL capture was
+    running and dying). The metadata vLLM builds for a capture carries the flag,
+    which is the reliable signal.
     """
-    cap = int(getattr(attn_metadata, "max_num_reqs_capacity", 0) or 0)
-    n_obs = int(attn_metadata.seq_lens.shape[0])
-    if cap <= n_obs or cap <= 0:
-        return None
-    cache = _capacity_warm_meta.__dict__.setdefault("_cache", {})
-    key = (cap, str(device))
+    if attn_metadata is not None and getattr(attn_metadata, "is_capture", False):
+        return True
+    return bool(torch.cuda.is_current_stream_capturing())
+
+
+def _warm_meta(n_reqs: int, indptr_len: int, block_table, max_blocks_per_req: int,
+               device):
+    """An ALL-ZERO metadata for the capture geometry.
+
+    Every request gets `kv_len == 0` and `q_len == 0`: the kernel's tile loop is
+    `ceil(0 / tile_n) == 0` and its epilogue is guarded by `q_off + tok < q_len`,
+    so the launch reads nothing, writes nothing, and only does the thing it exists
+    for -- compiling that (config, shape, grid) and allocating its split partials
+    eagerly. That makes it safe to run on the step's own buffers.
+    """
+    cache = _warm_meta.__dict__.setdefault("_cache", {})
+    key = (int(n_reqs), int(indptr_len), str(device))
     hit = cache.get(key)
     if hit is None:
         hit = cache[key] = (
-            torch.zeros(cap, dtype=torch.int32, device=device),
-            torch.zeros(cap + 1, dtype=torch.int32, device=device),
-            [],
+            torch.zeros(int(n_reqs), dtype=torch.int32, device=device),
+            torch.zeros(int(n_reqs) + 1, dtype=torch.int32, device=device),
+            torch.zeros(int(indptr_len), dtype=torch.int32, device=device),
         )
-    sl, qsl, prev = hit
-    if prev:
-        prev_n = int(prev[0])
-        sl[:prev_n].zero_()
-        qsl[: prev_n + 1].zero_()
-    sl[:n_obs].copy_(attn_metadata.seq_lens[:n_obs])
-    qsl[: n_obs + 1].copy_(attn_metadata.query_start_loc[: n_obs + 1])
-    prev[:] = [n_obs]
+    sl, qsl, indptr = hit
+    # Re-zero every call: nothing here is supposed to be written, and the invariant
+    # that matters (a zero metadata = a launch that reads and writes nothing) must
+    # not depend on that.
+    sl.zero_()
+    qsl.zero_()
+    indptr.zero_()
     return _CapacityMeta(
-        sl, qsl, attn_metadata.block_table,
-        int(getattr(attn_metadata, "max_blocks_per_req", 0) or 0),
-        int(getattr(attn_metadata, "max_query_len", 0) or 1), cap,
-    )
+        sl, qsl, block_table,
+        int(max_blocks_per_req), 1, int(n_reqs),
+    ), indptr
 
 
 _DBG_GEO: dict = {"last": None}
@@ -931,7 +939,7 @@ class ThunderAttentionImpl(AttentionImplBase):
                 value[:n].reshape(n, self.num_kv_heads, self.head_size),
                 attn_metadata.slot_mapping[:n],
                 kv_cache,
-                self._scales_for(kv_cache),
+                self._scales_for(kv_cache, capturing=_capturing),
                 quantizer,
                 self.layout,
             )
@@ -993,7 +1001,7 @@ class ThunderAttentionImpl(AttentionImplBase):
                 1,
                 int(((_sl_cpu[:_r].to(torch.int64) + _bs - 1) // _bs).max().item()),
             )
-        _capturing = torch.cuda.is_current_stream_capturing()
+        _capturing = _in_capture(attn_metadata)
         _path_setting = os.environ.get("THUNDER_8B_INDIRECT", "")
         _indirect = _use_indirect_gather(
             paged, self.layout, self.num_kv_heads, _path_setting
@@ -1031,7 +1039,7 @@ class ThunderAttentionImpl(AttentionImplBase):
             # Phase A: build CSR metadata once per step (shared by all layers);
             # only the KV payload select is per-layer (each layer has its own
             # kv_cache).
-            _scales = self._scales_for(kv_cache)
+            _scales = self._scales_for(kv_cache, capturing=_capturing)
             _kc = self.layout.k_codes(kv_cache)
             _vc = self.layout.v_codes(kv_cache)
             _kn = self.layout.k_norm(_scales)
@@ -1090,7 +1098,7 @@ class ThunderAttentionImpl(AttentionImplBase):
             gathered = paged.gather_packed_tiles(
                 attn_metadata.block_table,
                 kv_cache,
-                self._scales_for(kv_cache),
+                self._scales_for(kv_cache, capturing=_capturing),
                 attn_metadata.seq_lens,
                 live_blocks=live_blocks,
             )
@@ -1245,56 +1253,45 @@ class ThunderAttentionImpl(AttentionImplBase):
 
     def _capacity_warm(self, q, gathered, o, attn_metadata, quantizer,
                        indptr, indirect: bool) -> None:
-        """Compile+allocate the capture's (config, shape, grid) once, eagerly."""
+        """Compile the CAPTURE's launches before vLLM captures them.
+
+        `cudagraph_num_of_warmups` is 0 in vLLM, and the capture's metadata differs
+        from every eager step's -- a padded, uniform-decode geometry with its own
+        tile and split count. CuTeDSL keys its jit cache per (config, shape, grid)
+        and the split partials are allocated per (num_reqs, splits), so without
+        this the capture is the FIRST execution of that triple: a cold compile plus
+        a cold allocation inside the captured region, which is what kills it.
+        """
+        sizes = [int(x) for x in (getattr(attn_metadata, "capture_sizes", ()) or ())]
+        if not sizes:
+            return  # graphs are off: nothing to warm
         cap = int(getattr(attn_metadata, "max_num_reqs_capacity", 0) or 0)
-        if cap <= 0 or cap <= int(attn_metadata.seq_lens.shape[0]):
-            return
-        key = (cap, int(self.head_size), int(self.num_kv_groups))
-        if key in _WARM_CAPACITY_DONE:
-            return
-        md = _capacity_warm_meta(attn_metadata, q.device)
-        if md is None:
-            return
-        _WARM_CAPACITY_DONE.add(key)
-        # The capture is a uniform decode: one query token per request, no
-        # split-K (the split policy refuses to decide on the host while
-        # capturing), GQA-packed.
-        kernel = self.get_kernel(self.head_size, False, cap, 1)
-        md.max_query_len = 1
-        # The warm launch writes the step's output buffer (the kernel's epilogue
-        # targets it, and only there are the launch shapes identical to the
-        # capture's -- `_fixed_rows` derives the view from the buffer's STORAGE,
-        # so a same-shaped scratch would not match). Its result is not the step's:
-        # this launch runs with num_splits=1 while a real decode uses S=16..64 and
-        # the two reductions differ in their last bits. Save and restore around it.
-        saved_o = o.clone()
-        # Likewise the CSR `indptr`: the eager step's is (observed + 1) long, and
-        # the kernel indexes mIndptr[req] for req < capacity. A capacity-sized
-        # zeroed copy keeps every address inside the reservation (the values are
-        # irrelevant to a compile, which is all this launch is for).
-        warm_indptr = indptr
-        if indirect:
-            wi = _capacity_warm_meta.__dict__.setdefault("_indptr", {})
-            warm_indptr = wi.get(key)
-            if warm_indptr is None:
-                warm_indptr = wi[key] = torch.zeros(cap + 1, dtype=torch.int32,
-                                                    device=q.device)
-        try:
-            launch_thunder_attention(
-                kernel, q, gathered, o, md, self.scale,
-                quantizer=quantizer, num_splits=1,
-                gqa_pack=bool(self.num_kv_groups > 1),
-                onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
-                causal_bound=self.cfg.causal_bound, indptr=warm_indptr,
-                indirect=indirect,
-            )
-        finally:
-            o.copy_(saved_o)
-        logger.info(
-            "capacity warm-up: cap=%d tile=(m=%d,n=%d,threads=%d) splits=1 "
-            "indirect=%d",
-            cap, kernel.tile_m, kernel.tile_n, kernel.num_threads, int(indirect),
-        )
+        done = []
+        for size in sizes:
+            n_reqs = max(int(size), 1)
+            for splits in (1, 2, 4, 8, 16, 32, 64):
+                key = (n_reqs, splits, self.head_size, self.num_kv_groups)
+                if key in _WARM_CAPACITY_DONE:
+                    continue
+                _WARM_CAPACITY_DONE.add(key)
+                md, warm_indptr = _warm_meta(
+                    n_reqs, max(cap, n_reqs) + 1, attn_metadata.block_table,
+                    int(getattr(attn_metadata, "max_blocks_per_req", 0) or 0),
+                    q.device,
+                )
+                kernel = self.get_kernel(self.head_size, False, n_reqs, 1)
+                launch_thunder_attention(
+                    kernel, q, gathered, o, md, self.scale,
+                    quantizer=quantizer, num_splits=splits,
+                    gqa_pack=bool(self.num_kv_groups > 1),
+                    onepass=self.cfg.onepass, reg_rescale=self.cfg.reg_rescale,
+                    causal_bound=self.cfg.causal_bound,
+                    indptr=(warm_indptr if indirect else None),
+                    indirect=indirect,
+                )
+                done.append((n_reqs, splits, kernel.tile_m, kernel.tile_n))
+        if done:
+            logger.info("capture warm-up: %d launch(es), first=%s", len(done), done[0])
 
     def _decode_split_count(self, attn_metadata: Any, is_causal: bool) -> int:
         """Split-K count for a decode step, or 1 when splitting would not help.
@@ -1320,7 +1317,7 @@ class ThunderAttentionImpl(AttentionImplBase):
         sl_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
         if torch.is_tensor(sl_cpu) and sl_cpu.numel() > 0 and not sl_cpu.is_cuda:
             seq_len = int(sl_cpu[:n_reqs].max().item())
-        elif not torch.cuda.is_current_stream_capturing():
+        elif not _in_capture(attn_metadata):
             seq_len = int(attn_metadata.seq_lens[:n_reqs].max().item())
         else:
             return 1
@@ -1523,7 +1520,8 @@ class ThunderAttentionImpl(AttentionImplBase):
             except Exception:  # noqa: BLE001 - a non-settable holder is not a layer
                 pass
 
-    def _scales_for(self, kv_cache: torch.Tensor) -> torch.Tensor:
+    def _scales_for(self, kv_cache: torch.Tensor,
+                    capturing: bool | None = None) -> torch.Tensor:
         """The norm tensor paired with ``kv_cache``.
 
         vLLM only threads a single cache tensor through the backend API, so the
@@ -1539,7 +1537,7 @@ class ThunderAttentionImpl(AttentionImplBase):
         # once clamped, silently used block 0's norms. Never resize while a graph
         # is being captured -- it would move a pointer already baked in.
         if scales is not None and int(scales.shape[0]) != num_blocks:
-            if torch.cuda.is_current_stream_capturing():
+            if capturing if capturing is not None else _in_capture():
                 return scales
             scales = None
         if scales is None:
