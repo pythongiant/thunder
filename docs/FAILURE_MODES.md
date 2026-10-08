@@ -174,6 +174,11 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   kernels, so the 3-bit path has no host branch at all; the torch quantizer is
   unchanged and the parity probe (`ci_probe/modal_probe_store_parity.py`, 4/4,
   3/4, and both with PAD_SLOT_ID) reports `maxdiff == 0.0` on codes and norms.
+  Verified end to end once the spend limit lifted: the parity probe still reports
+  `maxdiff 0.0` in all four cases, the GPU suite is green (1 known stub failure,
+  0 unexpected), and 16k eager serving measures ITL 320 ms / 3.1 tok/s against
+  334 ms / 3.0 before the change -- so the scatter is invisible in serving and
+  only removes the host syncs.
   Effect on capture (measured, this session): the failure MODE changes and the
   store is exonerated. Three 4k `ours` configurations, all `k=3/v=4`:
 

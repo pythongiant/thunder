@@ -166,6 +166,7 @@ def _capacity_warm_meta(attn_metadata, device):
     )
 
 
+_DBG_GEO: dict = {"last": None}
 _ENGINE_HOOK = {"done": False}
 _PAGED_CACHE: dict = {}
 # Compiled kernels, shared across the 36 layer impls. The kernel object carries
@@ -857,9 +858,17 @@ class ThunderAttentionImpl(AttentionImplBase):
                     f"ThunderAttentionImpl.forward: attn_metadata.{_name} is on "
                     f"{_v.device}, expected CUDA"
                 )
-        if env_flag("THUNDER_DEBUG_LAUNCH"):
+        # Print when capturing, or when the geometry changes: the capture-time
+        # geometry is what FAILURE_MODES 14 turns on, and a per-forward print
+        # drowns it (the harness keeps only the tail of a run's output).
+        _geo = (int(getattr(attn_metadata, "num_reqs", 0) or 0),
+                int(getattr(attn_metadata, "max_query_len", 0) or 0),
+                bool(torch.cuda.is_current_stream_capturing()))
+        _show = _geo != _DBG_GEO["last"]
+        _DBG_GEO["last"] = _geo
+        if env_flag("THUNDER_DEBUG_LAUNCH") and (_show or _geo[2]):
             print(
-                f"[TQ-LAUNCH] q={tuple(query.shape)}/{query.dtype} n={n} "
+                f"[TQ-LAUNCH] capturing={int(_geo[2])} q={tuple(query.shape)}/{query.dtype} n={n} "
                 f"kv={tuple(kv_cache.shape)} "
                 f"bt={tuple(attn_metadata.block_table.shape)} "
                 f"sl={tuple(attn_metadata.seq_lens.shape)} "
