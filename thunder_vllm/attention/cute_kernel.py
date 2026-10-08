@@ -1253,16 +1253,16 @@ def _fast_key(kernel_cfg, shapes, num_reqs, max_query_len, num_splits,
     ``gqa_pack`` and ``indirect``, which select different kernel specializations
     even when all tensor shapes coincide.
 
-    ``shapes`` is accepted but deliberately NOT part of the key. The compiled
-    function is specialized on constexprs only; tensor shapes are runtime arguments
-    it handles itself, so keying on them made the cache arm once per SHAPE instead
-    of once per config -- and an arm costs a ``generate_mlir`` (~166 ms, measured),
-    which landed in the first request of each new prompt length. Everything that
-    does vary the specialization (the tile, the bit widths, the flags, the split
-    count) is already in ``kernel_cfg`` and the scalars below.
+    ``shapes`` IS part of the key, and has to be: CuTeDSL's own ``jit_cache`` is
+    keyed per shape, so a cached entry for one shape must never be handed to another
+    (the arm path fetches the entry by diffing that cache). The cost of that is a
+    ``generate_mlir`` arm (~166 ms, measured) plus a compile (~1.9 s) for the first
+    step of each new shape -- which for a prefill is the prompt length. Making that
+    cheap means launching fixed-shape tensors, not weakening this key.
     """
     return (
         tuple(kernel_cfg),
+        tuple(shapes),
         int(num_reqs), int(max_query_len), int(num_splits),
         int(bool(debug)), int(split_mode), int(gqa_mode), int(bool(gqa_pack)),
         int(bool(onepass)), int(bool(reg_rescale)), int(bool(causal_bound)),
