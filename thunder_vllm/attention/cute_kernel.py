@@ -1108,6 +1108,7 @@ def _dsl_object(kernel):
 # plumbing (reshape/contiguous/from_dlpack) from the CuTeDSL host call and the
 # split-K merge so a slow launch can be attributed.
 _LAUNCH_TIME: dict = {"plumbing": 0.0, "kernel": 0.0, "merge": 0.0, "n": 0}
+_GPU_EVENTS: list = []
 
 
 def _dump_launch_time() -> None:
@@ -1121,14 +1122,25 @@ def _dump_launch_time() -> None:
     means = {
         k: _LAUNCH_TIME[k] / n * 1e3 for k in ("plumbing", "kernel", "merge")
     }
+    gpu = 0.0
+    if _GPU_EVENTS:
+        import torch  # noqa: PLC0415 -- dump-time only
+        try:
+            torch.cuda.synchronize()
+            pairs = [e.elapsed_time(a) for a, e in _GPU_EVENTS if e.query()]
+            if pairs:
+                gpu = sum(pairs) / len(pairs)
+        except Exception:
+            gpu = -1.0
     print(
         "[TQ-LAUNCH] n=%d  plumbing=%.2fms  kernel=%.2fms  merge=%.2fms  "
-        "total=%.2fms"
+        "gpu=%.2fms  total=%.2fms"
         % (
             _LAUNCH_TIME["n"],
             means["plumbing"],
             means["kernel"],
             means["merge"],
+            gpu,
             sum(means.values()),
         ),
         flush=True,
@@ -1593,11 +1605,26 @@ def launch_thunder_attention(
             part_o_t, part_m_t, part_l_t, num_reqs, S, hq, hd, o3, q_start
         )
 
+    if _TIME and _GPU_EVENTS:
+        try:
+            _GPU_EVENTS[-1][1].record()
+        except Exception:
+            pass
     if _TIME:
         _t3 = _time.perf_counter()
         _LAUNCH_TIME["plumbing"] += _t1 - _t0
         _LAUNCH_TIME["kernel"] += _t2 - _t1
         _LAUNCH_TIME["merge"] += _t3 - _t2
         _LAUNCH_TIME["n"] += 1
+        # The buckets above are host-dispatch only (docs/FAILURE_MODES.md 3), so they
+        # cannot say how much of a layer is GPU. These event pairs can, and are read
+        # once at dump time.
+        try:
+            _ev_a = torch.cuda.Event(enable_timing=True)
+            _ev_b = torch.cuda.Event(enable_timing=True)
+            _ev_a.record()
+            _GPU_EVENTS.append((_ev_a, _ev_b))
+        except Exception:
+            pass
 
 
