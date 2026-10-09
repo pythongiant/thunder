@@ -230,6 +230,31 @@ Ranked next tests, cheapest first:
    the cost is inside the kernel/GPU; if much worse, the hit path is already saving
    us and the target is elsewhere.
 
+### THE critical path: graphs are unusable, and graphs are the 13 ms/layer fix
+
+Measured head-to-head on the same cell:
+
+| cfg | result |
+|---|---|
+| `ours-eager` | serves: ITL 474 ms (steady state), 2.1 tok/s |
+| `ours` (CUDA graphs) | **FAILS at engine init**: `cudaErrorIllegalAddress`, engine core init failed |
+
+A captured graph replays all 36 layers from one graph with NO per-layer host launch,
+so the ~13 ms/layer measured inside `jf(...)` is precisely what graphs remove -- which
+is why the recorded baseline text lists `ours` at 58 tok/s against the 2.1 tok/s
+`ours-eager` delivers. Therefore:
+
+**Priority 1 is the post-capture IMA, because it gates the only configuration that is
+fast, and it is also the same fault that blocks vLLM's DEFAULT (graphs on).**
+
+What is established about it: both captures now COMPLETE (piecewise 13.5 s, FULL
+0.75 s after the fast-path guard fix); the fault lands AFTER them, in the KV-cache-init
+phase; the XID is an MMU read fault; and with `THUNDER_FAST_DEBUG=1` no
+`MISS ... capturing=1` line appears, so that phase does NOT reach
+`launch_thunder_attention` -- the fault is in the gather / CSR build / store that runs
+before the launch. Bisection is blocked for the store A/B: `THUNDER_STORE_TORCH=1`
+makes the store sync, so the capture fails earlier with
+`cudaErrorStreamCaptureUnsupported` and never reaches the phase in question.
 ### Literature that applies (searched, not assumed)
 
 - **BitDecoding** (Du et al., HPCA 2026, arXiv 2503.18773): the closest work --
