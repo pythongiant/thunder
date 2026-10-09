@@ -82,3 +82,70 @@ KV-head/GQA tile ownership
 - No second grid mode inside v2 (keeps the schedule honest).
 - No new quantization representation until the pipeline wins on the
   current one (representation is proven; execution is not).
+
+## Measured delta vs FA4 (read from the FA source, not assumed)
+
+Source: `flash-attention/` (the FA repo, incl. `flash_attn/cute/` = FA4 in the
+SAME CuTeDSL stack we use), `benchmarks/results/fa4_matrix_b200_full.md` (frozen,
+same methodology both sides), and our own code.
+
+The worst cell is the one that matters most, hd128/gqa4 (Qwen3-8B's shape):
+
+| cell | FA4 ms | ours ms (frozen) | ratio | GB/s FA4 / ours |
+|---|---|---|---|---|
+| hd128-gqa4-causal-decode-B16-S16384-sp4 | 0.2012 | 14.1858 | **70.5x** | **5339 / 20** |
+| hd128-gqa4-causal-decode-B16-S4096-sp4 | 0.0860 | 3.7374 | 43.5x | 3124 / 19 |
+| hd128-gqa4-causal-decode-B1-S16384-sp4 | 0.1955 | 1.1788 | 6.0x | 343 / 15 |
+| hd128-gqa4-causal-prefill-B1-S16384 | 1.6823 | 105.456 | 62.7x | 199 / 3 |
+
+Two corrections to how this table is usually quoted:
+
+- It is **frozen** (pre-session). The shipped kernel has since moved b16/32k
+  from 24.11 to **2.72 ms**, so the *current* ratio on that cell is ~7x, not 70x
+  (FA4 at S32768 ~= 0.40 ms by linear extrapolation, since it is bandwidth-bound
+  there -- inference, not a measurement).
+- The **GB/s column is the whole story**. FA4 runs that cell at 5339 GB/s, about
+  67% of B200 HBM peak; we run it at 20 GB/s (frozen) and ~350 GB/s now, a few
+  percent. Ours moves LESS data (112 packed bytes per token-head vs 256 fp16) and
+  is still far slower. So this is not a data-volume or arithmetic problem: it is
+  a **latency-hiding / issue-rate** problem.
+
+### Mechanism-by-mechanism (ours vs FA4)
+
+| | ours (`thunder_vllm/attention/cute_kernel.py`, shipped) | FA4 (`flash_attn/cute/flash_fwd_sm100.py`) |
+|---|---|---|
+| KV movement | `_load_kv_packed_full` (cute_kernel.py:967): global -> registers -> smem, **two-phase but synchronous, single-buffered** | `cpasync.CopyBulkTensorTileG2SOp` (TMA bulk G2S, flash_fwd_sm100.py:656) |
+| async copies | `cpasync` is **imported (cute_kernel.py:49) and never called** | TMA + `PipelineTmaUmma` with byte-count mbarrier (1050) |
+| stages in flight | 1 | `kv_stage = min((224*1024 - smem_size_q_o)//smem_size_kv_per_stage, 32)` (425) |
+| softmax | serial, in the MMA warps | dedicated softmax + correction warps (1021-1027) |
+| accumulators | registers | TMEM, ping-pong S/P slots (338-375), `TmemAllocator` (994) |
+| scheduling | static grid | CLC dynamic persistent, 2-CTA MMA clusters |
+| split-KV reduce | separate Triton `_merge_splits_kernel` | device-side `flash_fwd_combine.py` |
+| paged KV | gather into a temporary, then kernel reads it | consumed in-kernel via TMA |
+
+The `num_stages`/`num_dequant_stages` knobs measuring DEAD is *consistent* with
+this: a "stage" knob cannot help when no copy in the loop is asynchronous.
+
+### Porting ladder (each rung verified by the matrix, not by inspection)
+
+We are not starting from zero: `thunder_vllm/attention/cute_kernel_tcgen05.py`
+already builds `PipelineUmmaAsync` (621), `NamedBarrier` (631), `TmemAllocator`
+(634) and `declare_ptx_smem_desc` (662) -- but at **`num_stages=1`** (351), and it
+is not the shipped kernel. Rungs, in dependency order:
+
+1. **Async, multi-stage KV pipeline** (the missing machinery). TMA descriptors for
+   the packed K/V tiles; feed the KV pipeline asynchronously; raise
+   `num_stages` and size it from the smem budget as FA4 does. This is the rung
+   that targets the measured bandwidth collapse directly.
+2. **Warp specialization**: softmax/correction warps + named barriers, so dequant
+   and softmax stop serializing behind the MMA.
+3. **TMEM accumulators** (tcgen05), taking the existing attempt past `num_stages=1`.
+4. **Direct paged-KV consumption** (delete the gather; item 7 above).
+5. **Device-side split-KV reduction** (replace the Triton merge).
+6. **Register/exp2 tuning**: FA4 spends 184-192 registers on softmax warps and
+   *emulates* exp2 (`ex2_emu`, SM100's native ex2 is slow), with the tuning table
+   keyed by (2cta, causal, hdim, sm103).
+
+Verification for rung 1: `python -m benchmarks.fa4_matrix --quick` on
+hd128-gqa4-causal-decode-B16-S16384-sp4, and the GB/s column must rise before any
+time number is believed. A rung that does not move GB/s is not the bottleneck.
