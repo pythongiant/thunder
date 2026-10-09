@@ -169,17 +169,51 @@ Upstream itself is 4.4x off the roofline, and our representation has a 4.6x byte
 advantage (31.5 KiB vs 144 KiB of KV per token), so the target is reachable
 without beating FA4.
 
-### Where the served step actually goes (measured)
+### Where the served step actually goes (MEASURED)
 
-`--e2e "4096|ours-eager|3|4"` -> ITL 336.46 ms. Over 36 layers that is 9.3 ms per
-layer, of which the attention kernel is 0.215 ms: **97.7% of the served step is
-NOT the attention kernel.** So the 1.4x target is primarily a HOST-PATH and
-memory-traffic problem, and the kernel work (above) is the secondary lever.
+`--e2e "4096|ours-eager|3|4|0|VLLM_ENABLE_V1_MULTIPROCESSING=0,THUNDER_TIME_LAUNCH=1"`:
 
-One structural suspect, visible in the code: the gather reservation is sized for
-the ENGINE capacity (1024 reqs x 264 blocks x 16 = 4,325,376 token rows = **1.7 GB
-per tensor**) while batch 1 / 4k has only 25 MB live -- a 66x over-reservation that
-the launcher then reshapes and `.contiguous()`s every layer every step.
+```
+[TQ-LAUNCH] n=1368  plumbing=0.34ms  kernel=25.95ms  merge=0.16ms  gpu=-1.00ms  total=26.45ms
+```
+
+`n` = 1368 launches = 36 layers x 38 forwards. The `kernel` bucket (the
+compiled-function invocation, i.e. `_t2 - _t1`) is **98% of the launch cost at
+25.95 ms per launch**; plumbing (which covers the reshapes, `.contiguous()`s and
+dlpack wrapping) is 0.34 ms and merge 0.16 ms. `gpu=-1.00` means the GPU-event
+path produced no timing.
+
+This is NOT the MLIR arm: `--e2e "...|VLLM_ENABLE_V1_MULTIPROCESSING=0,THUNDER_DIAG=1"`
+reports `{'launch_reqmajor': 1368, 'attn_calls_eager': 1368,
+'attn_calls_eager_prefill': 144, 'fast_armed': 7, 'fast_hit': 1360}` -- the fast
+path HITS on 99.4% of launches (7 distinct keys). So the 26 ms is inside the
+invocation, i.e. GPU work far larger than the live problem.
+
+**Root cause: the gather reservation is sized to the engine CAPACITY, and the
+kernel's work tracks it.** Measured `page_rows=270336` (= max_num_seqs 1024 x 264
+blocks/req), i.e. 270336 x 16 tokens x 8 heads:
+
+| tensor | bytes |
+|---|---|
+| k_packed (48 B/head) | 1.66 GB |
+| v_packed (64 B/head) | 2.21 GB |
+| k_norm + v_norm | 0.14 GB |
+| **per layer** | **4.01 GB** |
+| **x 36 layers** | **144.5 GB** |
+
+The run's own log reports `peak=165.6 GiB`, so the gather buffers are **87% of the
+GPU memory**. At batch 1 / 4k only 4096 page rows (58.7 MB) are live: a **66x
+over-reservation**, matching the 25.95 ms/layer measured against the ~393 us/layer
+the live problem should cost. It also starves the KV cache, which is why the
+recorded baseline lists @32768 as blocked.
+
+Two harness lessons, both paid for: the counters must be read with
+`VLLM_ENABLE_V1_MULTIPROCESSING=0` (otherwise the atexit dump fires in a process
+that launched nothing and prints `n=0`), and `THUNDER_TIME_LAUNCH=1` roughly
+doubles wall time because it creates and records two CUDA events per launch.
+
+A/B in flight: `E2E_MAX_SEQS=16` (harness now honours it) shrinks the reservation
+~64x; if ITL collapses proportionally, the over-reservation is the whole gap.
 
 ### Literature that applies (searched, not assumed)
 
