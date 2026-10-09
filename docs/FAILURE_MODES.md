@@ -287,6 +287,19 @@ makes the capture succeed, so the fault is in this backend and in the dense path
   post-FM19 notes, so the eager store path is sound.
   What is left is the IMA *after* both captures, in the KV-cache-init phase, and
   it is the capture context -- not the store's bytes -- that needs explaining.
+- **The capture's cost was `generate_mlir`, not the compile (MEASURED).** The
+  fast-launch path -- which invokes the already-compiled `JitCompiledFunction` and
+  exists precisely to skip `generate_mlir`'s ~0.4 s MLIR regeneration -- was
+  deliberately disabled while capturing ("the capture must record the plain jit
+  launch"). That theory is wrong: the fast path IS a plain launch, and the graph
+  records it identically. Measured, removing the guard: the FULL capture went from
+  **52.7 s to 0.75 s** (1.33 it/s), i.e. 130 launches x 0.4 s was exactly the old
+  cost. `generate_mlir` also runs a DEVICE program, which a capture cannot host,
+  so it is the prime suspect for the IMA that follows the captures -- but that IMA
+  survives the guard's removal, so it has a second cause still to be named.
+  The key is shape-complete and stable: `_torch_args` holds q/o at the launch
+  shape plus the gathered RESERVATION's tensors (`page_rows x block_size`, not the
+  engine cache's block count), so the eager warm-up arms exactly the capture's key.
 - **Final measured state (this session).** With `THUNDER_WARM_CAPACITY=1` BOTH
   captures now complete -- `PIECEWISE 1/1` in 13.5 s and, for the first time,
   `FULL 1/1` in 50.5 s (they previously hung or died in `capture_model`). The warm
