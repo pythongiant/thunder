@@ -1611,6 +1611,13 @@ def launch_thunder_attention(
         )
         jf = _FAST.get(key)
         if jf is None:
+            if _FDBG:
+                # Print BEFORE compiling: a miss inside a capture compiles there,
+                # and generate_mlir blocks/faults in that context, so an ARM line
+                # printed after `kernel(*_all_args)` never appears. This is the
+                # line that names a capture's key difference.
+                print(f"[fast] MISS key={key} capturing="
+                      f"{int(torch.cuda.is_current_stream_capturing())}", flush=True)
             dsl = _dsl_object(kernel)
             _ensure_cache_probe(dsl)
             _LAST_JF["v"] = None
