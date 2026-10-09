@@ -189,31 +189,33 @@ reports `{'launch_reqmajor': 1368, 'attn_calls_eager': 1368,
 path HITS on 99.4% of launches (7 distinct keys). So the 26 ms is inside the
 invocation, i.e. GPU work far larger than the live problem.
 
-**Root cause: the gather reservation is sized to the engine CAPACITY, and the
-kernel's work tracks it.** Measured `page_rows=270336` (= max_num_seqs 1024 x 264
-blocks/req), i.e. 270336 x 16 tokens x 8 heads:
+**SUSPECT TESTED AND REFUTED: the reservation size is NOT the cause.** The gather
+reservation is sized to the engine capacity (`page_rows=270336` = max_num_seqs 1024
+x 264 blocks/req) and only 4096 page rows are live at batch 1 / 4k, so it looked
+like a 66x over-reservation. But an A/B with `E2E_MAX_SEQS=16` (harness now honours
+it, shrinking the capacity 64x) left ITL unchanged (649 vs 537-600 ms) and the
+counters byte-identical (`fast_hit=1360/1368`). So the reservation size does not
+drive the 26 ms.
 
-| tensor | bytes |
-|---|---|
-| k_packed (48 B/head) | 1.66 GB |
-| v_packed (64 B/head) | 2.21 GB |
-| k_norm + v_norm | 0.14 GB |
-| **per layer** | **4.01 GB** |
-| **x 36 layers** | **144.5 GB** |
-
-The run's own log reports `peak=165.6 GiB`, so the gather buffers are **87% of the
-GPU memory**. At batch 1 / 4k only 4096 page rows (58.7 MB) are live: a **66x
-over-reservation**, matching the 25.95 ms/layer measured against the ~393 us/layer
-the live problem should cost. It also starves the KV cache, which is why the
-recorded baseline lists @32768 as blocked.
+Do not repeat the arithmetic error that made this look decisive: `peak=165.6 GiB`
+in the e2e log is NOT the gather buffers. `gpu_memory_utilization=0.85` on a 180 GB
+B200 is a ~153 GB KV cache, so the peak is weights + cache, and 144.5 GB of gathers
+could not coexist with it. The per-impl managers must be shared across layers (or
+the reservation much smaller) -- check `_ensure_paged`'s cache key before quoting
+per-layer buffer sizes again.
 
 Two harness lessons, both paid for: the counters must be read with
 `VLLM_ENABLE_V1_MULTIPROCESSING=0` (otherwise the atexit dump fires in a process
 that launched nothing and prints `n=0`), and `THUNDER_TIME_LAUNCH=1` roughly
 doubles wall time because it creates and records two CUDA events per launch.
 
-A/B in flight: `E2E_MAX_SEQS=16` (harness now honours it) shrinks the reservation
-~64x; if ITL collapses proportionally, the over-reservation is the whole gap.
+Still unexplained, and the next thing to measure: `jf(...)` -- the fast-path HIT --
+costs ~15-26 ms of host time per launch, when a hit is supposed to be ~0.35 ms. Two
+confounders to remove first: (a) the e2e's ITL is computed from only TWO decode
+steps (`2 decode` in the log) while the run arms 7 keys (an arm is ~166 ms plus up
+to a 1.9 s compile), so the number is warmup-contaminated rather than steady state
+-- raise `E2E_GEN`; (b) the GPU-event path returns -1, so no GPU time exists; fix
+that or profile with ncu before attributing further.
 
 ### Literature that applies (searched, not assumed)
 
