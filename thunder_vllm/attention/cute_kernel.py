@@ -1572,10 +1572,19 @@ def launch_thunder_attention(
         int(1 if indirect else 0),
         cuda.CUstream(stream),
     )
-    # Skip the direct-call fast path while a CUDA graph is being captured: the
-    # capture must record the plain jit launch, and the host cost there is
-    # one-time. The fast path applies to eager prefill/decode steps.
-    if _FASTLAUNCH and not torch.cuda.is_current_stream_capturing():
+    # The fast path runs under capture TOO. It was skipped there on the theory
+    # that "the capture must record the plain jit launch", but that is wrong: the
+    # fast path invokes the already-compiled `JitCompiledFunction`, which is a
+    # plain launch the graph records identically. What it SKIPS is
+    # `generate_mlir` -- ~0.4 s per call, and a device program, which a capture
+    # cannot host. Measured: with the guard in place the FULL capture took 52.7 s
+    # (130 launches x 0.4 s, i.e. every launch regenerating MLIR) and then died in
+    # `jit_wrapper -> generate_mlir -> run_compiled_program` with an IMA, which is
+    # exactly that device work being attempted inside the capture. The key is
+    # shape-complete (`_torch_args` holds q/o at the launch shape and the gathered
+    # reservation's tensors, both stable), and the eager warm-up arms it, so the
+    # captured launch is a cache HIT.
+    if _FASTLAUNCH:
         _COUNTS["attn_calls_eager"] += 1
         if _DIAG and max_query_len > 1:
             _COUNTS["attn_calls_eager_prefill"] += 1
