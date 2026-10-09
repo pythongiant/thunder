@@ -900,6 +900,13 @@ class ThunderAttentionImpl(AttentionImplBase):
                 f"[TQ-LAUNCH] capturing={int(_geo[2])} q={tuple(query.shape)}/{query.dtype} n={n} "
                 f"kv={tuple(kv_cache.shape)} "
                 f"bt={tuple(attn_metadata.block_table.shape)} "
+                # The gathered buffers are sliced to `_nb` block counts inside the
+                # launcher, and `_nb` comes from the ENGINE's cache: 1 at the
+                # profile capture, N at the real one. Those shapes are part of the
+                # jit key, so a cold compile inside the real capture means they
+                # differ from what the eager steps compiled.
+                f"gk={tuple(gathered.k_packed.shape)} "
+                f"gkn={tuple(gathered.k_norm.shape)} "
                 f"sl={tuple(attn_metadata.seq_lens.shape)} "
                 f"qsl={tuple(attn_metadata.query_start_loc.shape)} "
                 f"slot={tuple(attn_metadata.slot_mapping.shape)} "
