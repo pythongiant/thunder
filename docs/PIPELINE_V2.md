@@ -209,13 +209,26 @@ Two harness lessons, both paid for: the counters must be read with
 that launched nothing and prints `n=0`), and `THUNDER_TIME_LAUNCH=1` roughly
 doubles wall time because it creates and records two CUDA events per launch.
 
-Still unexplained, and the next thing to measure: `jf(...)` -- the fast-path HIT --
-costs ~15-26 ms of host time per launch, when a hit is supposed to be ~0.35 ms. Two
-confounders to remove first: (a) the e2e's ITL is computed from only TWO decode
-steps (`2 decode` in the log) while the run arms 7 keys (an arm is ~166 ms plus up
-to a 1.9 s compile), so the number is warmup-contaminated rather than steady state
--- raise `E2E_GEN`; (b) the GPU-event path returns -1, so no GPU time exists; fix
-that or profile with ncu before attributing further.
+Still unexplained: `jf(...)` -- the fast-path HIT -- costs ~13 ms of host wall time
+per decode launch, when a hit is supposed to be ~0.35 ms. `fast_fallback` is absent
+from the counters, so `jf` succeeds; it is simply expensive.
+
+The warmup confounder is REMOVED: `E2E_GEN=256` still reports "2 decode" and
+ITL 474 ms (vs 537-649 ms at GEN=32), so ~474 ms/step = ~13 ms/layer is
+steady-state, not a two-sample artifact.
+
+Ranked next tests, cheapest first:
+1. `--e2e "4096|ours|3|4"` (CUDA graphs) vs `ours-eager`: a graph replays all 36
+   layers with no per-layer host launch, so if the served rate jumps by the ~28x
+   the recorded baseline text implies (58 vs 2 tok/s), the 13 ms/layer is HOST
+   launch cost and not GPU work. This is the single most informative comparison
+   and needs no new instrumentation.
+2. Fix the GPU-event path (`gpu=-1.00`): without GPU time the host/GPU split inside
+   `jf(...)` cannot be resolved. `THUNDER_TIME_LAUNCH=1` already creates the event
+   pairs; the read-back at exit is what fails.
+3. `THUNDER_FASTLAUNCH=0` A/B: if ITL is similar, the fast path is not the lever and
+   the cost is inside the kernel/GPU; if much worse, the hit path is already saving
+   us and the target is elsewhere.
 
 ### Literature that applies (searched, not assumed)
 
