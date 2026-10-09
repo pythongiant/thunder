@@ -149,3 +149,73 @@ is not the shipped kernel. Rungs, in dependency order:
 Verification for rung 1: `python -m benchmarks.fa4_matrix --quick` on
 hd128-gqa4-causal-decode-B16-S16384-sp4, and the GB/s column must rise before any
 time number is believed. A rung that does not move GB/s is not the bottleneck.
+
+## Target: >= 1.4x the upstream TurboQuant inside vLLM (served, not kernel)
+
+Goal restated by the user: the *served* system must be 40% faster than upstream
+`TURBOQUANT` (`turboquant_3bit_nc` in vLLM), not merely close the FA4 kernel gap.
+
+### First-principles floors (Qwen3-8B, B200 8 TB/s, 2.25 PFLOPS dense)
+
+| quantity | floor | upstream | ours |
+|---|---|---|---|
+| decode b1/4k ITL | 2.07 ms/step (484 tok/s) | 9.13 ms (109.5 tok/s) = 4.4x off | 333 ms (3.0 tok/s) = 161x off |
+| decode b1/32k ITL | 2.18 ms/step | 55 ms (18.2 tok/s) | blocked |
+| TTFT prefill 4096 | 32 ms (72 TFLOP) | 74.3 ms = 2.3x off | 1817 ms = 57x off |
+
+Target = 1.4 x 109.5 = **>= 153 tok/s @4k, i.e. ITL <= 6.5 ms**, which is 3.2x off
+the floor -- i.e. the target does NOT require beating a near-optimal baseline.
+Upstream itself is 4.4x off the roofline, and our representation has a 4.6x byte
+advantage (31.5 KiB vs 144 KiB of KV per token), so the target is reachable
+without beating FA4.
+
+### Where the served step actually goes (measured)
+
+`--e2e "4096|ours-eager|3|4"` -> ITL 336.46 ms. Over 36 layers that is 9.3 ms per
+layer, of which the attention kernel is 0.215 ms: **97.7% of the served step is
+NOT the attention kernel.** So the 1.4x target is primarily a HOST-PATH and
+memory-traffic problem, and the kernel work (above) is the secondary lever.
+
+One structural suspect, visible in the code: the gather reservation is sized for
+the ENGINE capacity (1024 reqs x 264 blocks x 16 = 4,325,376 token rows = **1.7 GB
+per tensor**) while batch 1 / 4k has only 25 MB live -- a 66x over-reservation that
+the launcher then reshapes and `.contiguous()`s every layer every step.
+
+### Literature that applies (searched, not assumed)
+
+- **BitDecoding** (Du et al., HPCA 2026, arXiv 2503.18773): the closest work --
+  low-bit KV decode at long context. Its claims: existing systems "decode
+  inefficiently by relying solely on CUDA cores, underutilizing Tensor Cores",
+  which is exactly us (LUT dequant + `mma.sync`). Techniques to take: induce
+  tensor-core-friendly layouts, warp-level dequantization parallelism, a
+  software-pipelined dequantization kernel for mixed-precision execution, query
+  transformation, and **Blackwell NVFP4/MXFP4 formats**. Reported 7.5x average /
+  8.6x on Blackwell over FP16 FlashDecoding-v2, 3x single-batch latency at 128K.
+  Open source: github.com/OpenBitSys/BitDecoding.
+- **TurboQuant** (Zandieh et al., ICLR 2026, arXiv 2504.19874): our own quantizer's
+  paper. Includes **QJL bias correction** (random-rotation + Lloyd-Max + a
+  sign-based correction term that keeps the attention estimate unbiased), which is
+  a MATH lever we do not currently use and which could relax how much accuracy
+  headroom 3-bit K needs.
+- **turboquant_cutile** (a B200 cuTile implementation of the same algorithm,
+  devtechjr.github.io/turboquant_cutile): a working blueprint for our target
+  hardware. Five kernel types, and a FUSED attention kernel (score + QJL
+  correction + online softmax + V accumulation in one pass) that decompresses V
+  **on-chip** instead of round-tripping it through HBM -- the same round-trip our
+  gather performs. Its Blackwell list: pipelined TMA loads with `latency=2`
+  prefetch hints, TMEM -> tensor-core single hop, `exp2(flush_to_zero=True)` with
+  base-2 softmax, approximate division, block swizzling for L2 (954 -> 899 us at
+  16k), `occupancy=2`.
+
+### Order of work for the 1.4x target
+
+1. **Attribute the 9.3 ms/layer** (`THUNDER_TIME_LAUNCH=1` splits plumbing/kernel/
+   merge; `THUNDER_STAGE_TIMING=1` splits gather/qrot/launch/inverse) and delete
+   the largest term. Candidate: the 1.7 GB reservation's reshape/`contiguous()`
+   and the gather round-trip.
+2. **Right-size the reservation** to the live batch rather than the engine
+   capacity (it is what makes the above term huge), keeping pointer stability for
+   graphs.
+3. Then the kernel rungs above (async multi-stage pipeline first).
+4. Optional math lever: QJL bias correction to buy accuracy headroom, and/or
+   NVFP4 for native tensor-core execution of the low-bit path.
