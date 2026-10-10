@@ -526,3 +526,49 @@ with our side identical to four digits. Per-cell FA4 variance is therefore ~2%
 typically and ~15% worst observed, which puts the aggregate's noise floor around
 +-10%. **Decide on `ours_ms`, treat the ratio as indicative**, and re-run a cell
 before believing a small move in it.
+
+## Attributing the vLLM gap: 95% of the step is OUTSIDE our attention forward
+
+Instrument: `THUNDER_STAGE_TIMING=1` + `VLLM_ENABLE_V1_MULTIPROCESSING=0` (with the
+engine in a subprocess its atexit dump is invisible -- that is why earlier attempts
+printed nothing). Qwen3-8B, batch 1, 4k, `ours-eager`.
+
+```
+[STAGE] total=p50:0.480ms p90:0.766ms n=1368
+  prefix 0.011 | gather 0.138 | qrot 0.059 | launch 0.237 | inverse 0.035 | suffix 0.002
+```
+
+| quantity | value |
+|---|---|
+| our whole forward, per layer | **0.480 ms** (p90 0.766) |
+| our forward x 36 layers | **17.3 ms per step** |
+| observed ITL | **356.5 ms per step** |
+| **=> outside our forward** | **339 ms per step (95%)** |
+
+The same engine on the same pin with **fp16 KV** runs 3.04 ms ITL (165.6 tok/s), so
+the ~339 ms is neither the model nor vLLM's scheduler/sampler: it is a cost that
+appears only with our backend and lives outside `ThunderAttentionImpl.forward`.
+
+Inside our forward the largest term is the launch plumbing (0.237 ms, 49%), then the
+gather (0.138 ms, 29%) -- both small in absolute terms, and neither is the gap.
+
+**What runs per layer outside our forward and is ours:**
+
+1. **`do_kv_cache_update`** -- our backend declares
+   `forward_includes_kv_cache_update = False` (vLLM's default is `True`), so vLLM
+   drives the KV store through a *separate per-layer call*. This is the same hook
+   where FM19 found the store running TWICE per layer per step ("16x on the
+   forward's host time, 2x on served decode"). The `[STAGE]` numbers cannot see it
+   because it is not inside `forward()`.
+2. **`AttentionMetadataBuilder.build`** -- our metadata (and its
+   `_split_decodes_and_prefills` helper) is rebuilt every step.
+
+Either could hide a **device->host sync**, which at 36 layers would serialise the
+step: a per-layer sync is the classic way to turn 3 ms of GPU work into hundreds of
+ms of wall clock.
+
+Next, in order: (a) put the same stage timer around the KV-update hook and the
+builder to attribute the 339 ms; (b) test `forward_includes_kv_cache_update = True`
+(our forward already contains an inline store path) and re-measure ITL; (c) grep the
+per-step path for D2H syncs (`.item()`/`.cpu()`/`synchronize()`) that run per layer
+rather than once per step.
