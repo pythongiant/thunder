@@ -143,3 +143,48 @@ bit-for-bit comparable.
   per-layer cost and are labelled as such.
 - Numbers are single-run medians of one generation; the fp16 control spread is
   shown above so the reader can judge.
+
+## Update: end-to-end difference, and what the gap actually is
+
+The numbers above are the answer to "TTFT and throughput vs upstream under vLLM".
+Restated as the difference:
+
+| ctx | upstream turboquant_3bit_nc | ours (graphs) | ours (eager) | ratio (ours / upstream) |
+|---|---|---|---|---|
+| 4096 | TTFT 74.3 ms, ITL 7.03 ms, **109.5 tok/s** | TTFT 1667-2806 ms, ITL 50-87 ms, **7.3 tok/s** | TTFT 1996 ms, ITL 133.7 ms, 5.2 tok/s | **15x slower** (graphs), 21x (eager) |
+| 32768 | TTFT 1380.2 ms, ITL 12.23 ms, **18.2 tok/s** | blocked (capture) | correct but unmeasured end to end | n/a |
+
+So under vLLM we are **15-24x slower end to end**, and the cross-stack fp16 control
+(99.0 ms / 3.04 ms / 165.6 tok/s on our pin) shows that is not an artifact of the
+two environments.
+
+**Correction to the attribution above.** The earlier text says the gap is "host
+path, not kernel" and names the launch plumbing as the suspect. That conclusion
+survives, but the *specific* mechanism it implies -- a ~13 ms per-layer launch cost
+-- turned out to be an **instrumentation artifact**: a timing variable went stale
+across CUDA-graph capture boundaries, so a mean over 1368 launches reported 25 ms
+while the real fast-path hit measures **0.07 ms** (the wall-clock ITL is identical
+with and without the instrumentation).
+
+The corrected picture, measured:
+
+- the attention launch is **0.07 ms**, so 36 layers are ~2.5 ms of a ~474 ms step;
+- the rest is **whole-model eager launch overhead** (36 layers x ~10 kernels per
+  step), which is exactly what CUDA graphs exist to collapse -- hence "graphs are
+  worth 1.5-2.7x" above is a floor, not the ceiling;
+- and **graphs are blocked by the post-capture fault** in `docs/FAILURE_MODES.md`
+  FM14 (both captures now *complete* after the fast-path-guard fix, 52.7 s -> 0.75 s
+  for the FULL capture, but the engine still faults in the KV-cache-init phase).
+
+**Engine-free claim.** Because the served path is confounded by the above, the
+kernel claim is measured without vLLM at all:
+
+| | ours | FA4 (the kernel upstream TurboQuant runs on) | speedup |
+|---|---|---|---|
+| decode b1 32k | 0.220 ms | 0.307 ms | **1.397** |
+| decode b16 32k | 2.590 ms | 0.345 ms | 0.133 |
+| prefill 4k | 5.212 ms | 0.113 ms | 0.0217 |
+
+geomean **0.1138**; see `docs/REPRODUCE.md` for the one-command reproduction. The
+kernel is faster than upstream's at batch-1 decode and behind at batched decode and
+prefill; the end-to-end gap under vLLM is *not* the kernel's doing.
