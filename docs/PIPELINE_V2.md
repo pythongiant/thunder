@@ -380,3 +380,59 @@ vLLM's own trace) for the orchestration.
 4. **P4** only if the profile shows actionable stalls; then re-measure.
 5. **vLLM end-to-end separately**: fix FM14 capture, then a timeline before any
    attribution.
+
+## ncu profiles: the kernel is starved, not instruction-saturated (MEASURED)
+
+Method: `ncu --profile-from-start off --clock-control none --target-processes all`
+around a single launch via `ci/ncu_one.py`, so only our attention kernel is replayed
+(not the quantizer, store, gather or FA4). **`--clock-control none` is required
+here** -- the default (`base`) tries to lock GPU clocks and aborts with "Failed to
+lock GPU clock frequencies". Percentages are therefore relative to unlocked clocks:
+indicative within a run, not reproducible across runs.
+
+| metric | prefill 4k | decode b16 32k |
+|---|---|---|
+| Duration | 5.22 ms | 2.58 ms |
+| **DRAM Throughput** | **0.09%** | **2.34%** |
+| Memory Throughput / Mem Busy | 67.8% | 71.0% |
+| Compute (SM) / Mem Pipes Busy | 20.7% | 24.4% |
+| Eligible Warps Per Scheduler | 0.22 | 0.23 |
+| **One Or More Eligible** | **20.2%** | -- |
+| **No Eligible** | **79.8%** | -- |
+| Active Warps Per Scheduler | 1.93 | -- |
+| Warp Cycles Per Issued Instruction | 9.52 | 8.69 |
+| Avg Active Threads Per Warp | 31.93 (no divergence) | -- |
+| **Executed Instructions** | **1.0002e9** | **5.46e8** |
+| ncu's top finding | "stalled waiting for a scoreboard dependency", **Est. speedup 41.7%** | (same shape) |
+
+### What this establishes, and what it refutes
+
+1. **NOT issue-saturated** -- refutes the "prefill is instruction-bound" claim made
+   from the 3-bit/4-bit delta. The instructions exist (1.0002e9, which matches the
+   independent ~1.07e9 LUT-code estimate) but they are not queued: **no eligible
+   warp for 79.8% of cycles**.
+2. **NOT DRAM-bound** -- 0.09% of DRAM peak in the very kernel that reads the whole
+   KV, so the gathered KV is L2/SMEM-resident. **This also puts the earlier
+   "decode is traffic-sensitive" reading of the 3-bit/4-bit delta in doubt**: with
+   DRAM idle, a 5% decode win from fewer bytes must come from L2/SMEM traffic, not
+   bandwidth. Recorded as UNRESOLVED rather than explained away.
+3. **Absolute occupancy is the starvation lever** (Active Warps Per Scheduler 1.93,
+   ~7.7 warps/SM). The tile sweeps could not move it because they trade CTAs for
+   warps 1:1 -- every variant sat at 13.8 warps/SM by construction -- so the fix is
+   **per-CTA cost (SMEM and registers)**, not the tile shape.
+4. **The top stall is a scoreboard dependency** (ncu's own OPT block, 4.0 cycles per
+   warp, est. 41.7% speedup). Short vs long scoreboard is NOT yet distinguished --
+   the line was truncated. short = SMEM => cut SMEM round-trips (the P2 direction)
+   and add ILP; long = global/L2 => prefetch (the P4 direction).
+5. Avg Active Threads 31.93 with 31.51 not-predicated-off => no warp divergence, so
+   this is not a mask/predication problem.
+
+### Consequence for the order of work
+
+P4's async prefetch addresses *long*-scoreboard waits, which this profile makes
+unlikely (DRAM idle, data L2-resident). The profile points first at **raising
+resident warps per SM by cutting per-CTA cost** and at **cutting SMEM dependency
+chains** -- the second of which is exactly what P2's aligned packing does (one
+aligned word load plus shift/mask instead of byte-spanning reads). P4 stays right for
+prefill's barrier-heavy PASS 2 once the stall line is resolved, so: **get the full
+stall line before choosing between P2 and P4.**
