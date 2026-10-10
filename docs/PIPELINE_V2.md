@@ -293,3 +293,90 @@ makes the store sync, so the capture fails earlier with
 3. Then the kernel rungs above (async multi-stage pipeline first).
 4. Optional math lever: QJL bias correction to buy accuracy headroom, and/or
    NVFP4 for native tensor-core execution of the low-bit path.
+
+## Diagnosis-driven next steps (external review, verified against the code)
+
+Ranked by expected value, after checking each claim against our own measurements.
+
+**Arithmetic correction accepted.** The shipped 3-bit prefill run is 137 GFLOP /
+5.212 ms = **26.3 TFLOP/s**, not 29.5 (that figure was the 4-bit run at 4.644 ms).
+FA4 is **1212 TFLOP/s**, so the gap is **46x** either way.
+
+### P1. Prefill: dequantize once, then a dense attention (DIAGNOSTIC, not product)
+
+Our prefill re-dequantizes the whole KV sequence per q-block (64x redundant at 4k).
+Sizing the prize: one dequant pass is ~1/64 of the current dequant work, so
+~0.065 ms + FA4's 0.113 ms ~= **0.18 ms against 5.212 ms, ~29x**. If it holds, the
+two prefill cells go 0.0217 and 0.0230 -> ~0.6 and ~0.6, and the geomean goes
+**0.114 -> ~0.42** (3.7x).
+
+Run it as a *measurement* to size the structural prize, not as the shipped path:
+calling FA4 from our plugin would make us an FA4 wrapper and the "our kernel beats
+the kernel upstream runs on" claim vacuous. The product-shaped version of the same
+idea is to dequantize once into an fp16 scratch and run **our** kernel on it (no LUT
+in the inner loop). Keep the compressed cache as the persistent representation so
+the batch-1 decode win is untouched.
+
+### P2. Aligned 3-bit packing (best product-shaped idea; CONFIRMED by our packer)
+
+`quant/packing.py::pack_indices` uses a `_contributions(bits, head_dim)` table whose
+per-code work is `((idx[c] >> src) & mask) << dst` -- i.e. variable shifts with codes
+crossing byte boundaries, exactly the cost identified. A 10-codes-per-32-bit-word
+format makes extraction a single aligned word load plus one shift/mask, at 3.2 bits
+per value: K grows 48 -> 52 bytes per head (**+8.3%**) instead of 4-bit's +33%.
+
+Expected magnitude, bounded by measurements we already have: 4-bit bought **+12% on
+prefill** (instruction-bound) and cost **-5% on decode b16** (traffic-sensitive).
++8.3% bytes is a quarter of 4-bit's penalty, so the trade is strictly better than
+the nibble padding already rejected -- predict **~+8-12% prefill, ~-1-2% decode**,
+i.e. a small but real geomean gain. Multi-file and correctness-sensitive (packer,
+layout, Triton store, kernel `_unpack`), so it needs a dedicated session with the
+parity tests as the gate.
+
+### P3. Split-KV for batched decode -- ALREADY IMPLEMENTED
+
+`num_splits` up to 64 exists, the policy takes it (`max_splits_batched=16` above
+`BATCHED_DECODE_FROM`), and the launcher only forbids split-mode when
+`max_query_len > 1` (prefill). Measurements: splitting buys ~25% going 1 -> 4 at
+batch 16 (3.21 -> 2.39 ms at 16k, frozen 4-bit matrix) and the curve is then **flat
+from 8 to 64 at 32k** (splits.py documents the same knee). So the remaining lever
+here is P4 (overlap), not adding split-KV.
+
+### P4. Async double-buffering (the real structural fix)
+
+Agreed, including the caveat: "importing cpasync alone does not make a kernel
+asynchronous". `cpasync` is imported at cute_kernel.py:49 and never called; PASS 2
+is a ~6-barrier serial chain per tile. Feasibility already checked: packed rows are
+48/64 B (16-byte aligned), so 16-byte-granular cp.async works, and doubling the four
+buffers costs ~+10 KB SMEM per CTA -- affordable since occupancy is proven NOT to be
+the limit. **Pipelining hides latency; it does not remove unpack instructions**, so
+it must not be started before the profile says which one dominates.
+
+### The vLLM attribution needs a timeline (partly conceded)
+
+Attention is 2.5 ms of a ~474 ms step, so "attention is the cause" is not supported,
+and 360 launches would each need ~1.31 ms of overhead to explain it by launch gaps
+alone -- a claim that needs a timeline, not an inference.
+
+What our own instrumentation *does* show: `THUNDER_SYNC_PROBE` reported ~0.38 ms of
+GPU work per launch averaged over 1368 launches, i.e. the GPU is idle for most of the
+run. But two caveats weaken that as attribution: the mean includes the (much larger)
+prefill launches, and the profiling runs forced `VLLM_ENABLE_V1_MULTIPROCESSING=0`,
+which our own notes record as inflating ITL (16.6 -> 78 ms at 4k). So the honest
+statement today is **"the GPU is idle most of the step; the cause of that idle time
+is not yet attributed"** -- fix with `ncu` for the kernel and Nsight Systems (or
+vLLM's own trace) for the orchestration.
+
+### Order of work
+
+1. **Two `ncu` captures first** (prefill 4k; decode b16 32k): issue-active %, stall
+   reasons (barrier / wait / short-scoreboard / long-scoreboard / MIO throttle),
+   DRAM and SMEM traffic. Interpret as: low issue + stalls => P4 (overlap); high
+   issue with integer/SMEM work => P2 (representation); low DRAM but high
+   memory-instruction pressure => narrow loads / LUT traffic.
+2. **P1 as a diagnostic** -- it decides whether the fused unpack belongs in prefill
+   at all, and it is the fastest way to size the whole structural prize.
+3. **P2** (aligned 3-bit) against the current 3-bit, 4-bit, and the P1 result.
+4. **P4** only if the profile shows actionable stalls; then re-measure.
+5. **vLLM end-to-end separately**: fix FM14 capture, then a timeline before any
+   attribution.
