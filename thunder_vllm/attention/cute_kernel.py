@@ -1107,6 +1107,9 @@ def _dump_counts() -> None:
 atexit.register(_dump_counts)
 
 
+_SYNC_PROBE = os.environ.get("THUNDER_SYNC_PROBE", "0").strip().lower() not in (
+    "", "0", "false", "no", "off"
+)
 _LAST_JF: dict = {"v": None}
 _FDBG = os.environ.get("THUNDER_FAST_DEBUG", "0").strip().lower() not in (
     "", "0", "false", "no", "off"
@@ -1156,7 +1159,15 @@ def _dsl_object(kernel):
 # Host-stage timing for THUNDER_TIME_LAUNCH, dumped at exit. Separates the torch
 # plumbing (reshape/contiguous/from_dlpack) from the CuTeDSL host call and the
 # split-K merge so a slow launch can be attributed.
-_LAUNCH_TIME: dict = {"plumbing": 0.0, "kernel": 0.0, "merge": 0.0, "n": 0}
+_LAUNCH_TIME: dict = {"plumbing": 0.0, "kernel": 0.0, "merge": 0.0,
+                       "gpu_sync": 0.0, "args_build": 0.0, "key": 0.0,
+                       "jf": 0.0, "n": 0}
+_JF_TYPE: dict = {"v": None}
+_JF_PROBE = os.environ.get("THUNDER_JF_PROBE", "0").strip().lower() not in (
+    "", "0", "false", "no", "off"
+)
+_JF_PROBE_DONE: set = set()
+_JF_ALT: dict = {"v": None}
 _GPU_EVENTS: list = []
 
 
@@ -1169,7 +1180,9 @@ def _dump_launch_time() -> None:
         return
     n = max(_LAUNCH_TIME["n"], 1)
     means = {
-        k: _LAUNCH_TIME[k] / n * 1e3 for k in ("plumbing", "kernel", "merge")
+        k: _LAUNCH_TIME[k] / n * 1e3
+        for k in ("plumbing", "kernel", "merge", "gpu_sync", "args_build",
+                  "key", "jf")
     }
     gpu = 0.0
     if _GPU_EVENTS:
@@ -1183,12 +1196,17 @@ def _dump_launch_time() -> None:
             gpu = -1.0
     print(
         "[TQ-LAUNCH] n=%d  plumbing=%.2fms  kernel=%.2fms  merge=%.2fms  "
+        "gpu_sync=%.2fms  args_build=%.2fms  key=%.2fms  jf=%.2fms  "
         "gpu=%.2fms  total=%.2fms"
         % (
             _LAUNCH_TIME["n"],
             means["plumbing"],
             means["kernel"],
             means["merge"],
+            means["gpu_sync"],
+            means["args_build"],
+            means["key"],
+            means["jf"],
             gpu,
             sum(means.values()),
         ),
@@ -1557,6 +1575,8 @@ def launch_thunder_attention(
     if _TIME:
         _t1 = _time.perf_counter()
 
+    if _TIME:
+        _t1a = _time.perf_counter()
     _all_args = (
         *args,
         softmax_scale,
@@ -1610,6 +1630,10 @@ def launch_thunder_attention(
             onepass, reg_rescale, causal_bound, indirect,
         )
         jf = _FAST.get(key)
+        if _TIME:
+            _t1b = _time.perf_counter()
+            _LAUNCH_TIME["args_build"] += _t1a - _t1
+            _LAUNCH_TIME["key"] += _t1b - _t1a
         if jf is None:
             if _FDBG:
                 # Print BEFORE compiling: a miss inside a capture compiles there,
@@ -1647,6 +1671,45 @@ def launch_thunder_attention(
             if _FDBG:
                 print(f"[fast] LOOKUP key={key} jf={id(jf)} indirect={int(indirect)}",
                       flush=True)
+            if _JF_PROBE and key not in _JF_PROBE_DONE:
+                _JF_PROBE_DONE.add(key)
+                # Locate the cheap invocation path empirically: the full
+                # __call__ vs a bare run_compiled_program vs `to()`'s executor.
+                import time as _pt
+                _cargs = [*args, softmax_scale, kv_row_stride, max_query_len, S,
+                          cuda.CUstream(stream)]
+                try:
+                    _e0 = _pt.perf_counter()
+                    _exe, _adapted = jf.execution_args.generate_execution_args(
+                        tuple(_cargs), {}
+                    )
+                    _e1 = _pt.perf_counter()
+                    jf(*_cargs)
+                    _e2 = _pt.perf_counter()
+                    jf.run_compiled_program(_exe)
+                    _e3 = _pt.perf_counter()
+                    _alt = jf.to()
+                    _e4 = _pt.perf_counter()
+                    _alt.run_compiled_program(_exe)
+                    _e5 = _pt.perf_counter()
+                    print(
+                        f"[TQ-JF] gen_args={(_e1-_e0)*1e3:.2f}ms "
+                        f"call={(_e2-_e1)*1e3:.2f}ms "
+                        f"run_compiled={(_e3-_e2)*1e3:.2f}ms "
+                        f"to()={(_e4-_e3)*1e3:.2f}ms "
+                        f"to_run={(_e5-_e4)*1e3:.2f}ms "
+                        f"alt={type(_alt).__name__}",
+                        flush=True,
+                    )
+                    _JF_ALT["v"] = _alt
+                except Exception as _pe:  # noqa: BLE001
+                    print(f"[TQ-JF] probe failed: {type(_pe).__name__}: {_pe}",
+                          flush=True)
+            if _JF_TYPE["v"] is None:
+                _JF_TYPE["v"] = f"{type(jf).__module__}.{type(jf).__name__}"
+                print(f"[TQ-JF] cached object is {_JF_TYPE['v']} "
+                      f"has_exec={hasattr(jf, 'execution_args')} "
+                      f"callable={callable(jf)}", flush=True)
             try:
                 jf(
                     *args,
@@ -1666,6 +1729,13 @@ def launch_thunder_attention(
 
     if _TIME:
         _t2 = _time.perf_counter()
+        _LAUNCH_TIME["jf"] += _t2 - _t1b if _FASTLAUNCH else 0.0
+        if _SYNC_PROBE:
+            # Diagnostic: one sync per launch. `kernel` above is host dispatch;
+            # this bucket is the GPU work that dispatch had queued. Without it
+            # there is no way to tell a slow kernel from a slow host path.
+            torch.cuda.synchronize()
+            _LAUNCH_TIME["gpu_sync"] += _time.perf_counter() - _t2
 
     if split_mode:
         _merge_splits(

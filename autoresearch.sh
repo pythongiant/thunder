@@ -1,40 +1,38 @@
 #!/usr/bin/env bash
-# Autoresearch entrypoint: kernel latency at the shapes the engine runs, on
-# Modal B200 (no local CUDA).
+# Autoresearch entrypoint: OUR KERNEL vs the upstream backbone (FA4), WITHOUT vLLM.
 #
-# Primary metric: decode_b16_32k_ms — batch 16 at 32k context, the serving shape
-# and the one with the most headroom left (the frozen FA4 matrix has ours ~70x
-# off FA4 there, against ~2x at B=1). Secondaries cover the B=1 decode shapes
-# and prefill so a change that trades one for another is visible.
+# Why kernel-only: the thing we publish is a faster *kernel*, and the served e2e
+# path is confounded (eager vs graphs, multiprocessing on/off, broken capture).
+# Here both sides get identical q/k/v, identical CUDA-event timing (25 warmup +
+# 100 timed reps, median reported), on the engine's Qwen3-8B shapes
+# (head_dim 128, GQA 4:1, causal) -- i.e. our kernel against the kernel upstream
+# TurboQuant runs on. No engine, no scheduler, no sampler.
+#
+# Primary metric: speedup_vs_fa4 = geomean(fa4_ms / ours_ms) over the selected
+# cells (higher is better; >1.0 means we beat upstream's kernel).
 set -euo pipefail
 cd "$(dirname "$0")"
-
 # Fast pre-check (~1s): a syntax error fails here, not after a GPU round trip.
 python3 -m compileall -q thunder_vllm >/dev/null
-
+CELLS="hd128-gqa4-causal-decode-B16-S32768-sp16,hd128-gqa4-causal-decode-B16-S16384-sp16,hd128-gqa4-causal-decode-B16-S4096-sp16,hd128-gqa4-causal-decode-B1-S32768-sp64,hd128-gqa4-causal-prefill-B1-S4096-sp1"
 log=$(mktemp)
-if ! modal run ci/modal_app.py --mode loop >"$log" 2>&1; then
-    tail -n 60 "$log" >&2
-    exit 1
+if ! modal run ci/modal_app.py --mode shell \
+      --shell-cmd "cd /opt/thunder_vllm && python -m benchmarks.fa4_matrix --cells '$CELLS' --metrics" \
+      >"$log" 2>&1; then
+  tail -n 60 "$log" >&2
+  exit 1
 fi
-
 grep -E '^METRIC ' "$log" | sort
-
-# The baseline every run is reported against (AGENTS.md): upstream TurboQuant KV,
-# measured on its own pin. The loop measures kernel launches, which are not the
-# same quantity as upstream's served steps -- so both are printed, labelled.
+# Provenance for the served comparison (docs/BENCHMARKS.md, AGENTS.md). These are
+# NOT this metric: they are what upstream TurboQuant serves, for orientation.
 cat <<'BASELINE'
-
-[baseline] upstream turboquant_3bit_nc (vLLM 0.25.1, no plugin), served, batch 1:
-[baseline]   @4096   109.5 tok/s   ITL 7.03 ms   TTFT 74.3 ms   KV 3.4 MiB
-[baseline]   @32768   18.2 tok/s   ITL 12.23 ms  TTFT 1380.2 ms  KV 27.0 MiB
-[baseline] ours, served, batch 1 (ci/modal_app.py --mode e2e): request 7.3-7.5 tok/s,
-[baseline]   decode 58 tok/s (ITL 17.4 ms), TTFT 1.9-4.1 s; @32768 blocked.
-[baseline] ours above (METRIC) is an attention launch, not a served step.
+[baseline] upstream TurboQuant (FA4-based KV path), served, batch 1 (vLLM 0.25.1):
+[baseline]   @4096  109.5 tok/s  ITL 7.03 ms  TTFT 74.3 ms
+[baseline]   @32768  18.2 tok/s  ITL 12.23 ms  TTFT 1380.2 ms
+[baseline] above (METRIC) is a KERNEL launch, not a served step.
 BASELINE
-
-if ! grep -q '^METRIC decode_b16_32k_ms=' "$log"; then
-    tail -n 60 "$log" >&2
-    echo "autoresearch.sh: primary metric decode_b16_32k_ms missing" >&2
-    exit 1
+if ! grep -q '^METRIC speedup_vs_fa4=' "$log"; then
+  tail -n 60 "$log" >&2
+  echo "autoresearch.sh: primary metric speedup_vs_fa4 missing" >&2
+  exit 1
 fi

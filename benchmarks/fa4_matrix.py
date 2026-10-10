@@ -51,8 +51,11 @@ HEAD_DIMS = (64, 128)
 GQAS = (1, 4)
 PREFILL_SEQLENS = (1024, 4096, 16384)
 DECODE_BATCHES = (1, 16)
-DECODE_SEQLENS = (4096, 16384)
-DECODE_SPLITS = (1, 4)
+DECODE_SEQLENS = (4096, 16384, 32768)
+# 1/4 are the historical A/B points; 16 and 64 are what the SPLIT POLICY
+# actually picks at the engine's shapes (batched decode is capped at 16,
+# batch 1 at 32k picks 64), so the shipped configuration is measurable.
+DECODE_SPLITS = (1, 4, 16, 64)
 MB = int(os.environ.get("THUNDER_M_BLOCK", 64))
 NB = int(os.environ.get("THUNDER_N_BLOCK", 64))
 
@@ -69,7 +72,9 @@ def _ours_flags() -> dict:
         "onepass": _env_on("THUNDER_ONEPASS", True),
         "reg_rescale": _env_on("THUNDER_REG_RESCALE", True),
         "causal_bound": _env_on("THUNDER_CAUSAL_BOUND", True),
-        "gqa_pack": _env_on("THUNDER_GQA_PACK", False),
+        # Matches ThunderCuteConfig.gqa_pack (default True): the benchmark must
+        # measure the kernel we ship, not a flag-off variant.
+        "gqa_pack": _env_on("THUNDER_GQA_PACK", True),
         "indirect": _env_on("THUNDER_8B_INDIRECT", False),
         "m_block": MB,
         "n_block": NB,
@@ -139,16 +144,29 @@ def _fa4_vendored_callable(q, k, v, head_dim, gqa, causal):
 
 
 def _ours_callable(sb, q, meta_q, num_splits, flags, head_dim, gqa, causal):
+    """Our kernel at the SHIPPED configuration.
+
+    The tile must come from the product's own policy, not from the env defaults:
+    the engine builds its kernel through ``tile_shape`` (decode b16 = 16/16/32,
+    decode b1 = 32/32/64, prefill = 64/16/128), and hardcoding MB/NB measured a
+    configuration we never ship -- that is why the frozen matrix reported ours at
+    14.19 ms on a cell the engine runs at ~1.4 ms.
+    """
     from thunder_vllm.attention.cute_kernel import (
         ThunderAttentionForward,
         launch_thunder_attention,
     )
     from thunder_vllm.attention.paged_kv import make_paged_kv_manager
+    from thunder_vllm.attention.tile_shape import tile_shape
 
+    _n_reqs = int(sb.block_table.shape[0])
+    _mql = int(getattr(meta_q, "max_query_len", 0) or 0)
+    tile = tile_shape(bool(causal), _n_reqs, _mql or None)
     kernel = ThunderAttentionForward(
         head_dim=head_dim, K_BITS=sb.layout.k_bits, V_BITS=sb.layout.v_bits,
         qhead_per_kvhead=gqa, is_causal=causal,
-        m_block_size=MB, n_block_size=NB, num_threads=128,
+        m_block_size=tile["m_block"], n_block_size=tile["n_block"],
+        num_threads=tile["num_threads"],
     )
     mgr = make_paged_kv_manager(
         sb.layout, max_num_reqs=sb.block_table.shape[0],
@@ -246,7 +264,9 @@ def bench_cell(c: dict) -> dict:
     qo = b * hq * sq * hd * 2 * 2  # Q read + O write, fp16
     row["ours_bytes"] = kv + qo
     # Analytic CTA count for ours: q-blocks x head axis x reqs x splits.
-    qb = math.ceil((sq if c["mode"] == "prefill" else 1) / MB)
+    from thunder_vllm.attention.tile_shape import tile_shape as _ts
+    _t = _ts(bool(c["causal"]), b, sq if c["mode"] == "prefill" else None)
+    qb = math.ceil((sq if c["mode"] == "prefill" else 1) / _t["m_block"])
     heads = HK if row["ours_flags"]["gqa_pack"] else hq
     row["cta_ours"] = qb * heads * b * c["splits"]
     return row
@@ -333,6 +353,10 @@ def main() -> None:
     ap.add_argument("--only", default="")
     ap.add_argument("--only-cell", default="")
     ap.add_argument("--ncu-cells", default="")
+    ap.add_argument("--cells", default="",
+                    help="comma-separated name substrings to select")
+    ap.add_argument("--metrics", action="store_true",
+                    help="print METRIC lines (kernel benchmark for autoresearch)")
     args = ap.parse_args()
 
     print(system_line(), flush=True)
@@ -345,6 +369,14 @@ def main() -> None:
                and ((c["mode"] == "prefill" and c["seqlen_k"] == 4096)
                     or (c["mode"] == "decode" and c["batch"] == 1
                         and c["seqlen_k"] == 4096))]
+    elif args.cells:
+        pats = [x.strip() for x in args.cells.split(",") if x.strip()]
+        sel = [c for c in all_cells
+               if any(pat in c["name"] for pat in pats)]
+        missing = [pat for pat in pats
+                   if not any(pat in c["name"] for c in all_cells)]
+        if missing:
+            raise SystemExit(f"--cells: no cell matches {missing}")
     elif args.only:
         sel = [c for c in all_cells if args.only in c["name"]]
     else:
@@ -366,6 +398,37 @@ def main() -> None:
         rows.append(r)
 
     summ = [_summarize(r) for r in rows]
+
+    if args.metrics:
+        # Kernel-only comparison against the upstream backbone (FA4), no vLLM.
+        # `speedup_vs_fa4` is the headline: >1.0 means our kernel beats the
+        # kernel upstream TurboQuant runs on.
+        import math as _math
+
+        def _tag(name: str) -> str:
+            return name.replace("-", "_").replace(".", "_")
+
+        ratios = []
+        ours_all, fa4_all = [], []
+        for s_ in summ:
+            if not s_.get("ours_ms") or not s_.get("fa4_ms"):
+                continue
+            t = _tag(s_["name"])
+            print(f"METRIC ours_ms_{t}={s_['ours_ms']:.6f}")
+            print(f"METRIC fa4_ms_{t}={s_['fa4_ms']:.6f}")
+            print(f"METRIC speedup_{t}={s_['fa4_ms'] / s_['ours_ms']:.6f}")
+            if s_.get("ours_gbps"):
+                print(f"METRIC ours_gbps_{t}={s_['ours_gbps']:.1f}")
+            if s_.get("fa4_gbps"):
+                print(f"METRIC fa4_gbps_{t}={s_['fa4_gbps']:.1f}")
+            ratios.append(s_["fa4_ms"] / s_["ours_ms"])
+            ours_all.append(s_["ours_ms"])
+            fa4_all.append(s_["fa4_ms"])
+        if ratios:
+            gm = lambda xs: _math.exp(sum(_math.log(x) for x in xs) / len(xs))
+            print(f"METRIC speedup_vs_fa4={gm(ratios):.6f}")
+            print(f"METRIC ours_ms_geomean={gm(ours_all):.6f}")
+            print(f"METRIC fa4_ms_geomean={gm(fa4_all):.6f}")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         f.write("# FA4 vs TurboQuant kernel matrix\n\n")

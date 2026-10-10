@@ -28,3 +28,9 @@ scripts/vultr.py
 ci_probe/results/*.pt
 # macOS Finder metadata
 .DS_Store
+
+flash-attention/
+
+# Scratch reference clones (cutlass/vllm/flash-attention/BitDecoding).
+# Never commit: they contain nested git repos and are not part of the plugin.
+research/
