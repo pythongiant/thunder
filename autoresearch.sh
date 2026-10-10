@@ -19,7 +19,10 @@ log=$(mktemp)
 if ! modal run ci/modal_app.py --mode shell \
       --shell-cmd "cd /opt/thunder_vllm && python -m benchmarks.fa4_matrix --cells '$CELLS' --metrics" \
       >"$log" 2>&1; then
-  tail -n 60 "$log" >&2
+  # STDOUT, not stderr: the run capture reads stdout, so a stderr-only failure
+  # produced an empty log and an undiagnosable exit 1.
+  echo "=== benchmark command failed ==="
+  tail -n 100 "$log"
   exit 1
 fi
 grep -E '^METRIC ' "$log" | sort
@@ -32,7 +35,8 @@ cat <<'BASELINE'
 [baseline] above (METRIC) is a KERNEL launch, not a served step.
 BASELINE
 if ! grep -q '^METRIC speedup_vs_fa4=' "$log"; then
-  tail -n 60 "$log" >&2
-  echo "autoresearch.sh: primary metric speedup_vs_fa4 missing" >&2
+  echo "=== primary metric missing; log tail ==="
+  tail -n 100 "$log"
+  echo "autoresearch.sh: primary metric speedup_vs_fa4 missing"
   exit 1
 fi
