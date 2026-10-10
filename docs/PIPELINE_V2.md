@@ -492,3 +492,37 @@ order:
 Caveat, stated plainly: the profile says *where* the cycles go, not how much a given
 fix recovers. Each of 1-2 must be measured after implementation, and the batch-1 32k
 win (1.397x) must be re-measured to confirm it survives.
+
+### Measured: two-phase dequant, and the metric's noise floor
+
+ncu said the hotspot is shared memory (short-scoreboard 3.99/4.69, L1TEX 68-71%,
+no eligible warp 79.8%). The dequant's own load->store chain is part of that, so
+both layouts now stage every LUT load into registers before any store (the pattern
+the KV tile load already uses), **bounded to a staging window of <=16 values per
+thread**. The bound is not optional: unbounded staging is 64 values per thread at
+the decode-b1 tile on top of the KV load's 112, which hung the benchmark (30 min
+against 3-4).
+
+| cell | ours before -> after | delta |
+|---|---|---|
+| prefill 4k | 5.126 -> **4.940 ms** | **-3.6%** |
+| prefill 16k | 70.429 -> **68.785 ms** | **-2.3%** |
+| decode b16 32k | 2.5891 -> 2.5927 ms | flat (path unchanged by design) |
+| decode b16 4k | 0.33539 -> 0.33514 ms | flat |
+| decode b1 32k | 0.21962 -> 0.21933 ms | flat |
+
+Correctness: the GPU suite passes with the change (102 passed; the only failure is
+the pre-existing `test_cuda_graph_replay_parity` stub, already in
+`.auto/known_failures.txt`), including `test_packed_prefill_matches_dequant_reference`
+and `test_split_k_decode_matches_dequant_reference`, which exercise exactly the two
+edited functions. This matters because the harness's `speedup` column compares
+*times*, not values, so it cannot catch a wrong dequant -- a correctness run must
+precede any timing claim.
+
+**Noise floor (use this when reading the primary metric).** The aggregate
+`speedup_vs_fa4` moved 0.113811 -> 0.113442 (-0.3%) while our kernel got 2-4% faster,
+because FA4's own number on the decode-b16-4k cell moved **15%** (0.0715 -> 0.0610)
+with our side identical to four digits. Per-cell FA4 variance is therefore ~2%
+typically and ~15% worst observed, which puts the aggregate's noise floor around
++-10%. **Decide on `ours_ms`, treat the ratio as indicative**, and re-run a cell
+before believing a small move in it.

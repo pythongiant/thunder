@@ -115,15 +115,40 @@ def _dequantize_strided(
     tidx: Int32,
     num_threads: cutlass.Constexpr[int],
 ):
-    """Cooperative unpack + LUT gather: ``sCode[r, c] = sLut[idx, c]``."""
+    """Cooperative unpack + LUT gather: ``sCode[r, c] = sLut[idx, c]``.
+
+    TWO-PHASE when the per-thread staging window is small (total/num_threads <=
+    16): every LUT load is issued into registers before any store, so the
+    shared-memory returns overlap instead of forming one dependent load->store
+    chain per element. ncu makes this loop the kernel's hotspot -- short-scoreboard
+    stalls of 3.99 cycles per issued instruction at prefill 4k and 4.69 at batched
+    decode 32k, L1TEX at 68-71% of peak, no eligible warp for 79.8% of cycles --
+    and the structure is the one the KV tile load already uses for that reason.
+    The window bound is NOT optional: unbounded staging is 64 values per thread at
+    the decode-b1 tile (on top of the KV load's 112) and blew the benchmark up
+    (30 min against 3-4). That shape keeps the interleaved loop, and it is the one
+    we already win (1.397x).
+    """
     total: cutlass.Constexpr[int] = rows * head_dim
-    iters: cutlass.Constexpr[int] = (total + num_threads - 1) // num_threads
-    for e in cutlass.range_constexpr(iters):
-        idx = tidx + e * num_threads
-        if idx < total:
+    if const_expr(total % num_threads == 0 and total // num_threads <= 16):
+        iters: cutlass.Constexpr[int] = total // num_threads
+        vals = []
+        for e in cutlass.range_constexpr(iters):
+            idx = tidx + e * num_threads
             row = idx // head_dim
             col = idx % head_dim
-            sCode[row, col] = sLut[_unpack(sPacked, row, col, bits), col]
+            vals.append(sLut[_unpack(sPacked, row, col, bits), col])
+        for e in cutlass.range_constexpr(iters):
+            idx = tidx + e * num_threads
+            sCode[idx // head_dim, idx % head_dim] = vals[e]
+    else:
+        iters: cutlass.Constexpr[int] = (total + num_threads - 1) // num_threads
+        for e in cutlass.range_constexpr(iters):
+            idx = tidx + e * num_threads
+            if idx < total:
+                row = idx // head_dim
+                col = idx % head_dim
+                sCode[row, col] = sLut[_unpack(sPacked, row, col, bits), col]
 
 
 @cute.jit
@@ -143,13 +168,26 @@ def _dequantize_transposed(
     straight into the transposed layout instead of transposing in SMEM.
     """
     total: cutlass.Constexpr[int] = rows * head_dim
-    iters: cutlass.Constexpr[int] = (total + num_threads - 1) // num_threads
-    for e in cutlass.range_constexpr(iters):
-        idx = tidx + e * num_threads
-        if idx < total:
+    if const_expr(total % num_threads == 0 and total // num_threads <= 16):
+        # see _dequantize_strided: same two-phase staging, same window bound
+        iters: cutlass.Constexpr[int] = total // num_threads
+        vals = []
+        for e in cutlass.range_constexpr(iters):
+            idx = tidx + e * num_threads
             row = idx // head_dim
             col = idx % head_dim
-            sCode[col, row] = sLut[_unpack(sPacked, row, col, bits), col]
+            vals.append(sLut[_unpack(sPacked, row, col, bits), col])
+        for e in cutlass.range_constexpr(iters):
+            idx = tidx + e * num_threads
+            sCode[idx % head_dim, idx // head_dim] = vals[e]
+    else:
+        iters: cutlass.Constexpr[int] = (total + num_threads - 1) // num_threads
+        for e in cutlass.range_constexpr(iters):
+            idx = tidx + e * num_threads
+            if idx < total:
+                row = idx // head_dim
+                col = idx % head_dim
+                sCode[col, row] = sLut[_unpack(sPacked, row, col, bits), col]
 
 
 @cute.jit
