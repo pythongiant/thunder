@@ -436,3 +436,59 @@ chains** -- the second of which is exactly what P2's aligned packing does (one
 aligned word load plus shift/mask instead of byte-spanning reads). P4 stays right for
 prefill's barrier-heavy PASS 2 once the stall line is resolved, so: **get the full
 stall line before choosing between P2 and P4.**
+
+### Stall resolution: SHARED MEMORY is the bottleneck (Case C). Order changes.
+
+Explicit stall counters, cycles per issued instruction (`smsp__average_warps_issue_
+stalled_*_per_issue_active.ratio`) plus pipe throughputs:
+
+| stall reason | prefill 4k | decode b16 32k |
+|---|---|---|
+| **short_scoreboard (SMEM)** | **3.99** | **4.69** |
+| barrier | 1.97 | **0.02** |
+| wait | 1.54 | 1.97 |
+| long_scoreboard (L2/global) | 0.80 | 0.77 |
+| mio_throttle / lg_throttle | 0.01 / 0.00 | 0.08 / 0.01 |
+| not_selected / math_pipe_throttle | 0.08 / 0.03 | 0.09 / 0.04 |
+
+| throughput | prefill 4k | decode b16 32k |
+|---|---|---|
+| **l1tex (SMEM/L1TEX pipe)** | **68.5%** | **71.0%** |
+| lts (L2) | 2.55% | 2.22% |
+| DRAM | 0.09% | 2.34% |
+| sm (compute) | 20.9% | 24.4% |
+
+**Verdict: the L1TEX/shared-memory pipe is the bottleneck and its latency is what
+the warps stall on.** This is the external review's Case C ("low DRAM throughput but
+high memory-instruction pressure => excessive narrow loads, shared-memory lookup
+traffic, serialized memory operations"), not Case A. Every latency-hiding signal is
+absent: long_scoreboard 0.8, mio/lg throttle ~0, L2 2.5%, DRAM <3%.
+
+Two predictions resolved against the record:
+- CONFIRMED: advance predicted the decode CTA (single warp) would show no barrier
+  stall -- measured **0.02**. The barrier cost (1.97) is prefill-only.
+- REFUTED: the "prefill is instruction-bound" claim drawn from the 3-bit/4-bit
+  delta. Compute is 20.9%; SMEM is 68.5%.
+
+### Consequence: cut SMEM accesses per KV element FIRST
+
+Our dequant performs **three SMEM accesses per code element**: read the packed
+bytes (byte-spanning), read the LUT, write the dequantized code. Then the MMA does a
+*fourth* (a `cute.copy` from `sK_code`/`sV_code` into the register fragment). That is
+what saturates L1TEX and what the short-scoreboard stalls are waiting on. In reach
+order:
+
+1. **Dequantize straight into the MMA register fragment** instead of via `sCode` in
+   SMEM -- removes the code-buffer store *and* the subsequent SMEM->register copy,
+   i.e. 2 of the 4 SMEM accesses per element. The `mma.sync` path already consumes
+   register fragments (`make_fragment_A/B`), so this is a data-path change, not a
+   new schedule.
+2. **P2's word-aligned packing** so one SMEM load feeds several codes instead of one
+   byte-spanning load per code (aligned 3.2-bit words), which also removes the
+   variable-shift sequence.
+3. **P4 (async prefetch / double buffering) only after that**, and only for prefill's
+   remaining barrier component (1.97). Prefetching cannot help a SMEM-latency stall.
+
+Caveat, stated plainly: the profile says *where* the cycles go, not how much a given
+fix recovers. Each of 1-2 must be measured after implementation, and the batch-1 32k
+win (1.397x) must be re-measured to confirm it survives.
