@@ -34,6 +34,27 @@ Measured with the split count pinned, so the tile is the only variable
 research loop's own numbers to three digits (2.7232 against 2.723), which is the
 harness's own correctness check.
 
+**Refuted (kernel-vs-FA4 segment): buying parallelism by enlarging M.**
+The kernel locks ``m_block == num_warps * 16``, so batched decode runs
+single-warp CTAs and the obvious fix looked like a taller M tile with more warps
+to hide the KV-walk latency. Measured against the shipped tile on the engine's
+shapes, with FA4 timed on the same tensors:
+
+| cell (m, threads, n) | ours ms | FA4 ms | vs shipped |
+|---|---|---|---|
+| decode b16 32k, 16/32/16 (shipped) | **2.726** | 0.355 | — |
+| decode b16 32k, 32/64/16 | 3.530 | 0.345 | -23% |
+| decode b16 32k, 32/64/32 | 3.502 | 0.360 | -22% |
+| prefill 4k, 64/128/16 (shipped) | **4.666** | 0.107 | — |
+| prefill 4k, 128/256/16 | 5.246 | 0.113 | -11% |
+| prefill 4k, 32/64/16 | 7.141 | 0.118 | -35% |
+
+The extra M rows cost more than the extra warps buy: at batched decode the KV
+tile is loaded per (request, KV head) regardless of M, so the dequant is
+unchanged while the QK/PV and staging grow with M. Adding warps only helps if
+they share the SAME tile (warp specialization inside the kernel), not if they
+enlarge it. Do not retry this as a policy knob.
+
 So the schedules want different tiles in every dimension: decode takes the
 smallest M tile that holds its live rows, prefill takes a full-height M tile with
 the narrowest KV tile that builds (8 does not; the MMA floor is 16). ``t`` is not
