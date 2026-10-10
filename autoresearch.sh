@@ -1,38 +1,32 @@
 #!/usr/bin/env bash
 # Autoresearch entrypoint: OUR KERNEL vs the upstream backbone (FA4), WITHOUT vLLM.
 #
-# Why kernel-only: the thing we publish is a faster *kernel*, and the served e2e
-# path is confounded (eager vs graphs, multiprocessing on/off, broken capture).
-# Here both sides get identical q/k/v, identical CUDA-event timing (25 warmup +
-# 100 timed reps, median reported), on the engine's Qwen3-8B shapes
-# (head_dim 128, GQA 4:1, causal) -- i.e. our kernel against the kernel upstream
-# TurboQuant runs on. No engine, no scheduler, no sampler.
+# Why kernel-only: what we publish is a faster *kernel*, and the served e2e path is
+# confounded (eager vs graphs, multiprocessing on/off, a capture path that is
+# broken). Here both kernels see identical tensors and identical CUDA-event timing
+# (25 warmup + 50 timed reps) on the engine's Qwen3-8B geometry (head_dim 128,
+# 32 Q heads / 8 KV heads = GQA 4:1, causal) at the engine's own tile, split-K and
+# GQA-packing policy -- i.e. the configuration we ship.
 #
-# Primary metric: speedup_vs_fa4 = geomean(fa4_ms / ours_ms) over the selected
-# cells (higher is better; >1.0 means we beat upstream's kernel).
+# Primary metric: speedup_vs_fa4 = geomean(fa4_ms / ours_ms) over the cells
+# (higher is better; >1.0 means our kernel beats the kernel upstream TurboQuant
+# runs on).
 set -euo pipefail
 cd "$(dirname "$0")"
-# Fast pre-check (~1s): a syntax error fails here, not after a GPU round trip.
 python3 -m compileall -q thunder_vllm >/dev/null
-CELLS="hd128-gqa4-causal-decode-B16-S32768-sp16,hd128-gqa4-causal-decode-B16-S16384-sp16,hd128-gqa4-causal-decode-B16-S4096-sp16,hd128-gqa4-causal-decode-B1-S32768-sp64,hd128-gqa4-causal-prefill-B1-S4096-sp1"
+# <shape>|<splits>|<gqa> with the rest left to the engine policy.
+CELLS="decode-b16-32k|policy|policy;decode-b16-4k|policy|policy;decode-long|policy|policy;prefill|policy|policy;prefill-16k|policy|policy"
 log=$(mktemp)
-if ! modal run ci/modal_app.py --mode shell \
-      --shell-cmd "cd /opt/thunder_vllm && python -m benchmarks.fa4_matrix --cells '$CELLS' --metrics" \
-      >"$log" 2>&1; then
-  # STDOUT, not stderr: the run capture reads stdout, so a stderr-only failure
-  # produced an empty log and an undiagnosable exit 1.
+if ! modal run ci/modal_app.py --mode grid --grid "$CELLS" >"$log" 2>&1; then
   echo "=== benchmark command failed ==="
   tail -n 100 "$log"
   exit 1
 fi
 grep -E '^METRIC ' "$log" | sort
-# Provenance for the served comparison (docs/BENCHMARKS.md, AGENTS.md). These are
-# NOT this metric: they are what upstream TurboQuant serves, for orientation.
 cat <<'BASELINE'
-[baseline] upstream TurboQuant (FA4-based KV path), served, batch 1 (vLLM 0.25.1):
-[baseline]   @4096  109.5 tok/s  ITL 7.03 ms  TTFT 74.3 ms
-[baseline]   @32768  18.2 tok/s  ITL 12.23 ms  TTFT 1380.2 ms
-[baseline] above (METRIC) is a KERNEL launch, not a served step.
+[baseline] upstream TurboQuant (the upstreamed TURBOQUANT backend) runs on FA4's
+[baseline] SM100 forward, so `speedup_vs_fa4` compares our kernel with exactly
+[baseline] that kernel on identical tensors and identical timing, with no vLLM.
 BASELINE
 if ! grep -q '^METRIC speedup_vs_fa4=' "$log"; then
   echo "=== primary metric missing; log tail ==="
