@@ -572,3 +572,26 @@ builder to attribute the 339 ms; (b) test `forward_includes_kv_cache_update = Tr
 (our forward already contains an inline store path) and re-measure ITL; (c) grep the
 per-step path for D2H syncs (`.item()`/`.cpu()`/`synchronize()`) that run per layer
 rather than once per step.
+
+### Refuted: reclaiming the separate KV-update call by inlining it
+
+Since our backend declares `forward_includes_kv_cache_update = False` (vLLM's
+default is `True`), vLLM drives the store through a separate per-layer call, and
+that call is the only per-layer path of ours that sits outside `forward()` and
+outside every timer. The obvious reclaim is to declare `True` and let the forward's
+inline store path (the `_tq_cache_updated` guard, the designed fallback) do the
+write -- removing the extra round-trip per layer per step.
+
+**Measured: it does not work.** With the flag flipped the engine fails to
+initialize (`[e2e] FAILED ... rc=1`, and `[STAGE] n=0` -- no forward ever ran).
+So `False` is load-bearing, not an oversight. Hypothesis (unverified): with `True`
+vLLM routes the cache update through the fused-hook path
+(`fused_rope_kvcache_supported` / `do_rope_and_kv_cache_update` /
+`do_qk_norm_rope_kvcache_update`, per the pinned API docs) or otherwise changes the
+forward contract, and this impl does not satisfy it. Diagnosing it needs the
+engine's own error text, which the harness's log capture drops.
+
+Kept reverted. The next instrument should be `torch.profiler` with CPU+CUDA
+activities inside the e2e worker (`key_averages`), which names the 339 ms directly
+-- sync, copy, allocation or vLLM-side op -- instead of inferring it from stage
+sums.
